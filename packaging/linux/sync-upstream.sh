@@ -46,6 +46,27 @@ if git diff --cached --quiet; then
   exit 0
 fi
 
+# Re-apply the fork's patches against upstream files. Checking out upstream
+# paths discards them, so a sync that skipped this would silently revert fixes
+# the GUI depends on.
+shopt -s nullglob
+patches=("$REPO_ROOT"/patches/*.patch)
+shopt -u nullglob
+for patch in "${patches[@]}"; do
+  name="$(basename "$patch")"
+  if git apply --check "$patch" 2>/dev/null; then
+    git apply "$patch"
+    git add -u
+    log "applied $name"
+  elif git apply --reverse --check "$patch" 2>/dev/null; then
+    # Already present in the synced tree: upstream took the fix, so the patch
+    # can be deleted rather than carried.
+    log "$name is already upstream — delete it from patches/"
+  else
+    die "$name no longer applies to $REV; rebase or drop it before continuing"
+  fi
+done
+
 git diff --cached --stat | tail -20
 
 cat <<EOF

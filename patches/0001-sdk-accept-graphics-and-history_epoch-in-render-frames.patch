@@ -1,0 +1,28 @@
+diff --git a/cmux-tui/bindings/rust/src/resource/typed_stream.rs b/cmux-tui/bindings/rust/src/resource/typed_stream.rs
+index 82072e5bea..3011867733 100644
+--- a/cmux-tui/bindings/rust/src/resource/typed_stream.rs
++++ b/cmux-tui/bindings/rust/src/resource/typed_stream.rs
+@@ -717,6 +717,13 @@ fn decode_render_snapshot(value: Value) -> Result<RenderSnapshot> {
+             "render snapshot must contain each viewport row exactly once".to_string(),
+         ));
+     }
++    // The server sends `graphics` and `history_epoch` in render snapshots (see
++    // the generated RenderStateEvent, which carries both), but this hand-written
++    // decoder never consumed them, so `finish` rejected every real snapshot with
++    // "render snapshot contains unknown fields: graphics, history_epoch".
++    // Consume and discard them: this frontend renders text runs only.
++    let _ = take_optional(&mut object, "graphics");
++    let _ = take_optional(&mut object, "history_epoch");
+     finish(object, "render snapshot")?;
+     Ok(RenderSnapshot { size, cursor, default_fg, default_bg, scrollback_rows, rows })
+ }
+@@ -747,6 +754,9 @@ fn decode_render_patch(value: Value) -> Result<RenderPatch> {
+             "render resize patch rows must equal size.rows".to_string(),
+         ));
+     }
++    // Same omission as decode_render_snapshot; render deltas carry these too.
++    let _ = take_optional(&mut object, "graphics");
++    let _ = take_optional(&mut object, "history_epoch");
+     finish(object, "render patch")?;
+     Ok(RenderPatch { cursor, full_reset, size, default_fg, default_bg, scrollback_rows, rows })
+ }

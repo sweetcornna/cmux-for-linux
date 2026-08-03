@@ -23,3 +23,6 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# GUI build output
+gui/target/

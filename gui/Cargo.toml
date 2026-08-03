@@ -1,0 +1,27 @@
+# cmux-gtk lives outside cmux-tui/ on purpose: packaging/linux/sync-upstream.sh
+# replaces cmux-tui/ wholesale from upstream, so anything this fork authors in
+# there would be deleted on the next sync.
+[workspace]
+members = ["."]
+
+[package]
+name = "cmux-gtk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91"
+license = "GPL-3.0-or-later"
+description = "GTK4 frontend for cmux, speaking cmux.protocol/1"
+publish = false
+
+[[bin]]
+name = "cmux-gtk"
+path = "src/main.rs"
+
+[dependencies]
+cmux-client = { path = "../cmux-tui/bindings/rust" }
+gtk4 = { version = "0.9", features = ["v4_10"] }
+pangocairo = "0.20"
+async-channel = "2"
+
+[profile.release]
+strip = "symbols"
