@@ -1,6 +1,6 @@
 # cmux for linux
 
-Native Linux packages for [cmux](https://github.com/manaflow-ai/cmux) — the
+Native Linux packages for [cmux](https://github.com/manaflow-ai/cmux), the
 terminal multiplexer for AI coding agents, backed by `libghostty-vt`.
 
 Upstream cmux is a macOS application that ships its Rust multiplexer only
@@ -9,11 +9,11 @@ the parts that run natively on Linux, packages them the way Linux
 distributions expect, and drops everything else.
 
 ```bash
-sudo apt install ./cmux_<version>_amd64.deb    # Debian / Ubuntu
+sudo apt install ./cmux_<version>_amd64.deb      # Debian / Ubuntu
 sudo apt install ./cmux-gtk_<version>_amd64.deb  # optional GTK4 window
-sudo dnf install ./cmux-<version>.x86_64.rpm   # Fedora / RHEL
-yay -S cmux-bin                                # Arch (AUR)
-./cmux-<version>-x86_64.AppImage               # anywhere
+sudo dnf install ./cmux-<version>.x86_64.rpm     # Fedora / RHEL
+yay -S cmux-bin                                  # Arch (AUR)
+./cmux-<version>-x86_64.AppImage                 # anywhere
 ```
 
 Then:
@@ -25,7 +25,7 @@ cmux workspace create --name api
 cmux workspace current run -- cargo test
 ```
 
-`man cmux` documents the full noun-first CLI.
+`man cmux` documents the noun-first CLI.
 
 For a window instead of a TUI:
 
@@ -34,10 +34,46 @@ cmux --headless --session main &
 cmux-gtk --session main
 ```
 
-`cmux-gtk` renders a terminal, switches workspaces from a sidebar, resizes the
-PTY with the window, scrolls back with the wheel and copies a drag-selection
-with `Ctrl+Shift+C`. It is a separate package so the core install stays free
-of GTK dependencies — see [`gui/README.md`](gui/README.md).
+`cmux-gtk` renders pane splits and tabs, switches workspaces from a sidebar,
+resizes each pane's PTY with the window, scrolls back with the wheel and copies
+a drag-selection with `Ctrl+Shift+C`. It is a separate package so the core
+install stays free of GTK dependencies. See [`gui/README.md`](gui/README.md).
+
+## GTK frontend vs the TUI
+
+Normal cmux is the TUI installed by the `cmux` package. It is the
+terminal-native multiplexer, runs anywhere cmux can run, including over SSH,
+and is also the server that every frontend attaches to when run with
+`--headless`. The `cmux` package is required whether you use the TUI, the GTK
+frontend, or both.
+
+`cmux-gtk` is an optional native window onto a running cmux session. It speaks
+the same protocol, uses the same server and displays the same session. It is a
+different face for the session, not a fork of multiplexer behavior.
+
+Choose `cmux-gtk` when you want a desktop window with its own icon, launcher
+and Alt-Tab entry; fonts and rendering through Pango rather than the limits of
+the terminal emulator hosting the TUI; or a per-window font and theme without
+changing terminal-emulator settings. Choose the TUI for SSH and remote use,
+terminal-only environments, or features that the GTK frontend does not have
+yet.
+
+| Capability | TUI (`cmux`) | GTK (`cmux-gtk`) |
+| --- | --- | --- |
+| Panes and splits | Yes | Yes |
+| Tabs | Yes | Yes |
+| Mouse input to terminal applications | Yes | Yes |
+| Scrollback | Yes | Yes |
+| Selection and clipboard | Yes | Yes; copy with `Ctrl+Shift+C` |
+| Themes | Reads `cmux-tui.json` | Reads `cmux-tui.json`; the font is set separately in `cmux-gtk.json` |
+| Inline images | Depends on the terminal emulator's own support | Not yet |
+| Create panes and resize them by dragging | Yes | Not yet; create and resize them through the CLI or TUI, and the GTK window follows the layout |
+| Sidebar file browser | Yes | No |
+| Machine rail and SSH targets | Yes | No |
+| Works over SSH without X or Wayland | Yes | No |
+
+The packages coexist. A GTK window and any number of TUI attachments can view
+the same session at the same time.
 
 ## What is in this repository
 
@@ -61,11 +97,11 @@ in the `upstream` remote.
 | --- | --- |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching upstream's npm command name |
 | `/usr/bin/cmux-tui` | the multiplexer and public CLI |
-| `/usr/bin/cmux-relay` | stdio↔socket transport primitive |
+| `/usr/bin/cmux-relay` | stdio-to-socket transport primitive |
 | `/usr/share/applications/cmux.desktop` | desktop entry |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons |
 | `/usr/share/man/man1/cmux.1.gz` | man page |
-| `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
+| `/usr/share/{bash-completion,zsh,fish}/...` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | docs, third-party notices, GPL-3.0 text |
 
 The binaries link only `libc`, `libm` and `libgcc_s`.
@@ -90,9 +126,9 @@ Artifacts land in `build/linux/dist/`, each with a matching `.sha256`.
 `'limits.h' file not found`. This is the most common first-build failure on a
 clean Linux host.
 
-See [`packaging/linux/README.md`](packaging/linux/README.md) for the full
-packaging reference and [`docs/linux-port.md`](docs/linux-port.md) for what is
-and is not ported.
+See [`packaging/linux/README.md`](packaging/linux/README.md) for the packaging
+reference and [`docs/linux-port.md`](docs/linux-port.md) for what is and is not
+ported.
 
 ## Relationship to upstream
 
@@ -113,7 +149,7 @@ packaging bugs belong here.
 ## Licence
 
 cmux is **GPL-3.0-or-later**, which is what makes this fork and its packages
-redistributable. Every package ships the full licence text at
+redistributable. Every package ships the licence text at
 `/usr/share/licenses/cmux/LICENSE` and upstream's third-party notices at
 `/usr/share/doc/cmux/THIRD_PARTY_LICENSES.md`.
 

@@ -1,7 +1,7 @@
 # cmux-gtk
 
-A GTK4 frontend for cmux. Stage 1 of the Linux GUI in
-[`../docs/linux-port.md`](../docs/linux-port.md).
+A GTK4 frontend for cmux. See
+[`../docs/linux-port.md`](../docs/linux-port.md) for the Linux port status.
 
 ```bash
 cmux --headless --session main &     # a session to attach to
@@ -12,8 +12,8 @@ cargo run --release -- --session main
 
 - connects to a running cmux session over `cmux.protocol/1`
 - lists the session's workspaces in a sidebar
-- attaches to a terminal and renders it from the server's styled render stream
-- sends key presses back to the PTY
+- renders pane splits and tabs from the server's styled render stream
+- sends keyboard and supported mouse input back to each pane's PTY
 
 ## What it deliberately does not do
 
@@ -48,37 +48,75 @@ cargo run --release -- --probe --session main
 
 | | |
 | --- | --- |
-| Rendering | styled runs with colour, bold, italic, underline, inverse and faint; block/underline/bar cursor |
-| Input | full keyboard, including Ctrl and Alt sequences and the arrow/navigation keys |
-| Workspaces | sidebar lists them and switches the attached terminal; refreshed every 3s so workspaces created elsewhere appear |
-| Resize | the PTY follows the window — the frontend claims exclusive sizing authority for its viewer lease |
-| Scrollback | mouse wheel scrolls the viewport; the status line shows when it is not at the bottom |
-| Selection | drag to select, `Ctrl+Shift+C` copies to the clipboard |
+| Panes | split layouts with per-pane PTY sizing and click-to-focus |
+| Tabs | a tab strip for the session's tabs |
+| Input | keyboard input, including Ctrl and Alt sequences; mouse input to applications |
+| Workspaces | sidebar switching with a topology refresh every 3 seconds |
+| Resize | dynamic window resize updates the pane PTY sizes |
+| Scrollback | the mouse wheel scrolls the viewport |
+| Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
+| Theme | border colours from `cmux-tui.json`; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
+
+## Configuration
+
+The GTK frontend honors these keys under `theme` in `cmux-tui.json`:
+
+- `border_active`
+- `border_inactive`
+- `selection_background`
+- `selection_foreground`
+
+Xterm-256 colour indexes are accepted for these values. A malformed
+`cmux-tui.json` or `cmux-gtk.json` does not prevent startup; the frontend
+retains its defaults for settings it cannot read.
+
+The GTK font is separate from the shared TUI theme. Set it in `cmux-gtk.json`:
+
+```json
+{
+  "font": "monospace 11"
+}
+```
+
+`CMUX_GTK_FONT` sets the font for the process and takes precedence over the
+value in `cmux-gtk.json`:
+
+```bash
+CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
+```
+
+## Mouse policy
+
+| Input | Handled by the GTK frontend | Forwarded to the pane application |
+| --- | --- | --- |
+| Click | Focuses the pane | The button event is forwarded when the application has requested mouse input |
+| Shift+drag | Selects text locally | No |
+| Wheel over an alternate-screen application using mouse input | No local scrollback | Yes |
+| Wheel otherwise | Scrolls local history | No |
+| Pointer move with no button held | No | No |
 
 ## Verified
 
-On Ubuntu 26.04, against live sessions:
+The following were checked against live sessions:
 
-- styled runs render with correct colours and all five attributes; `ls --color`
-  output and shell prompt colours match the TUI;
-- text typed into the window reaches the PTY, confirmed by reading the terminal
-  back over the protocol;
-- resizing the window resizes the PTY: 80x24 → 98x36 → 54x19 → 126x45, with the
-  server reporting `accepted=true` at each step;
-- clicking a sidebar row re-attaches to that workspace's terminal;
-- the wheel scrolls into history and the status line switches to "scrolled back";
-- a drag selects text and `Ctrl+Shift+C` puts it on the clipboard.
-
-Two things make GUI testing under `Xvfb` misleading, and both produced false
-failures before being accounted for: nothing grants keyboard focus without a
-window manager, and `xdotool search` also matches GTK's 1x1 helper windows, so
-resizing "the window" can silently resize nothing.
+- pane splits render with per-pane PTY sizes, and dynamic window resizing
+  updates those sizes;
+- the tab strip is present, panes accept click-to-focus, and workspace
+  switching follows topology refreshed every 3 seconds;
+- keyboard input includes Ctrl and Alt sequences;
+- application mouse forwarding works for clicks in `htop` and wheel input in
+  an alternate-screen application;
+- wheel scrollback and drag selection work, with Shift overriding application
+  mouse handling;
+- border colours and xterm-256 indexes are read from `cmux-tui.json`, the GTK
+  font is read separately from `cmux-gtk.json`, and a malformed configuration
+  does not prevent startup.
 
 ## Known gaps
 
-- One terminal per workspace. A workspace with several terminals attaches to
-  the first; there is no tab strip yet.
-- No splits or tabs of its own — it renders one terminal, not a pane layout.
-- No mouse reporting to the application, and no theming beyond the server's
-  colours.
-- `graphics` payloads (inline images) are dropped; see `../patches/README.md`.
+- Inline images are not implemented. The work was assessed at roughly 450-650
+  lines and deferred.
+- No pane create, close or resize from the GUI itself.
+- No mouse `Move` reporting without a held button.
+- No blink animation.
+- No bracketed-paste guard.
