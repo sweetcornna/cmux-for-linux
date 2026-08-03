@@ -2,17 +2,6 @@ import Foundation
 
 /// Builds shell-free restore invocations from structured persisted records.
 public struct AgentRestorePlanner: Sendable {
-    private static let claudeAuthSelectionEnvironmentKeys: Set<String> = [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_MODEL",
-        "ANTHROPIC_SMALL_FAST_MODEL",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CONFIG_DIR",
-    ]
-
     private let isExecutableFile: @Sendable (String) -> Bool
 
     /// Creates a restore planner.
@@ -164,7 +153,7 @@ public struct AgentRestorePlanner: Sendable {
         )
         if kind == "claude" {
             let keys = selected.keys.sorted().filter {
-                Self.claudeAuthSelectionEnvironmentKeys.contains($0)
+                AgentLaunchEnvironmentPolicy.claudeAuthSelectionEnvironmentKeys.contains($0)
             }
             if !keys.isEmpty {
                 selected["CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV"] = "1"

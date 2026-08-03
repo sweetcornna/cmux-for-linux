@@ -101,16 +101,7 @@ extension CMUXCLI {
     }
 
     private var sessionsListClaudeAuthSelectionEnvironmentKeys: Set<String> {
-        [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-            "ANTHROPIC_SMALL_FAST_MODEL",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CONFIG_DIR",
-        ]
+        AgentLaunchEnvironmentPolicy.claudeAuthSelectionEnvironmentKeys
     }
 
     private func sessionsListASCIIPrintfCommandSubstitution(for value: String) -> String {

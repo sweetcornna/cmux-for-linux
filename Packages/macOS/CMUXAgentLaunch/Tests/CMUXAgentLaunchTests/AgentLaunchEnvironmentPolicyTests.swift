@@ -20,8 +20,8 @@ struct AgentLaunchEnvironmentPolicyTests {
         ])
     }
 
-    @Test("Preserves Claude secure storage config dir for Claude without persisting secrets")
-    func preservesClaudeSecureStorageConfigDirForClaudeWithoutPersistingSecrets() {
+    @Test("Preserves Claude secure storage config dir for Claude launchers without persisting secrets")
+    func preservesClaudeSecureStorageConfigDirForClaudeLaunchersWithoutPersistingSecrets() {
         let selected = AgentLaunchEnvironmentPolicy().selectedEnvironment(
             from: [
                 "AMP_API_KEY": "amp-secret-should-not-persist",
@@ -36,6 +36,12 @@ struct AgentLaunchEnvironmentPolicyTests {
         #expect(selected["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/tmp/claude-secure-storage")
         #expect(selected["AMP_API_KEY"] == nil)
         #expect(selected["ANTHROPIC_AUTH_TOKEN"] == nil)
+
+        let claudeTeamsSelected = AgentLaunchEnvironmentPolicy().selectedEnvironment(
+            from: ["CLAUDE_SECURESTORAGE_CONFIG_DIR": "/tmp/claude-teams-secure-storage"],
+            kind: "claudeTeams"
+        )
+        #expect(claudeTeamsSelected["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/tmp/claude-teams-secure-storage")
 
         let codexSelected = AgentLaunchEnvironmentPolicy().selectedEnvironment(
             from: ["CLAUDE_SECURESTORAGE_CONFIG_DIR": "/tmp/claude-secure-storage"],

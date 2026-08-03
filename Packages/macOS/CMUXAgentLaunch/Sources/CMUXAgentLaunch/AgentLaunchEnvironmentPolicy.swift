@@ -35,9 +35,35 @@ public struct AgentLaunchEnvironmentPolicy: Sendable {
     /// Creates a launch environment policy.
     public init() {}
 
+    /// Claude environment names that select which account or auth backend a restore should use.
+    ///
+    /// This is not a replay allowlist. Callers intersect it with values already filtered by
+    /// ``selectedEnvironment(from:kind:)`` so secret names here do not become persisted values.
+    public static let claudeAuthSelectionEnvironmentKeys: Set<String> = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    ]
+
     private static let hermesAgentEnvironmentKeys: Set<String> = [
         "CUSTOM_BASE_URL",
         "HERMES_CODEX_BASE_URL",
+    ]
+
+    private static let claudeOnlyEnvironmentKeys: Set<String> = [
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    ]
+
+    private static let claudeEnvironmentKinds: Set<String> = [
+        "claude",
+        "claudeteams",
+        "claude-teams",
     ]
 
     /// Keys campfire manages itself and must not inherit from a captured Pi
@@ -68,6 +94,7 @@ public struct AgentLaunchEnvironmentPolicy: Sendable {
         "CAMPFIRE_CODING_AGENT_SESSION_DIR",
         "CAMPFIRE_RELAY_URL",
         "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         "CMUX_CUSTOM_CLAUDE_PATH",
         "CMUX_ROVODEV_SESSIONS_DIR",
         "CODEX_HOME",
@@ -135,6 +162,11 @@ public struct AgentLaunchEnvironmentPolicy: Sendable {
         }
         if normalizedKind != "hermes-agent" {
             for key in Self.hermesAgentEnvironmentKeys {
+                result.removeValue(forKey: key)
+            }
+        }
+        if let normalizedKind, !Self.claudeEnvironmentKinds.contains(normalizedKind) {
+            for key in Self.claudeOnlyEnvironmentKeys {
                 result.removeValue(forKey: key)
             }
         }

@@ -28520,19 +28520,11 @@ struct CMUXCLI {
         let selected = selectedAgentLaunchEnvironment(from: environment, kind: kind)
         guard !selected.isEmpty else { return nil }
 
-        let claudeAuthKeys: Set<String> = [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-            "ANTHROPIC_SMALL_FAST_MODEL",
-            "CLAUDE_CODE_USE_BEDROCK",
-            "CLAUDE_CODE_USE_VERTEX",
-            "CLAUDE_CONFIG_DIR"
-        ]
         var resolved = selected
         if kind == "claude" {
-            let preservedClaudeKeys = selected.keys.sorted().filter { claudeAuthKeys.contains($0) }
+            let preservedClaudeKeys = selected.keys.sorted().filter {
+                AgentLaunchEnvironmentPolicy.claudeAuthSelectionEnvironmentKeys.contains($0)
+            }
             if !preservedClaudeKeys.isEmpty {
                 resolved["CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV"] = "1"
                 resolved["CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV_KEYS"] = preservedClaudeKeys.joined(separator: ",")

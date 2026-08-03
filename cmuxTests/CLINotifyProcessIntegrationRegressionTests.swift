@@ -1470,6 +1470,7 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
             "ANTHROPIC_BASE_URL": "https://api.example.test",
             "ANTHROPIC_MODEL": "claude-sonnet-test",
             "CLAUDE_CONFIG_DIR": context.root.appendingPathComponent("claude-config", isDirectory: true).path,
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": context.root.appendingPathComponent("claude-securestorage", isDirectory: true).path,
         ]
         startClaudeHookMockServerAccepting(
             context: context,
@@ -1511,7 +1512,7 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertEqual(environment["CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV"] as? String, "1")
         XCTAssertEqual(
             environment["CMUX_PRESERVE_CLAUDE_AUTH_SELECTION_ENV_KEYS"] as? String,
-            "ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,CLAUDE_CONFIG_DIR"
+            "ANTHROPIC_BASE_URL,ANTHROPIC_MODEL,CLAUDE_CONFIG_DIR,CLAUDE_SECURESTORAGE_CONFIG_DIR"
         )
         XCTAssertNil(environment["ANTHROPIC_API_KEY"])
         XCTAssertEqual(environment["ANTHROPIC_BASE_URL"] as? String, "https://api.example.test")
@@ -1519,6 +1520,10 @@ final class CLINotifyProcessIntegrationRegressionTests: XCTestCase {
         XCTAssertEqual(
             environment["CLAUDE_CONFIG_DIR"] as? String,
             context.root.appendingPathComponent("claude-config", isDirectory: true).path
+        )
+        XCTAssertEqual(
+            environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] as? String,
+            context.root.appendingPathComponent("claude-securestorage", isDirectory: true).path
         )
     }
 
