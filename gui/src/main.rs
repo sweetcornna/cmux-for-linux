@@ -22,10 +22,10 @@ use cmux::{InputModifier, MouseButton, TerminalId, TerminalMouseKind, TerminalMo
 use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, DrawingArea, EventControllerKey,
-    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GestureClick,
-    GestureDrag, HeaderBar, Label, ListBox, ListBoxRow, Orientation, Paned, ScrolledWindow,
-    SelectionMode,
+    Align, Application, ApplicationWindow, Box as GtkBox, CenterBox, CssProvider, DrawingArea,
+    EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
+    GestureClick, GestureDrag, Label, ListBox, ListBoxRow, Orientation, Overlay, PackType, Paned,
+    ScrolledWindow, SelectionMode, WindowControls,
 };
 
 use screen::ScreenSet;
@@ -34,6 +34,8 @@ use session::{AttachmentSpec, Control, Input, Update, Worker};
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const SIDEBAR_WIDTH: i32 = 240;
+const SIDEBAR_MAX_WIDTH: i32 = 600;
 
 struct MouseTarget {
     terminal: TerminalId,
@@ -219,6 +221,151 @@ fn mouse_button_held(state: gdk::ModifierType) -> bool {
     )
 }
 
+fn clamp_sidebar_width(requested: i32, window_width: i32) -> i32 {
+    let maximum = (window_width.max(0) / 3).min(SIDEBAR_MAX_WIDTH);
+    if maximum < SIDEBAR_WIDTH {
+        maximum
+    } else {
+        requested.clamp(SIDEBAR_WIDTH, maximum)
+    }
+}
+
+fn clamp_sidebar(paned: &Paned, window: &ApplicationWindow) {
+    if window.width() <= 0 {
+        return;
+    }
+    let position = clamp_sidebar_width(paned.position(), window.width());
+    if position != paned.position() {
+        paned.set_position(position);
+    }
+}
+
+fn set_toast(toast: &Label, message: &str) {
+    toast.set_text(message);
+    toast.set_visible(true);
+}
+
+fn clear_toast(toast: &Label) {
+    toast.set_visible(false);
+}
+
+fn refresh_chrome(
+    screens: &ScreenSet,
+    theme: &view::Theme,
+    provider: &CssProvider,
+    terminal: &DrawingArea,
+    sidebar_scrims: &DrawingArea,
+    workspaces: &ListBox,
+) {
+    let Some(background) = screens
+        .focused_screen()
+        .and_then(|screen| config::Rgb::parse(screen.default_bg.as_str()))
+    else {
+        return;
+    };
+    if theme.refresh_chrome(background) {
+        provider.load_from_data(&theme.css());
+        terminal.queue_draw();
+        sidebar_scrims.queue_draw();
+        workspaces.queue_draw();
+    }
+}
+
+fn workspace_row(entry: &session::WorkspaceEntry, theme: Rc<view::Theme>) -> ListBoxRow {
+    let title = if entry.name.is_empty() {
+        "(unnamed)"
+    } else {
+        &entry.name
+    };
+    let label = Label::new(Some(title));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    label.set_single_line_mode(true);
+    label.add_css_class("workspace-title");
+
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.add_css_class("workspace-content");
+    content.append(&label);
+    if entry.terminals.len() > 1 {
+        let count = Label::new(Some(&entry.terminals.len().to_string()));
+        count.add_css_class("workspace-badge");
+        content.append(&count);
+    }
+
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&content));
+    let base_color = entry.color.as_deref().and_then(|value| {
+        config::Rgb::parse(value).or_else(|| config::workspace_palette_color(value))
+    });
+    if let Some(base_color) = base_color {
+        let rail = DrawingArea::new();
+        rail.set_content_width(3);
+        rail.set_halign(Align::Start);
+        rail.set_valign(Align::Fill);
+        rail.set_can_target(false);
+        rail.add_css_class("workspace-rail");
+        rail.set_draw_func(move |_, cr, width, height| {
+            let chrome = theme.chrome();
+            let color = chrome
+                .workspace_rail
+                .unwrap_or_else(|| config::workspace_display_color(base_color, chrome.is_light));
+            let (red, green, blue) = color.cairo();
+            let width = f64::from(width);
+            let height = f64::from(height);
+            cr.set_source_rgba(red, green, blue, 0.95);
+            let radius = 1.5_f64.min(width / 2.0).min(height / 2.0);
+            cr.new_sub_path();
+            cr.arc(
+                width - radius,
+                radius,
+                radius,
+                -std::f64::consts::FRAC_PI_2,
+                0.0,
+            );
+            cr.arc(
+                width - radius,
+                height - radius,
+                radius,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+            );
+            cr.arc(
+                radius,
+                height - radius,
+                radius,
+                std::f64::consts::FRAC_PI_2,
+                std::f64::consts::PI,
+            );
+            cr.arc(
+                radius,
+                radius,
+                radius,
+                std::f64::consts::PI,
+                std::f64::consts::PI * 1.5,
+            );
+            cr.close_path();
+            let _ = cr.fill();
+        });
+        overlay.add_overlay(&rail);
+    }
+
+    let row = ListBoxRow::new();
+    row.add_css_class("workspace-row");
+    row.set_child(Some(&overlay));
+    let drag = GestureDrag::new();
+    {
+        let row = row.clone();
+        drag.connect_drag_begin(move |_, _, _| row.add_css_class("dragging"));
+    }
+    {
+        let row = row.clone();
+        drag.connect_drag_end(move |_, _, _| row.remove_css_class("dragging"));
+    }
+    row.add_controller(drag);
+    row
+}
+
 fn build_ui(application: &Application) {
     let args = parse_args();
     let theme = Rc::new(view::Theme::new(config::load()));
@@ -231,46 +378,83 @@ fn build_ui(application: &Application) {
     ));
     let blink = Rc::new(Cell::new(view::BlinkState::new(false)));
 
-    let header = HeaderBar::new();
+    let css_provider = CssProvider::new();
+    css_provider.load_from_data(&theme.css());
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &css_provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    let titlebar = CenterBox::new();
+    titlebar.add_css_class("cmux-titlebar");
     let title = Label::new(Some(&format!("cmux — {}", args.session)));
-    header.set_title_widget(Some(&title));
+    title.add_css_class("cmux-title");
+    titlebar.set_center_widget(Some(&title));
+    let controls_start = WindowControls::new(PackType::Start);
+    let controls_end = WindowControls::new(PackType::End);
+    titlebar.set_start_widget(Some(&controls_start));
+    titlebar.set_end_widget(Some(&controls_end));
 
     let workspaces = ListBox::new();
     workspaces.set_selection_mode(SelectionMode::Single);
-    workspaces.add_css_class("navigation-sidebar");
-    let sidebar = ScrolledWindow::builder()
+    workspaces.add_css_class("workspace-list");
+    let sidebar_scroll = ScrolledWindow::builder()
         .child(&workspaces)
-        .width_request(200)
+        .hscrollbar_policy(gtk4::PolicyType::Never)
         .build();
+    sidebar_scroll.add_css_class("sidebar-surface");
+    let sidebar_scrims = view::build_sidebar_scrims(Rc::clone(&theme));
+    let sidebar = Overlay::new();
+    sidebar.add_css_class("sidebar-surface");
+    sidebar.set_child(Some(&sidebar_scroll));
+    sidebar.add_overlay(&sidebar_scrims);
     let terminal = view::build(Rc::clone(&screens), Rc::clone(&theme), Rc::clone(&blink));
 
-    let status = Label::new(Some("connecting…"));
-    status.set_xalign(0.0);
-    status.set_margin_start(8);
-    status.set_margin_end(8);
-    status.set_margin_top(4);
-    status.set_margin_bottom(4);
-    status.add_css_class("dim-label");
-
-    let terminal_side = GtkBox::new(Orientation::Vertical, 0);
-    terminal_side.append(&terminal);
-    terminal_side.append(&status);
+    let toast = Label::new(None);
+    toast.add_css_class("toast");
+    toast.set_halign(Align::Center);
+    toast.set_valign(Align::End);
+    toast.set_wrap(true);
+    toast.set_visible(false);
+    let terminal_overlay = Overlay::new();
+    terminal_overlay.set_child(Some(&terminal));
+    terminal_overlay.add_overlay(&toast);
     let paned = Paned::builder()
         .orientation(Orientation::Horizontal)
         .start_child(&sidebar)
-        .end_child(&terminal_side)
-        .position(200)
+        .end_child(&terminal_overlay)
+        .position(SIDEBAR_WIDTH)
         .resize_start_child(false)
+        .shrink_start_child(true)
+        .wide_handle(false)
         .build();
+    paned.add_css_class("cmux-split");
 
     let window = ApplicationWindow::builder()
         .application(application)
         .title("cmux")
-        .default_width(1100)
+        .default_width(1000)
         .default_height(700)
         .child(&paned)
         .build();
-    window.set_titlebar(Some(&header));
+    window.add_css_class("cmux-window");
+    window.set_size_request(300, 200);
+    window.set_titlebar(Some(&titlebar));
+
+    {
+        let window = window.clone();
+        let adjusting = Cell::new(false);
+        paned.connect_position_notify(move |paned| {
+            if adjusting.replace(true) {
+                return;
+            }
+            clamp_sidebar(paned, &window);
+            adjusting.set(false);
+        });
+    }
 
     // --- focus and blink phase -------------------------------------------
     {
@@ -306,8 +490,11 @@ fn build_ui(application: &Application) {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
         let theme = Rc::clone(&theme);
+        let paned = paned.clone();
+        let window = window.clone();
         let last = Cell::new((0i32, 0i32));
         terminal.connect_resize(move |area, width, height| {
+            clamp_sidebar(&paned, &window);
             if last.replace((width, height)) == (width, height) {
                 return;
             }
@@ -662,7 +849,10 @@ fn build_ui(application: &Application) {
         let screens = Rc::clone(&screens);
         let terminal = terminal.clone();
         let theme = Rc::clone(&theme);
-        let status = status.clone();
+        let toast = toast.clone();
+        let css_provider = css_provider.clone();
+        let sidebar_scrims = sidebar_scrims.clone();
+        let workspaces_for_theme = workspaces.clone();
         workspaces.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let Ok(index) = usize::try_from(row.index()) else {
@@ -678,13 +868,26 @@ fn build_ui(application: &Application) {
                 .cloned();
             screens.borrow_mut().set_workspace(entry.view.clone());
             sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
+            refresh_chrome(
+                &screens.borrow(),
+                &theme,
+                &css_provider,
+                &terminal,
+                &sidebar_scrims,
+                &workspaces_for_theme,
+            );
             terminal.queue_draw();
             let _ = worker.input.send(Input::FocusWorkspace {
                 workspace: entry.id,
                 target,
             });
             if entry.terminals.is_empty() {
-                status.set_text(&format!("workspace '{}' has no terminal tabs", entry.name));
+                set_toast(
+                    &toast,
+                    &format!("Workspace '{}' has no terminal tabs", entry.name),
+                );
+            } else {
+                clear_toast(&toast);
             }
         });
     }
@@ -693,18 +896,22 @@ fn build_ui(application: &Application) {
     {
         let screens = Rc::clone(&screens);
         let terminal = terminal.clone();
-        let status = status.clone();
+        let toast = toast.clone();
         let workspaces = workspaces.clone();
         let entries = Rc::clone(&entries);
         let worker = Rc::clone(&worker);
         let theme = Rc::clone(&theme);
+        let css_provider = css_provider.clone();
+        let sidebar_scrims = sidebar_scrims.clone();
         gtk4::glib::spawn_future_local(async move {
             while let Ok(update) = update_rx.recv().await {
                 match update {
                     Update::Connected { session_name } => {
-                        status.set_text(&format!("connected to session '{session_name}'"));
+                        eprintln!("connected to session '{session_name}'");
+                        clear_toast(&toast);
                     }
                     Update::Workspaces(list) => {
+                        let empty = list.is_empty();
                         let focused = list
                             .iter()
                             .find(|entry| entry.focused)
@@ -716,23 +923,7 @@ fn build_ui(application: &Application) {
                                 workspaces.remove(&child);
                             }
                             for entry in &list {
-                                let name = if entry.name.is_empty() {
-                                    "(unnamed)".to_string()
-                                } else {
-                                    entry.name.clone()
-                                };
-                                let label = Label::new(Some(&if entry.terminals.len() > 1 {
-                                    format!("{name}  ·  {}", entry.terminals.len())
-                                } else {
-                                    name
-                                }));
-                                label.set_xalign(0.0);
-                                label.set_margin_start(10);
-                                label.set_margin_end(10);
-                                label.set_margin_top(6);
-                                label.set_margin_bottom(6);
-                                let row = ListBoxRow::new();
-                                row.set_child(Some(&label));
+                                let row = workspace_row(entry, Rc::clone(&theme));
                                 workspaces.append(&row);
                             }
                             *entries.borrow_mut() = list;
@@ -747,6 +938,14 @@ fn build_ui(application: &Application) {
                             screens.borrow_mut().set_workspace(entry.view.clone());
                             let _ = worker.input.send(Input::SetTarget(target));
                             sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
+                            refresh_chrome(
+                                &screens.borrow(),
+                                &theme,
+                                &css_provider,
+                                &terminal,
+                                &sidebar_scrims,
+                                &workspaces,
+                            );
                             if changed {
                                 let index = entries
                                     .borrow()
@@ -761,12 +960,15 @@ fn build_ui(application: &Application) {
                         } else {
                             screens.borrow_mut().set_workspace(None);
                             sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
+                            if empty {
+                                set_toast(&toast, "The session has no workspaces");
+                            }
                         }
                         terminal.queue_draw();
                     }
                     Update::Attached { terminal: id } => {
                         eprintln!("viewer attached to {id:?}");
-                        status.set_text("attached");
+                        clear_toast(&toast);
                         terminal.grab_focus();
                     }
                     Update::Snapshot {
@@ -775,6 +977,14 @@ fn build_ui(application: &Application) {
                     } => {
                         if screens.borrow().contains_terminal(&id) {
                             screens.borrow_mut().apply_snapshot(id, *render);
+                            refresh_chrome(
+                                &screens.borrow(),
+                                &theme,
+                                &css_provider,
+                                &terminal,
+                                &sidebar_scrims,
+                                &workspaces,
+                            );
                             terminal.queue_draw();
                         }
                     }
@@ -784,9 +994,19 @@ fn build_ui(application: &Application) {
                     } => {
                         if screens.borrow().contains_terminal(&id) {
                             match screens.borrow_mut().apply_patch(&id, *render) {
-                                Ok(()) => terminal.queue_draw(),
+                                Ok(()) => {
+                                    refresh_chrome(
+                                        &screens.borrow(),
+                                        &theme,
+                                        &css_provider,
+                                        &terminal,
+                                        &sidebar_scrims,
+                                        &workspaces,
+                                    );
+                                    terminal.queue_draw();
+                                }
                                 Err(error) => {
-                                    status.set_text(&format!("render desync: {error}"));
+                                    set_toast(&toast, &format!("Render desync: {error}"));
                                 }
                             }
                         }
@@ -798,20 +1018,16 @@ fn build_ui(application: &Application) {
                         let focused = screens.borrow().focused_terminal() == Some(&id);
                         screens.borrow_mut().apply_scroll(&id, at_bottom);
                         if focused {
-                            status.set_text(if at_bottom {
-                                "attached"
-                            } else {
-                                "scrolled back"
-                            });
+                            clear_toast(&toast);
                         }
                         terminal.queue_draw();
                     }
                     Update::Detached { terminal: id } => {
                         if screens.borrow().contains_terminal(&id) {
-                            status.set_text(&format!("detached from {id:?}; reconnecting"));
+                            set_toast(&toast, &format!("Detached from {id:?}; reconnecting"));
                         }
                     }
-                    Update::Error(message) => status.set_text(&message),
+                    Update::Error(message) => set_toast(&toast, &message),
                 }
             }
         });
@@ -837,4 +1053,18 @@ fn build_ui(application: &Application) {
 
     window.present();
     terminal.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidebar_width_is_clamped_to_metrics_and_one_third() {
+        assert_eq!(clamp_sidebar_width(100, 1000), 240);
+        assert_eq!(clamp_sidebar_width(400, 1000), 333);
+        assert_eq!(clamp_sidebar_width(900, 2400), 600);
+        assert_eq!(clamp_sidebar_width(240, 699), 233);
+        assert_eq!(clamp_sidebar_width(240, 300), 100);
+    }
 }

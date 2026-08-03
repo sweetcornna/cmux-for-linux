@@ -16,10 +16,16 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{gdk, DrawingArea};
 
-use crate::config::{Rgb, Settings};
+use crate::config::{
+    ChromeColors, ChromeMode, Rgb, Settings, ThemeOverrides, DEFAULT_DARK_BACKGROUND,
+    DEFAULT_LIGHT_BACKGROUND,
+};
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 
-const TAB_PAD: f64 = 4.0;
+const TAB_HEIGHT: f64 = 28.0;
+const TAB_FADE_WIDTH: f64 = 100.0;
+const SIDEBAR_SCRIM_HEIGHT: f64 = 50.0;
+const UNFOCUSED_PANE_OPACITY: f64 = 0.70;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlinkState {
@@ -52,6 +58,10 @@ impl BlinkState {
         } else {
             false
         }
+    }
+
+    fn window_active(self) -> bool {
+        self.window_active
     }
 }
 
@@ -121,21 +131,44 @@ impl MouseMoveThrottle {
 
 pub struct Theme {
     font: pango::FontDescription,
-    border_active: Rgb,
-    border_inactive: Rgb,
-    selection_background: Rgb,
-    selection_foreground: Option<Rgb>,
+    chrome_mode: ChromeMode,
+    overrides: ThemeOverrides,
+    chrome: RefCell<ChromeColors>,
 }
 
 impl Theme {
     pub fn new(settings: Settings) -> Self {
+        let fallback = match settings.chrome {
+            ChromeMode::Light => DEFAULT_LIGHT_BACKGROUND,
+            ChromeMode::Auto | ChromeMode::Dark => DEFAULT_DARK_BACKGROUND,
+        };
         Self {
             font: pango::FontDescription::from_string(&settings.font),
-            border_active: settings.border_active,
-            border_inactive: settings.border_inactive,
-            selection_background: settings.selection_background,
-            selection_foreground: settings.selection_foreground,
+            chrome_mode: settings.chrome,
+            overrides: settings.theme,
+            chrome: RefCell::new(ChromeColors::derive(
+                fallback,
+                settings.chrome,
+                settings.theme,
+            )),
         }
+    }
+
+    pub fn refresh_chrome(&self, background: Rgb) -> bool {
+        let colors = ChromeColors::derive(background, self.chrome_mode, self.overrides);
+        if *self.chrome.borrow() == colors {
+            return false;
+        }
+        *self.chrome.borrow_mut() = colors;
+        true
+    }
+
+    pub fn chrome(&self) -> ChromeColors {
+        self.chrome.borrow().clone()
+    }
+
+    pub fn css(&self) -> String {
+        self.chrome.borrow().css()
     }
 }
 
@@ -389,7 +422,7 @@ fn walk_stack(
         .iter()
         .position(|pane| pane == expanded)
         .unwrap_or(pane_ids.len() - 1);
-    let header_height = metrics.height + TAB_PAD * 2.0;
+    let header_height = TAB_HEIGHT;
     let visible_headers = ((rect.height / header_height).floor() as usize)
         .saturating_sub(1)
         .min(pane_ids.len() - 1);
@@ -438,14 +471,14 @@ fn push_pane(
     pane_id: &PaneId,
     rect: Rect,
     stack_header: bool,
-    metrics: CellMetrics,
+    _metrics: CellMetrics,
     out: &mut Vec<PaneGeometry>,
 ) {
     let Some(pane) = workspace.pane(pane_id) else {
         return;
     };
-    let tab_height = if !stack_header && pane.tabs.len() > 1 {
-        (metrics.height + TAB_PAD * 2.0).min(rect.height)
+    let tab_height = if !stack_header && !pane.tabs.is_empty() {
+        TAB_HEIGHT.min(rect.height)
     } else {
         0.0
     };
@@ -568,7 +601,9 @@ pub fn build(
     area.set_vexpand(true);
 
     area.set_draw_func(move |area, cr, width, height| {
-        cr.set_source_rgb(0.063, 0.063, 0.063);
+        let chrome = theme.chrome();
+        let (red, green, blue) = chrome.background.cairo();
+        cr.set_source_rgb(red, green, blue);
         let _ = cr.paint();
 
         let screens = screens.borrow();
@@ -603,10 +638,10 @@ pub fn build(
                     let (r, g, b) = parse_color(screen.default_bg.as_str());
                     cr.set_source_rgb(r, g, b);
                     cr.rectangle(
-                        geometry.rect.x,
-                        geometry.rect.y,
-                        geometry.rect.width,
-                        geometry.rect.height,
+                        geometry.content.x,
+                        geometry.content.y,
+                        geometry.content.width,
+                        geometry.content.height,
                     );
                     let _ = cr.fill();
                     let _ = cr.save();
@@ -635,18 +670,115 @@ pub fn build(
             }
 
             if !geometry.tabs.is_empty() {
-                draw_tabs(area, cr, workspace.pane(&geometry.pane), geometry, &theme);
+                draw_tabs(
+                    area,
+                    cr,
+                    workspace.pane(&geometry.pane),
+                    geometry,
+                    &chrome,
+                    blink.get().window_active(),
+                );
+            }
+            let focused = geometry.pane == workspace.layout.active_pane_id;
+            if !focused {
+                let (red, green, blue) = chrome.background.cairo();
+                cr.set_source_rgba(red, green, blue, 1.0 - UNFOCUSED_PANE_OPACITY);
+                cr.rectangle(
+                    geometry.rect.x,
+                    geometry.rect.y,
+                    geometry.rect.width,
+                    geometry.rect.height,
+                );
+                let _ = cr.fill();
             }
             let _ = cr.restore();
-            draw_border(
-                cr,
-                geometry.rect,
-                geometry.pane == workspace.layout.active_pane_id,
-                &theme,
-            );
+            draw_border(cr, geometry.rect, focused, &chrome);
         }
     });
     area
+}
+
+pub fn build_sidebar_scrims(theme: Rc<Theme>) -> DrawingArea {
+    let scrims = DrawingArea::new();
+    scrims.set_hexpand(true);
+    scrims.set_vexpand(true);
+    scrims.set_can_target(false);
+    scrims.set_draw_func(move |_, cr, width, height| {
+        let colors = theme.chrome();
+        let (red, green, blue) = colors.sidebar_background.cairo();
+        let height = f64::from(height);
+        let scrim_height = SIDEBAR_SCRIM_HEIGHT.min(height / 2.0);
+        if scrim_height <= 0.0 {
+            return;
+        }
+
+        let top = gtk4::cairo::LinearGradient::new(0.0, 0.0, 0.0, scrim_height);
+        top.add_color_stop_rgba(0.0, red, green, blue, 1.0);
+        top.add_color_stop_rgba(1.0, red, green, blue, 0.0);
+        let _ = cr.set_source(&top);
+        cr.rectangle(0.0, 0.0, f64::from(width), scrim_height);
+        let _ = cr.fill();
+
+        let bottom = gtk4::cairo::LinearGradient::new(0.0, height - scrim_height, 0.0, height);
+        bottom.add_color_stop_rgba(0.0, red, green, blue, 0.0);
+        bottom.add_color_stop_rgba(1.0, red, green, blue, 1.0);
+        let _ = cr.set_source(&bottom);
+        cr.rectangle(0.0, height - scrim_height, f64::from(width), scrim_height);
+        let _ = cr.fill();
+    });
+    scrims
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum TaskStatus {
+    Neutral,
+    Running,
+    Attention,
+    Done,
+}
+
+#[allow(dead_code)]
+pub fn draw_spokes_spinner(
+    cr: &gtk4::cairo::Context,
+    center_x: f64,
+    center_y: f64,
+    phase: usize,
+    foreground: Rgb,
+) {
+    let (red, green, blue) = foreground.cairo();
+    cr.set_line_width(1.25);
+    cr.set_line_cap(gtk4::cairo::LineCap::Round);
+    for spoke in 0..12 {
+        let angle = std::f64::consts::TAU * spoke as f64 / 12.0;
+        let age = (spoke + 12 - phase % 12) % 12;
+        let alpha = 0.18 + 0.82 * (12 - age) as f64 / 12.0;
+        cr.set_source_rgba(red, green, blue, alpha);
+        cr.move_to(center_x + angle.cos() * 3.0, center_y + angle.sin() * 3.0);
+        cr.line_to(center_x + angle.cos() * 5.5, center_y + angle.sin() * 5.5);
+        let _ = cr.stroke();
+    }
+}
+
+#[allow(dead_code)]
+pub fn draw_task_status_ring(
+    cr: &gtk4::cairo::Context,
+    center_x: f64,
+    center_y: f64,
+    status: TaskStatus,
+    colors: &ChromeColors,
+) {
+    let (color, alpha) = match status {
+        TaskStatus::Neutral => (colors.sidebar_dim_foreground, 0.8),
+        TaskStatus::Running => (colors.accent, 1.0),
+        TaskStatus::Attention => (Rgb(0xff, 0x6b, 0x33), 1.0),
+        TaskStatus::Done => (Rgb(0x73, 0x9e, 0x80), 1.0),
+    };
+    let (red, green, blue) = color.cairo();
+    cr.set_source_rgba(red, green, blue, alpha);
+    cr.set_line_width(1.5);
+    cr.arc(center_x, center_y, 3.75, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
 }
 
 fn draw_grid(
@@ -664,14 +796,14 @@ fn draw_grid(
     }
     draw_grid_backgrounds(cr, screen, metrics, height);
     if draw_selection && screen.selection.is_some() {
-        let (r, g, b) = theme.selection_background.cairo();
+        let (r, g, b) = theme.chrome().selection_background.cairo();
         cr.set_source_rgb(r, g, b);
         selection_path(cr, screen, metrics);
         let _ = cr.fill();
     }
     draw_grid_text(area, cr, screen, metrics, height, &theme.font, None, blink);
     if draw_selection && screen.selection.is_some() {
-        if let Some(foreground) = theme.selection_foreground {
+        if let Some(foreground) = theme.chrome().selection_foreground {
             let _ = cr.save();
             selection_path(cr, screen, metrics);
             cr.clip();
@@ -843,29 +975,37 @@ fn draw_tabs(
     cr: &gtk4::cairo::Context,
     pane: Option<&PaneView>,
     geometry: &PaneGeometry,
-    theme: &Theme,
+    colors: &ChromeColors,
+    window_active: bool,
 ) {
     let Some(pane) = pane else { return };
     let layout = area.create_pango_layout(None);
-    layout.set_font_description(Some(&theme.font));
+    let mut tab_font = pango::FontDescription::from_string("Sans");
+    tab_font.set_absolute_size(11.0 * f64::from(pango::SCALE));
+    layout.set_font_description(Some(&tab_font));
     layout.set_ellipsize(pango::EllipsizeMode::End);
+    if colors.tab_bar_is_opaque {
+        let (red, green, blue) = colors.tab_bar_background.cairo();
+        cr.set_source_rgb(red, green, blue);
+        cr.rectangle(
+            geometry.rect.x,
+            geometry.rect.y,
+            geometry.rect.width,
+            TAB_HEIGHT.min(geometry.rect.height),
+        );
+        let _ = cr.fill();
+    }
     for (tab, hit) in pane.tabs.iter().zip(&geometry.tabs) {
         let active = pane.active_tab().is_some_and(|active| active.id == tab.id);
         if active {
-            cr.set_source_rgb(0.18, 0.2, 0.24);
-        } else {
-            cr.set_source_rgb(0.10, 0.11, 0.13);
-        }
-        cr.rectangle(hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height);
-        let _ = cr.fill();
-        if active {
-            cr.set_source_rgb(0.38, 0.68, 0.86);
-            cr.rectangle(
-                hit.rect.x,
-                hit.rect.y + hit.rect.height - 2.0,
-                hit.rect.width,
-                2.0,
-            );
+            let background = if window_active {
+                colors.tab_active_background
+            } else {
+                colors.tab_active_unfocused_background
+            };
+            let (red, green, blue) = background.cairo();
+            cr.set_source_rgb(red, green, blue);
+            cr.rectangle(hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height);
             let _ = cr.fill();
         }
         layout.set_width(((hit.rect.width - 12.0).max(1.0) * f64::from(pango::SCALE)) as i32);
@@ -878,10 +1018,49 @@ fn draw_tabs(
                     TabContent::Browser => "browser",
                 }),
         );
-        cr.set_source_rgb(0.84, 0.85, 0.87);
-        cr.move_to(hit.rect.x + 6.0, hit.rect.y + TAB_PAD);
+        let foreground = if active && window_active {
+            colors.tab_active_foreground
+        } else if active {
+            colors.tab_active_unfocused_foreground
+        } else {
+            colors.tab_foreground
+        };
+        let (red, green, blue) = foreground.cairo();
+        cr.set_source_rgb(red, green, blue);
+        let (_, logical) = layout.pixel_extents();
+        let text_y = hit.rect.y + (hit.rect.height - f64::from(logical.height())) / 2.0
+            - f64::from(logical.y());
+        cr.move_to(hit.rect.x + 6.0, text_y);
         pangocairo::functions::show_layout(cr, &layout);
     }
+    draw_tab_fade_mask(cr, geometry, colors);
+}
+
+fn draw_tab_fade_mask(cr: &gtk4::cairo::Context, geometry: &PaneGeometry, colors: &ChromeColors) {
+    let width = TAB_FADE_WIDTH.min(geometry.rect.width.max(0.0));
+    if width <= 0.0 {
+        return;
+    }
+    let right = geometry.rect.x + geometry.rect.width;
+    let left = right - width;
+    let background = if colors.tab_bar_is_opaque {
+        colors.tab_bar_background
+    } else {
+        colors.background
+    };
+    let (red, green, blue) = background.cairo();
+    let gradient = gtk4::cairo::LinearGradient::new(left, 0.0, right, 0.0);
+    gradient.add_color_stop_rgba(0.0, red, green, blue, 0.0);
+    gradient.add_color_stop_rgba(0.60, red, green, blue, 0.0);
+    gradient.add_color_stop_rgba(1.0, red, green, blue, 0.86);
+    let _ = cr.set_source(&gradient);
+    cr.rectangle(
+        left,
+        geometry.rect.y,
+        width,
+        TAB_HEIGHT.min(geometry.rect.height),
+    );
+    let _ = cr.fill();
 }
 
 fn draw_stack_header(
@@ -891,16 +1070,26 @@ fn draw_stack_header(
     rect: Rect,
     theme: &Theme,
 ) {
-    cr.set_source_rgb(0.10, 0.11, 0.13);
-    cr.rectangle(rect.x, rect.y, rect.width, rect.height);
-    let _ = cr.fill();
+    let colors = theme.chrome();
+    if colors.tab_bar_is_opaque {
+        let (red, green, blue) = colors.tab_bar_background.cairo();
+        cr.set_source_rgb(red, green, blue);
+        cr.rectangle(rect.x, rect.y, rect.width, rect.height);
+        let _ = cr.fill();
+    }
     let layout = area.create_pango_layout(None);
-    layout.set_font_description(Some(&theme.font));
+    let mut tab_font = pango::FontDescription::from_string("Sans");
+    tab_font.set_absolute_size(11.0 * f64::from(pango::SCALE));
+    layout.set_font_description(Some(&tab_font));
     layout.set_ellipsize(pango::EllipsizeMode::End);
     layout.set_width(((rect.width - 12.0).max(1.0) * f64::from(pango::SCALE)) as i32);
     layout.set_text(pane.and_then(|pane| pane.name.as_deref()).unwrap_or("pane"));
-    cr.set_source_rgb(0.78, 0.80, 0.82);
-    cr.move_to(rect.x + 6.0, rect.y + TAB_PAD);
+    let (red, green, blue) = colors.tab_foreground.cairo();
+    cr.set_source_rgb(red, green, blue);
+    let (_, logical) = layout.pixel_extents();
+    let text_y =
+        rect.y + (rect.height - f64::from(logical.height())) / 2.0 - f64::from(logical.y());
+    cr.move_to(rect.x + 6.0, text_y);
     pangocairo::functions::show_layout(cr, &layout);
 }
 
@@ -910,32 +1099,43 @@ fn draw_browser_placeholder(
     rect: Rect,
     theme: &Theme,
 ) {
-    cr.set_source_rgb(0.075, 0.08, 0.09);
+    let colors = theme.chrome();
+    let (red, green, blue) = colors.background.cairo();
+    cr.set_source_rgb(red, green, blue);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     let _ = cr.fill();
     let layout = area.create_pango_layout(Some("browser tab - not supported"));
     layout.set_font_description(Some(&theme.font));
-    cr.set_source_rgb(0.62, 0.64, 0.67);
+    let (red, green, blue) = colors.sidebar_dim_foreground.cairo();
+    cr.set_source_rgb(red, green, blue);
     cr.move_to(rect.x + 12.0, rect.y + 12.0);
     pangocairo::functions::show_layout(cr, &layout);
 }
 
-fn draw_border(cr: &gtk4::cairo::Context, rect: Rect, focused: bool, theme: &Theme) {
-    let inset = if focused { 1.0 } else { 0.5 };
-    if focused {
-        let (r, g, b) = theme.border_active.cairo();
-        cr.set_source_rgb(r, g, b);
-        cr.set_line_width(2.0);
-    } else {
-        let (r, g, b) = theme.border_inactive.cairo();
-        cr.set_source_rgb(r, g, b);
-        cr.set_line_width(1.0);
-    }
+fn draw_border(cr: &gtk4::cairo::Context, rect: Rect, focused: bool, colors: &ChromeColors) {
+    let (red, green, blue) = colors.pane_separator.color.cairo();
+    cr.set_source_rgba(red, green, blue, colors.pane_separator.alpha);
+    cr.set_line_width(1.0);
     cr.rectangle(
-        rect.x + inset,
-        rect.y + inset,
-        (rect.width - inset * 2.0).max(0.0),
-        (rect.height - inset * 2.0).max(0.0),
+        rect.x + 0.5,
+        rect.y + 0.5,
+        (rect.width - 1.0).max(0.0),
+        (rect.height - 1.0).max(0.0),
+    );
+    let _ = cr.stroke();
+
+    if !focused || !colors.draw_active_border {
+        return;
+    }
+    let active = colors.border_active_foreground;
+    let (red, green, blue) = active.cairo();
+    cr.set_source_rgb(red, green, blue);
+    cr.set_line_width(2.0);
+    cr.rectangle(
+        rect.x + 1.0,
+        rect.y + 1.0,
+        (rect.width - 2.0).max(0.0),
+        (rect.height - 2.0).max(0.0),
     );
     let _ = cr.stroke();
 }
@@ -1155,11 +1355,11 @@ mod tests {
         assert_eq!(sizes.len(), 2);
         assert!(sizes
             .iter()
-            .all(|(_, size)| *size == Size { cols: 50, rows: 30 }));
+            .all(|(_, size)| *size == Size { cols: 50, rows: 28 }));
     }
 
     #[test]
-    fn tab_strip_reserves_rows_and_exposes_browser_hitbox() {
+    fn tab_strip_is_always_28_points_and_exposes_browser_hitbox() {
         let screens = split_workspace(true);
         let metrics = CellMetrics {
             width: 10.0,
@@ -1173,7 +1373,7 @@ mod tests {
         assert!(panes[0].tabs[1].rect.contains(375.0, 10.0));
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
         assert_eq!(sizes[0].1, Size { cols: 50, rows: 28 });
-        assert_eq!(sizes[1].1, Size { cols: 50, rows: 30 });
+        assert_eq!(sizes[1].1, Size { cols: 50, rows: 28 });
     }
 
     #[test]

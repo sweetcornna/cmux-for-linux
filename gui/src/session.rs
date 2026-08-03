@@ -107,6 +107,7 @@ pub enum Control {
 pub struct WorkspaceEntry {
     pub id: WorkspaceId,
     pub name: String,
+    pub color: Option<String>,
     pub focused: bool,
     pub terminals: Vec<TerminalId>,
     pub view: Option<WorkspaceView>,
@@ -620,9 +621,14 @@ fn publish_workspaces(
             .find(|(focused, _)| *focused)
             .or_else(|| views.first())
             .map(|(_, view)| view.clone());
+        let color = ["color", "color_name", "color_hex", "workspace_color"]
+            .into_iter()
+            .find_map(|key| snapshot.extra.get(key).and_then(serde_json::Value::as_str))
+            .map(str::to_string);
         entries.push(WorkspaceEntry {
             id: snapshot.id,
             name: snapshot.name,
+            color,
             focused: snapshot.focused,
             terminals,
             view,

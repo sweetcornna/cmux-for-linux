@@ -28,6 +28,7 @@ normally be terminal-emulation complexity stays server-side.
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | GTK application, window, sidebar, wiring |
+| `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
 | `src/session.rs` | protocol worker threads; the UI thread never blocks on a socket |
 | `src/screen.rs` | the cell grid, and snapshot/patch merge semantics |
 | `src/view.rs` | cairo/Pango drawing and key-to-bytes translation |
@@ -48,26 +49,47 @@ cargo run --release -- --probe --session main
 
 | | |
 | --- | --- |
+| Window chrome | custom 28px titlebar, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
 | Panes | split layouts with per-pane PTY sizing and click-to-focus |
-| Tabs | a tab strip for the session's tabs |
+| Pane chrome | derived 1px separators, optional configured 2px active borders, and 70% dimming for inactive panes |
+| Tabs | an always-visible 28px strip with focused/unfocused active states and the upstream action-lane fade |
 | Input | keyboard input, including Ctrl and Alt sequences; `Ctrl+Shift+V` paste with server-side bracketed-paste handling; mouse input to applications |
-| Workspaces | sidebar switching with a topology refresh every 3 seconds |
+| Workspaces | macOS-parity sidebar rows, draggable width clamped to one third of the window, switching, and a topology refresh every 3 seconds |
 | Resize | dynamic window resize updates the pane PTY sizes |
 | Scrollback | the mouse wheel scrolls the viewport |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
-| Theme | border colours from `cmux-tui.json`; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
+| Theme | runtime chrome colors from the active terminal background plus explicit `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
 
-## Configuration
+The visual metrics and color rules follow
+[`../docs/gtk-design-parity.md`](../docs/gtk-design-parity.md).
+
+## Theme
+
+Window chrome is recomputed whenever the active terminal's resolved background
+changes. The separator uses the upstream lightness offset, the sidebar is a
+solid approximation of the macOS sidebar material, and `theme.chrome` accepts
+`auto`, `light`, or `dark`. `auto` uses the same luminance threshold as the
+TUI. Before the first render state arrives, fallback backgrounds are `#1e1e1e`
+for dark/auto and `#feffff` for light.
 
 The GTK frontend honors these keys under `theme` in `cmux-tui.json`:
 
+- `chrome`
 - `border_active`
 - `border_inactive`
 - `selection_background`
 - `selection_foreground`
+- `sidebar_rail`
+- `sidebar_active_bg`
+- `tab_bg`
+- `tab_active_bg`
 
-Xterm-256 colour indexes are accepted for these values. A malformed
+Explicit theme colors take precedence over the parity defaults. In particular,
+the 2px active-pane border is off unless `border_active` is configured.
+`sidebar_rail` overrides the rail color when workspace metadata supplies a
+workspace color; no rail is drawn for an uncolored workspace.
+Xterm-256 colour indexes are accepted for color values. A malformed
 `cmux-tui.json` or `cmux-gtk.json` does not prevent startup; the frontend
 retains its defaults for settings it cannot read.
 

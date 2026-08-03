@@ -111,7 +111,7 @@ available if a future stage needs terminal emulation client-side.
 | --- | --- | --- |
 | 0 | Fork, Linux-only tree, toolchain, native packages | **done** |
 | 1 | GTK4 window driven over `cmux.protocol/1`: workspace sidebar, terminal rendering, keyboard, resize, scrollback, selection | **done** - see [`../gui/README.md`](../gui/README.md) |
-| 2 | Parity pass: pane layouts, tabs, mouse input, themes and input behavior | **substantially done** - verified items and remaining tail below |
+| 2 | Parity pass: pane layouts, tabs, mouse input, themes, macOS visual parity and input behavior | **substantially done** - verified items and remaining tail below |
 | 3 | Package the GUI alongside the TUI | **done** - separate `cmux-gtk` package |
 
 The stage 2 work verified against live sessions includes pane splits with
@@ -126,6 +126,16 @@ covered by the GUI tests are `Ctrl+Shift+V` through the server's
 bracketed-paste path, cell-throttled no-button mouse movement for mode 1003
 applications, and protocol-driven cursor and text blink animation with a stable
 unfocused cursor.
+
+The GTK window chrome now follows the extracted upstream design contract in
+[`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
+240px resizable workspace sidebar, always-visible 28px pane tab strips,
+derived 1px separators, inactive-pane dimming, and overlay error toasts in
+place of a status bar. Chrome colors are recomputed from the active terminal's
+resolved background, with auto/light/dark semantics and explicit
+`cmux-tui.json` theme values taking precedence. This remains a presentation
+change only; render state, input, mouse reporting and PTY sizing still cross
+`cmux.protocol/1`, and the server remains the sole VT implementation.
 
 The remaining stage 2 tail is:
 

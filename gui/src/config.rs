@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 const DEFAULT_FONT: &str = "monospace 11";
+pub const DEFAULT_DARK_BACKGROUND: Rgb = Rgb(0x1e, 0x1e, 0x1e);
+pub const DEFAULT_LIGHT_BACKGROUND: Rgb = Rgb(0xfe, 0xff, 0xff);
+pub const DEFAULT_CURSOR: Rgb = Rgb(0x98, 0x98, 0x9d);
+pub const DEFAULT_DARK_SELECTION_BACKGROUND: Rgb = Rgb(0x3f, 0x63, 0x8b);
+pub const DEFAULT_LIGHT_SELECTION_BACKGROUND: Rgb = Rgb(0xab, 0xd8, 0xff);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -22,27 +27,520 @@ impl Rgb {
             f64::from(self.2) / 255.0,
         )
     }
+
+    fn css(self) -> String {
+        format!("#{:02x}{:02x}{:02x}", self.0, self.1, self.2)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        parse_color_string(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChromeMode {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThemeOverrides {
+    pub selection_background: Option<Rgb>,
+    pub selection_foreground: Option<Option<Rgb>>,
+    pub sidebar_rail: Option<Rgb>,
+    pub sidebar_selected_background: Option<Rgb>,
+    pub tab_bar_background: Option<Rgb>,
+    pub tab_active_background: Option<Rgb>,
+    pub border_active: Option<Rgb>,
+    pub border_inactive: Option<Rgb>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub font: String,
-    pub border_active: Rgb,
-    pub border_inactive: Rgb,
-    pub selection_background: Rgb,
-    pub selection_foreground: Option<Rgb>,
+    pub chrome: ChromeMode,
+    pub theme: ThemeOverrides,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             font: DEFAULT_FONT.to_string(),
-            border_active: xterm_color(110),
-            border_inactive: xterm_color(238),
-            selection_background: Rgb(0x3a, 0x3a, 0x3a),
-            selection_foreground: None,
+            chrome: ChromeMode::Auto,
+            theme: ThemeOverrides::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rgba {
+    pub color: Rgb,
+    pub alpha: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChromeColors {
+    pub background: Rgb,
+    pub foreground: Rgb,
+    pub cursor: Rgb,
+    pub separator: Rgba,
+    pub pane_separator: Rgba,
+    pub sidebar_background: Rgb,
+    pub selection_background: Rgb,
+    pub chrome_selection_background: Rgb,
+    pub selection_foreground: Option<Rgb>,
+    pub accent: Rgb,
+    pub tab_bar_background: Rgb,
+    pub tab_bar_is_opaque: bool,
+    pub tab_foreground: Rgb,
+    pub tab_active_background: Rgb,
+    pub tab_active_foreground: Rgb,
+    pub tab_active_unfocused_background: Rgb,
+    pub tab_active_unfocused_foreground: Rgb,
+    pub sidebar_selected_background: Rgb,
+    pub sidebar_selected_foreground: Rgb,
+    pub sidebar_dim_foreground: Rgb,
+    pub sidebar_border: Rgb,
+    pub border_foreground: Rgb,
+    pub border_active_foreground: Rgb,
+    pub draw_active_border: bool,
+    pub menu_background: Rgb,
+    pub menu_foreground: Rgb,
+    pub toast_background: Rgb,
+    pub toast_foreground: Rgb,
+    pub scrollbar_thumb_foreground: Rgb,
+    pub workspace_rail: Option<Rgb>,
+    pub is_light: bool,
+}
+
+impl ChromeColors {
+    pub fn derive(background: Rgb, mode: ChromeMode, overrides: ThemeOverrides) -> Self {
+        let is_light = match mode {
+            ChromeMode::Auto => is_light_background(background),
+            ChromeMode::Light => true,
+            ChromeMode::Dark => false,
+        };
+        let separator = separator_color(background);
+        let pane_separator = overrides
+            .border_inactive
+            .map(|color| Rgba { color, alpha: 1.0 })
+            .unwrap_or(separator);
+
+        let mut colors = if is_light {
+            Self {
+                background,
+                foreground: Rgb(0x00, 0x00, 0x00),
+                cursor: DEFAULT_CURSOR,
+                separator,
+                pane_separator,
+                sidebar_background: sidebar_background(background),
+                selection_background: DEFAULT_LIGHT_SELECTION_BACKGROUND,
+                chrome_selection_background: Rgb(0xcc, 0xdd, 0xf5),
+                selection_foreground: Some(Rgb(0x00, 0x00, 0x00)),
+                accent: Rgb(0x00, 0x88, 0xff),
+                tab_bar_background: Rgb(0xe4, 0xe4, 0xe4),
+                tab_bar_is_opaque: false,
+                tab_foreground: Rgb(0x58, 0x58, 0x58),
+                tab_active_background: Rgb(0xd0, 0xd0, 0xd0),
+                tab_active_foreground: Rgb(0x1c, 0x1c, 0x1c),
+                tab_active_unfocused_background: Rgb(0xda, 0xda, 0xda),
+                tab_active_unfocused_foreground: Rgb(0x30, 0x30, 0x30),
+                sidebar_selected_background: Rgb(0xda, 0xda, 0xda),
+                sidebar_selected_foreground: Rgb(0x1c, 0x1c, 0x1c),
+                sidebar_dim_foreground: Rgb(0x6c, 0x6c, 0x6c),
+                sidebar_border: Rgb(0x94, 0x94, 0x94),
+                border_foreground: Rgb(0x94, 0x94, 0x94),
+                border_active_foreground: overrides.border_active.unwrap_or(Rgb(0x00, 0x87, 0xaf)),
+                draw_active_border: overrides.border_active.is_some(),
+                menu_background: Rgb(0xe4, 0xe4, 0xe4),
+                menu_foreground: Rgb(0x30, 0x30, 0x30),
+                toast_background: Rgb(0xd0, 0xd0, 0xd0),
+                toast_foreground: Rgb(0x1c, 0x1c, 0x1c),
+                scrollbar_thumb_foreground: Rgb(0x94, 0x94, 0x94),
+                workspace_rail: overrides.sidebar_rail,
+                is_light,
+            }
+        } else {
+            Self {
+                background,
+                foreground: Rgb(0xff, 0xff, 0xff),
+                cursor: DEFAULT_CURSOR,
+                separator,
+                pane_separator,
+                sidebar_background: sidebar_background(background),
+                selection_background: DEFAULT_DARK_SELECTION_BACKGROUND,
+                chrome_selection_background: Rgb(0x3a, 0x3a, 0x3a),
+                selection_foreground: Some(Rgb(0xff, 0xff, 0xff)),
+                accent: Rgb(0x00, 0x91, 0xff),
+                tab_bar_background: Rgb(0x30, 0x30, 0x30),
+                tab_bar_is_opaque: false,
+                tab_foreground: Rgb(0xa8, 0xa8, 0xa8),
+                tab_active_background: Rgb(0x58, 0x58, 0x58),
+                tab_active_foreground: Rgb(0xee, 0xee, 0xee),
+                tab_active_unfocused_background: Rgb(0x44, 0x44, 0x44),
+                tab_active_unfocused_foreground: Rgb(0xd0, 0xd0, 0xd0),
+                sidebar_selected_background: Rgb(0x30, 0x30, 0x30),
+                sidebar_selected_foreground: Rgb(0xee, 0xee, 0xee),
+                sidebar_dim_foreground: Rgb(0x6c, 0x6c, 0x6c),
+                sidebar_border: Rgb(0x3a, 0x3a, 0x3a),
+                border_foreground: Rgb(0x44, 0x44, 0x44),
+                border_active_foreground: overrides.border_active.unwrap_or(Rgb(0x87, 0xaf, 0xd7)),
+                draw_active_border: overrides.border_active.is_some(),
+                menu_background: Rgb(0x3a, 0x3a, 0x3a),
+                menu_foreground: Rgb(0xd0, 0xd0, 0xd0),
+                toast_background: Rgb(0x58, 0x58, 0x58),
+                toast_foreground: Rgb(0xee, 0xee, 0xee),
+                scrollbar_thumb_foreground: Rgb(0x94, 0x94, 0x94),
+                workspace_rail: overrides.sidebar_rail,
+                is_light,
+            }
+        };
+
+        if let Some(color) = overrides.selection_background {
+            colors.selection_background = color;
+            colors.chrome_selection_background = color;
+        }
+        if let Some(color) = overrides.selection_foreground {
+            colors.selection_foreground = color;
+        }
+        if let Some(color) = overrides.sidebar_selected_background {
+            colors.sidebar_selected_background = color;
+        }
+        if let Some(color) = overrides.tab_bar_background {
+            colors.tab_bar_background = color;
+            colors.tab_bar_is_opaque = true;
+        }
+        if let Some(color) = overrides.tab_active_background {
+            colors.tab_active_background = color;
+            colors.tab_active_unfocused_background = color;
+        }
+        colors.foreground = if is_light_background(background) {
+            Rgb(0x00, 0x00, 0x00)
+        } else {
+            Rgb(0xff, 0xff, 0xff)
+        };
+        colors
+    }
+
+    pub fn css(&self) -> String {
+        let hover = format!(
+            "rgba({}, {}, {}, 0.08)",
+            self.foreground.0, self.foreground.1, self.foreground.2
+        );
+        let accent_25 = format!(
+            "rgba({}, {}, {}, 0.25)",
+            self.accent.0, self.accent.1, self.accent.2
+        );
+        format!(
+            r#"
+@define-color chrome_bg {chrome_bg};
+@define-color chrome_fg {chrome_fg};
+@define-color terminal_cursor {terminal_cursor};
+@define-color chrome_separator {chrome_separator};
+@define-color pane_separator {pane_separator};
+@define-color sidebar_bg {sidebar_bg};
+@define-color selection_bg {selection_bg};
+@define-color sidebar_selected_bg {sidebar_selected_bg};
+@define-color sidebar_selected_fg {sidebar_selected_fg};
+@define-color sidebar_dim_fg {sidebar_dim_fg};
+@define-color sidebar_border {sidebar_border};
+@define-color accent {accent};
+@define-color accent_25 {accent_25};
+@define-color tab_bar_bg {tab_bar_bg};
+@define-color tab_fg {tab_fg};
+@define-color tab_active_bg {tab_active_bg};
+@define-color tab_active_fg {tab_active_fg};
+@define-color tab_active_unfocused_bg {tab_active_unfocused_bg};
+@define-color tab_active_unfocused_fg {tab_active_unfocused_fg};
+@define-color border_fg {border_fg};
+@define-color border_active_fg {border_active_fg};
+@define-color menu_bg {menu_bg};
+@define-color menu_fg {menu_fg};
+@define-color toast_bg {toast_bg};
+@define-color toast_fg {toast_fg};
+@define-color scrollbar_thumb_fg {scrollbar_thumb_fg};
+@define-color sidebar_hover_bg {sidebar_hover_bg};
+
+window.cmux-window,
+.cmux-titlebar {{
+  background-color: @chrome_bg;
+  color: @chrome_fg;
+}}
+window.cmux-window * {{ transition: none; }}
+.cmux-titlebar {{
+  min-height: 28px;
+  padding: 0;
+}}
+.cmux-title {{
+  font-size: 13px;
+  font-weight: 700;
+  color: @chrome_fg;
+}}
+.cmux-titlebar windowcontrols button {{
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  margin: 4px 2px;
+  border-radius: 6px;
+}}
+.cmux-titlebar windowcontrols button image {{
+  min-width: 12px;
+  min-height: 12px;
+}}
+.sidebar-surface,
+.workspace-list {{ background-color: @sidebar_bg; }}
+.workspace-list {{ padding-top: 2px; }}
+.workspace-row {{
+  margin: 0 6px 2px 6px;
+  padding: 0;
+  border-radius: 6px;
+  background-color: transparent;
+  color: @chrome_fg;
+}}
+.workspace-row:hover {{ background-color: transparent; }}
+.workspace-row:selected,
+.workspace-row:selected:hover {{
+  background-color: @sidebar_selected_bg;
+  color: @sidebar_selected_fg;
+}}
+.workspace-content {{
+  padding: 8px 10px;
+  border-radius: 6px;
+}}
+.workspace-title {{
+  font-size: 12.5px;
+  font-weight: 600;
+}}
+.workspace-description {{ font-size: 10.5px; font-weight: 400; }}
+.workspace-subtitle {{ font-size: 10px; }}
+.workspace-details {{ border-spacing: 4px; }}
+.workspace-remote-target {{ font-family: monospace; font-size: 10px; }}
+.workspace-remote-status {{ font-size: 9px; font-weight: 500; }}
+.workspace-badge {{
+  font-size: 9px;
+  font-weight: 600;
+  color: @sidebar_dim_fg;
+}}
+.workspace-pin,
+.workspace-media {{ font-size: 9px; }}
+.task-status-slot {{ min-width: 11px; min-height: 11px; }}
+.workspace-row:active .workspace-content {{ opacity: 0.5; }}
+.workspace-row.dragging .workspace-content {{ opacity: 0.6; }}
+.workspace-row.multi-selected {{ background-color: @accent_25; }}
+.workspace-rail {{
+  min-width: 3px;
+  border-radius: 1.5px;
+  margin-top: 5px;
+  margin-bottom: 5px;
+  opacity: 0.95;
+}}
+window.cmux-window .workspace-close,
+window.cmux-window .group-add {{
+  opacity: 0;
+  transition: opacity 120ms ease-out;
+}}
+.workspace-row:hover .workspace-close,
+.group-header:hover .group-add {{ opacity: 1; }}
+.group-header {{ border-radius: 4px; }}
+.group-header:hover {{ background-color: @sidebar_hover_bg; }}
+.group-header.multi-selected {{ border-radius: 6px; }}
+.group-name {{ font-size: 11px; }}
+.group-chevron {{ font-size: 9px; }}
+.group-folder,
+.group-add {{ font-size: 11px; }}
+.group-unread {{ font-size: 10px; }}
+.group-member {{ margin-left: 12px; }}
+.unread-badge {{
+  min-width: 16px;
+  min-height: 16px;
+  border-radius: 8px;
+  padding: 0;
+  font-size: 9px;
+  font-weight: 600;
+  background-color: @accent;
+}}
+.drop-indicator {{
+  min-height: 2px;
+  margin-left: 8px;
+  margin-right: 8px;
+  background-color: @accent;
+}}
+paned.cmux-split > separator {{
+  min-width: 10px;
+  background-image: linear-gradient(to right,
+    transparent 0%, transparent 60%,
+    @chrome_separator 60%, @chrome_separator 70%,
+    transparent 70%, transparent 100%);
+}}
+paned.cmux-split > separator:hover,
+paned.cmux-split > separator:active {{
+  background-image: linear-gradient(to right,
+    transparent 0%, transparent 60%,
+    @chrome_separator 60%, @chrome_separator 70%,
+    transparent 70%, transparent 100%);
+}}
+.toast {{
+  margin: 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background-color: @toast_bg;
+  color: @toast_fg;
+}}
+.sidebar-surface scrollbar slider {{
+  min-width: 4px;
+  min-height: 24px;
+  background-color: @scrollbar_thumb_fg;
+}}
+"#,
+            chrome_bg = self.background.css(),
+            chrome_fg = self.foreground.css(),
+            terminal_cursor = self.cursor.css(),
+            chrome_separator = self.separator.css(),
+            pane_separator = self.pane_separator.css(),
+            sidebar_bg = self.sidebar_background.css(),
+            selection_bg = self.chrome_selection_background.css(),
+            sidebar_selected_bg = self.sidebar_selected_background.css(),
+            sidebar_selected_fg = self.sidebar_selected_foreground.css(),
+            sidebar_dim_fg = self.sidebar_dim_foreground.css(),
+            sidebar_border = self.sidebar_border.css(),
+            accent = self.accent.css(),
+            tab_bar_bg = self.tab_bar_background.css(),
+            tab_fg = self.tab_foreground.css(),
+            tab_active_bg = self.tab_active_background.css(),
+            tab_active_fg = self.tab_active_foreground.css(),
+            tab_active_unfocused_bg = self.tab_active_unfocused_background.css(),
+            tab_active_unfocused_fg = self.tab_active_unfocused_foreground.css(),
+            border_fg = self.border_foreground.css(),
+            border_active_fg = self.border_active_foreground.css(),
+            menu_bg = self.menu_background.css(),
+            menu_fg = self.menu_foreground.css(),
+            toast_bg = self.toast_background.css(),
+            toast_fg = self.toast_foreground.css(),
+            scrollbar_thumb_fg = self.scrollbar_thumb_foreground.css(),
+            sidebar_hover_bg = hover,
+        )
+    }
+}
+
+impl Rgba {
+    fn css(self) -> String {
+        format!(
+            "rgba({}, {}, {}, {:.2})",
+            self.color.0, self.color.1, self.color.2, self.alpha
+        )
+    }
+}
+
+pub fn is_light_background(background: Rgb) -> bool {
+    0.2126 * f64::from(background.0)
+        + 0.7152 * f64::from(background.1)
+        + 0.0722 * f64::from(background.2)
+        > 128.0
+}
+
+pub fn separator_color(background: Rgb) -> Rgba {
+    let luminance = 0.299 * f64::from(background.0) / 255.0
+        + 0.587 * f64::from(background.1) / 255.0
+        + 0.114 * f64::from(background.2) / 255.0;
+    let (amount, alpha) = if luminance > 0.5 {
+        (-0.12, 0.26)
+    } else {
+        (0.16, 0.36)
+    };
+    let offset =
+        |channel: u8| ((f64::from(channel) / 255.0 + amount).clamp(0.0, 1.0) * 255.0).ceil() as u8;
+    Rgba {
+        color: Rgb(
+            offset(background.0),
+            offset(background.1),
+            offset(background.2),
+        ),
+        alpha,
+    }
+}
+
+pub fn sidebar_background(background: Rgb) -> Rgb {
+    let channel = |value: u8| (f64::from(value) * 0.82).floor() as u8;
+    Rgb(
+        channel(background.0),
+        channel(background.1),
+        channel(background.2),
+    )
+}
+
+pub const WORKSPACE_COLOR_PALETTE: [(&str, Rgb); 16] = [
+    ("Red", Rgb(0xc0, 0x39, 0x2b)),
+    ("Crimson", Rgb(0x92, 0x2b, 0x21)),
+    ("Orange", Rgb(0xa0, 0x40, 0x00)),
+    ("Amber", Rgb(0x7d, 0x66, 0x08)),
+    ("Olive", Rgb(0x4a, 0x5c, 0x18)),
+    ("Green", Rgb(0x19, 0x6f, 0x3d)),
+    ("Teal", Rgb(0x00, 0x6b, 0x6b)),
+    ("Aqua", Rgb(0x0e, 0x6b, 0x8c)),
+    ("Blue", Rgb(0x15, 0x65, 0xc0)),
+    ("Navy", Rgb(0x1a, 0x52, 0x76)),
+    ("Indigo", Rgb(0x28, 0x35, 0x93)),
+    ("Purple", Rgb(0x6a, 0x1b, 0x9a)),
+    ("Magenta", Rgb(0xad, 0x14, 0x57)),
+    ("Rose", Rgb(0x88, 0x0e, 0x4f)),
+    ("Brown", Rgb(0x7b, 0x3f, 0x00)),
+    ("Charcoal", Rgb(0x3e, 0x4b, 0x5e)),
+];
+
+pub fn workspace_palette_color(name: &str) -> Option<Rgb> {
+    WORKSPACE_COLOR_PALETTE
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, color)| *color)
+}
+
+pub fn workspace_display_color(color: Rgb, is_light: bool) -> Rgb {
+    if is_light {
+        return color;
+    }
+    let (hue, saturation, brightness) = rgb_to_hsv(color);
+    if saturation <= 0.08 {
+        return color;
+    }
+    let boosted = (brightness.max(0.62) + (1.0 - brightness) * 0.28).min(1.0);
+    hsv_to_rgb(hue, saturation, boosted)
+}
+
+fn rgb_to_hsv(color: Rgb) -> (f64, f64, f64) {
+    let (red, green, blue) = color.cairo();
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let delta = maximum - minimum;
+    let saturation = if maximum == 0.0 { 0.0 } else { delta / maximum };
+    let hue = if delta == 0.0 {
+        0.0
+    } else if maximum == red {
+        ((green - blue) / delta).rem_euclid(6.0) / 6.0
+    } else if maximum == green {
+        ((blue - red) / delta + 2.0) / 6.0
+    } else {
+        ((red - green) / delta + 4.0) / 6.0
+    };
+    (hue, saturation, maximum)
+}
+
+fn hsv_to_rgb(hue: f64, saturation: f64, brightness: f64) -> Rgb {
+    let scaled = hue * 6.0;
+    let chroma = brightness * saturation;
+    let intermediate = chroma * (1.0 - (scaled.rem_euclid(2.0) - 1.0).abs());
+    let (red, green, blue) = match scaled.floor() as u8 % 6 {
+        0 => (chroma, intermediate, 0.0),
+        1 => (intermediate, chroma, 0.0),
+        2 => (0.0, chroma, intermediate),
+        3 => (0.0, intermediate, chroma),
+        4 => (intermediate, 0.0, chroma),
+        _ => (chroma, 0.0, intermediate),
+    };
+    let match_value = brightness - chroma;
+    let channel = |value: f64| ((value + match_value) * 255.0).round() as u8;
+    Rgb(channel(red), channel(green), channel(blue))
 }
 
 #[derive(Default)]
@@ -104,19 +602,43 @@ fn apply_tui_theme(settings: &mut Settings, document: &Value) {
     let Some(theme) = document.get("theme").and_then(Value::as_object) else {
         return;
     };
-    apply_color(theme.get("border_active"), &mut settings.border_active);
-    apply_color(theme.get("border_inactive"), &mut settings.border_inactive);
-    apply_color(
+    if let Some(mode) = theme.get("chrome").and_then(Value::as_str) {
+        settings.chrome = match mode {
+            "light" => ChromeMode::Light,
+            "dark" => ChromeMode::Dark,
+            "auto" => ChromeMode::Auto,
+            _ => settings.chrome,
+        };
+    }
+    apply_optional_color(
+        theme.get("border_active"),
+        &mut settings.theme.border_active,
+    );
+    apply_optional_color(
+        theme.get("border_inactive"),
+        &mut settings.theme.border_inactive,
+    );
+    apply_optional_color(
         theme.get("selection_background"),
-        &mut settings.selection_background,
+        &mut settings.theme.selection_background,
     );
     if let Some(value) = theme.get("selection_foreground") {
         if value.is_null() {
-            settings.selection_foreground = None;
+            settings.theme.selection_foreground = Some(None);
         } else if let Some(color) = parse_color(value) {
-            settings.selection_foreground = Some(color);
+            settings.theme.selection_foreground = Some(Some(color));
         }
     }
+    apply_optional_color(theme.get("sidebar_rail"), &mut settings.theme.sidebar_rail);
+    apply_optional_color(
+        theme.get("sidebar_active_bg"),
+        &mut settings.theme.sidebar_selected_background,
+    );
+    apply_optional_color(theme.get("tab_bg"), &mut settings.theme.tab_bar_background);
+    apply_optional_color(
+        theme.get("tab_active_bg"),
+        &mut settings.theme.tab_active_background,
+    );
 }
 
 fn apply_gtk_config(settings: &mut Settings, document: &Value) {
@@ -129,9 +651,9 @@ fn apply_gtk_config(settings: &mut Settings, document: &Value) {
     }
 }
 
-fn apply_color(value: Option<&Value>, target: &mut Rgb) {
+fn apply_optional_color(value: Option<&Value>, target: &mut Option<Rgb>) {
     if let Some(color) = value.and_then(parse_color) {
-        *target = color;
+        *target = Some(color);
     }
 }
 
@@ -323,9 +845,71 @@ mod tests {
             "unknown_section": [1, 2, 3]
         });
         apply_tui_theme(&mut settings, &document);
-        assert_eq!(settings.border_active, Rgb(170, 187, 204));
-        assert_eq!(settings.border_inactive, xterm_color(238));
-        assert_eq!(settings.selection_background, Rgb(0x3a, 0x3a, 0x3a));
-        assert_eq!(settings.selection_foreground, Some(Rgb(255, 0, 0)));
+        assert_eq!(settings.theme.border_active, Some(Rgb(170, 187, 204)));
+        assert_eq!(settings.theme.border_inactive, None);
+        assert_eq!(settings.theme.selection_background, None);
+        assert_eq!(
+            settings.theme.selection_foreground,
+            Some(Some(Rgb(255, 0, 0)))
+        );
+    }
+
+    #[test]
+    fn derives_separator_sidebar_and_light_mode_from_terminal_background() {
+        let dark_separator = separator_color(DEFAULT_DARK_BACKGROUND);
+        assert_eq!(dark_separator.color, Rgb(0x47, 0x47, 0x47));
+        assert_eq!(dark_separator.alpha, 0.36);
+        assert_eq!(
+            sidebar_background(DEFAULT_DARK_BACKGROUND),
+            Rgb(0x18, 0x18, 0x18)
+        );
+        assert!(!is_light_background(DEFAULT_DARK_BACKGROUND));
+
+        let light_separator = separator_color(DEFAULT_LIGHT_BACKGROUND);
+        assert_eq!(light_separator.color, Rgb(0xe0, 0xe1, 0xe1));
+        assert_eq!(light_separator.alpha, 0.26);
+        assert_eq!(
+            sidebar_background(DEFAULT_LIGHT_BACKGROUND),
+            Rgb(0xd0, 0xd1, 0xd1)
+        );
+        assert!(is_light_background(DEFAULT_LIGHT_BACKGROUND));
+    }
+
+    #[test]
+    fn chrome_colors_follow_mode_and_preserve_explicit_tui_overrides() {
+        let overrides = ThemeOverrides {
+            border_active: Some(Rgb(1, 2, 3)),
+            border_inactive: Some(Rgb(4, 5, 6)),
+            tab_active_background: Some(Rgb(7, 8, 9)),
+            ..ThemeOverrides::default()
+        };
+        let colors = ChromeColors::derive(DEFAULT_DARK_BACKGROUND, ChromeMode::Light, overrides);
+        assert!(colors.is_light);
+        assert_eq!(colors.foreground, Rgb(0xff, 0xff, 0xff));
+        assert_eq!(colors.border_active_foreground, Rgb(1, 2, 3));
+        assert!(colors.draw_active_border);
+        assert_eq!(colors.pane_separator.color, Rgb(4, 5, 6));
+        assert_eq!(colors.pane_separator.alpha, 1.0);
+        assert_eq!(colors.tab_active_background, Rgb(7, 8, 9));
+        assert_eq!(colors.tab_active_unfocused_background, Rgb(7, 8, 9));
+    }
+
+    #[test]
+    fn workspace_palette_and_dark_brightness_boost_match_the_spec() {
+        assert_eq!(WORKSPACE_COLOR_PALETTE.len(), 16);
+        assert_eq!(workspace_palette_color("blue"), Some(Rgb(0x15, 0x65, 0xc0)));
+        assert_eq!(
+            workspace_display_color(Rgb(0x80, 0x80, 0x80), false),
+            Rgb(0x80, 0x80, 0x80)
+        );
+
+        let base = Rgb(0xc0, 0x39, 0x2b);
+        let boosted = workspace_display_color(base, false);
+        let (_, saturation, brightness) = rgb_to_hsv(base);
+        let (_, boosted_saturation, boosted_brightness) = rgb_to_hsv(boosted);
+        let expected = (brightness.max(0.62) + (1.0 - brightness) * 0.28).min(1.0);
+        assert!((boosted_brightness - expected).abs() < 0.005);
+        assert!((boosted_saturation - saturation).abs() < 0.005);
+        assert_eq!(workspace_display_color(base, true), base);
     }
 }
