@@ -1,0 +1,109 @@
+#compdef cmux cmux-tui
+#
+# zsh completion for cmux
+#
+# Mirrors the noun-first public grammar from cmux-tui/spec/cli.md. Selectors
+# complete only as `current`; resolving live IDs would need a running session.
+
+_cmux_roots=(
+  'machine:machines'
+  'session:sessions'
+  'client:attached clients'
+  'workspace:workspaces'
+  'screen:screens'
+  'pane:panes'
+  'tab:tabs'
+  'terminal:PTY terminals'
+  'browser:browser panes'
+  'notification:notifications'
+  'agent:agents'
+  'sidebar:sidebar views and plugins'
+  'pairing:pairing requests'
+  'projection:projections'
+  'provider:provider administration'
+  'raw:raw protocol escape hatch'
+)
+
+_cmux_modes=(
+  'attach:open the complete session TUI'
+  'relay:copy protocol bytes between stdio and a session socket'
+  'machine-agent:share a local session over one outbound SSH registration'
+)
+
+_cmux_actions() {
+  case "$1" in
+    machine)      reply=(list show session) ;;
+    session)      reply=(list open show snapshot events ping shutdown creation config window terminal) ;;
+    client)       reply=(list show detach metadata sizing cell) ;;
+    workspace)    reply=(list create show rename move focus close run layout screen) ;;
+    screen)       reply=(list create show rename focus close layout pane) ;;
+    pane)         reply=(list create show rename focus close split neighbor swap zoom run viewport tab) ;;
+    tab)          reply=(list create show rename move focus close terminal browser) ;;
+    terminal)     reply=(list show write keys mouse copy move attach close focus screen state history process viewport) ;;
+    browser)      reply=(list show navigate back forward reload activate key text attach close mouse wheel) ;;
+    notification) reply=(list create) ;;
+    agent)        reply=(list report) ;;
+    sidebar)      reply=(view plugin) ;;
+    pairing)      reply=(request) ;;
+    projection)   reply=(show put) ;;
+    provider)     reply=(authority) ;;
+    raw)          reply=(operation command) ;;
+    *)            reply=() ;;
+  esac
+}
+
+_cmux() {
+  local curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  _arguments -C \
+    '--machine=[routing default: machine]:machine:' \
+    '--session=[session name (default: main)]:session:' \
+    '--socket=[explicit socket path]:socket:_files' \
+    '--headless[run without attaching a TUI]' \
+    '--term=[TERM for child PTYs]:term:' \
+    '--cloud[compose local targets with the Cloud catalog]' \
+    '--json[one JSON result or structured error]' \
+    '--jsonl[one JSON value per result or stream item]' \
+    '--quiet[no successful output]' \
+    '--idempotency-key=[explicit mutation idempotency key]:key:' \
+    '--expected-revision=[optimistic concurrency revision]:revision:' \
+    '--correlation-key=[creation correlation key]:key:' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '1: :->root' \
+    '*:: :->rest' \
+    && return 0
+
+  case "$state" in
+    root)
+      _describe -t modes 'process mode' _cmux_modes
+      _describe -t roots 'resource' _cmux_roots
+      ;;
+    rest)
+      case "${words[1]}" in
+        attach)
+          _arguments \
+            '--terminal=[attach one terminal by exact ID]:terminal id:' \
+            '--session=[session name]:session:' \
+            '--socket=[explicit socket path]:socket:_files'
+          ;;
+        relay|machine-agent)
+          _arguments \
+            '--session=[session name]:session:' \
+            '--socket=[explicit socket path]:socket:_files'
+          ;;
+        *)
+          local -a reply
+          _cmux_actions "${words[1]}"
+          if (( ${#reply} )); then
+            _alternative \
+              "actions:action:(${reply[*]})" \
+              'selectors:selector:(current)'
+          fi
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_cmux "$@"

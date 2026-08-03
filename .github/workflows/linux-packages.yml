@@ -1,0 +1,154 @@
+# Native Linux packages for the `linux` maintenance branch.
+#
+# Upstream `main` ships the cmux TUI only through npm and PyPI. This workflow
+# builds the distro-native formats — .deb, .rpm, AUR directory, AppImage and a
+# portable tarball — for x86_64 and aarch64, and publishes them on
+# `cmux-tui-v*` tags.
+#
+# This workflow exists only on the `linux` branch and must never be proposed
+# upstream as part of a rebase.
+
+name: linux-packages
+
+on:
+  push:
+    branches: [linux]
+    tags: ['cmux-tui-v*']
+    paths:
+      - 'cmux-tui/**'
+      - 'packaging/linux/**'
+      - 'ghostty'
+      - '.github/workflows/linux-packages.yml'
+  pull_request:
+    branches: [linux]
+    paths:
+      - 'cmux-tui/**'
+      - 'packaging/linux/**'
+      - '.github/workflows/linux-packages.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override the package version (default: derive from the nearest cmux-tui-v* tag)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: '0.16.0'
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ghostty supplies libghostty-vt; fetch-depth 0 lets resolve_version
+          # see the nearest cmux-tui-v* tag.
+          submodules: false
+          fetch-depth: 0
+
+      - name: Check out the ghostty submodule
+        run: git submodule update --init --filter=blob:none ghostty
+
+      # bindgen needs clang's builtin header directory. Ubuntu's libclang
+      # runtime package alone is not enough: without libclang-*-dev the
+      # ghostty-vt-sys build fails with "'limits.h' file not found".
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libclang-dev dpkg-dev fakeroot
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cmux-tui
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)  zig_arch=x86_64 ;;
+            aarch64) zig_arch=aarch64 ;;
+          esac
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_arch}-linux-${ZIG_VERSION}.tar.xz"
+          curl -fSL --retry 3 -o /tmp/zig.tar.xz "$url"
+          mkdir -p "$HOME/.local/opt"
+          tar xf /tmp/zig.tar.xz -C "$HOME/.local/opt"
+          echo "$HOME/.local/opt/zig-${zig_arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          zig version
+          cargo --version
+          clang --version | head -1
+
+      - name: Build packages
+        env:
+          CMUX_VERSION: ${{ inputs.version }}
+          # Reproducible archive timestamps.
+          SOURCE_DATE_EPOCH: '0'
+        run: packaging/linux/build-all.sh tarball deb rpm aur appimage
+
+      - name: Install-test the .deb
+        if: matrix.arch == 'x86_64'
+        run: |
+          deb="$(find build/linux/dist -name '*.deb' -print -quit)"
+          sudo apt-get install -y -qq "$PWD/$deb"
+          command -v cmux
+          cmux --version || true
+          man --where cmux
+          dpkg -L cmux | sort
+          sudo apt-get remove -y -qq cmux
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmux-linux-${{ matrix.arch }}
+          path: |
+            build/linux/dist/*
+            build/linux/aur/PKGBUILD
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/cmux-tui-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          find artifacts -type f -print
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "cmux Linux packages $tag" \
+            --notes "Native Linux packages built from the \`linux\` maintenance branch.
+
+          Formats: \`.deb\`, \`.rpm\`, AppImage, portable tarball, and the AUR \`PKGBUILD\`.
+          Every artifact has a matching \`.sha256\`.
+
+          These packages ship the Rust \`cmux-tui\` multiplexer and \`cmux-relay\`. The macOS
+          Swift application is not part of them." \
+            $(find artifacts -type f | sort)

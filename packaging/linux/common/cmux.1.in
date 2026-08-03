@@ -1,0 +1,255 @@
+.TH CMUX 1 "" "cmux @VERSION@" "User Commands"
+.SH NAME
+cmux \- terminal multiplexer TUI for AI coding agents, backed by libghostty\-vt
+.SH SYNOPSIS
+.B cmux
+.RI [ "START OPTIONS" ]
+.br
+.B cmux attach
+.RI [ "START OPTIONS" ]
+.RB [ \-\-terminal
+.IR terminal-id ]
+.br
+.B cmux relay
+.RI [ "ROUTING OPTIONS" ]
+.br
+.B cmux machine\-agent
+.RI [ OPTIONS ]
+.br
+.B cmux
+.RI [ "GLOBAL OPTIONS" ]
+.I resource action
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B cmux
+keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
+terminals and browsers, and exposes those resources through the
+.B cmux.protocol/1
+public interface.
+.PP
+Running
+.B cmux
+with no resource argument starts or attaches to a session TUI. Every other
+invocation is a noun\-first control command that sends one public resource
+request to a running session.
+.PP
+The default session is
+.BR main .
+Default sockets live at
+.IR $TMPDIR/cmux\-tui\-<uid>/<session>.sock .
+Detach from an attached TUI with the prefix key followed by
+.BR d ,
+which is
+.B Ctrl\-b d
+by default.
+.SH PROCESS MODES
+.TP
+.B cmux
+Start a session, or attach to it when it already exists.
+.TP
+.B cmux attach
+Open the complete session TUI. With
+.BR \-\-terminal " " \fIterminal-id\fR
+it renders only that one PTY terminal, using the full host terminal without
+the sidebar, status bar, pane border or other tabs. Startup attach requires an
+exact ID from
+.BR "cmux terminal list" ;
+it does not accept names or
+.BR current .
+.TP
+.B cmux relay
+Copy private protocol bytes between standard I/O and one session socket.
+Machine connectors use this as a transport primitive; it is not an interactive
+TUI.
+.TP
+.B cmux machine\-agent
+Share an existing local session through one outbound SSH registration. Prints a
+one\-time pairing code and opens no listener. Unix only.
+.SH START OPTIONS
+.TP
+.BI \-\-session " name"
+Select the session name. Defaults to
+.BR main .
+.TP
+.BI \-\-socket " path"
+Use an explicit socket path instead of the default location.
+.TP
+.B \-\-headless
+Run the session without attaching a TUI.
+.TP
+.BI \-\-term " value"
+Set
+.B TERM
+for child PTYs. Without it children get
+.BR xterm\-256color .
+The
+.B CMUX_TUI_TERM
+environment variable overrides the terminal runtime default.
+.TP
+.B \-\-cloud
+Compose local machine targets with the Cloud catalog and enable temporary
+machine connections without sending local SSH details to Cloud.
+.SH SELECTORS
+An instance selector accepts a typed opaque ID such as
+.IR ws_… ,
+.I pane_…
+or
+.IR term_… ;
+the literal
+.BR current ;
+or an exact name.
+.PP
+Names may be empty, contain Unicode or whitespace, and need not be unique.
+.BI name: value
+forces name interpretation and is required for names equal to
+.BR current ,
+names containing
+.BR _ ,
+reserved command words, and ID\-shaped names. An ambiguous name returns
+.B selector.ambiguous
+with every candidate ID; it never chooses one or changes state.
+.PP
+A direct opaque target ID may omit structural ancestors. A name or
+.B current
+target requires its complete parent chain.
+.SH RESOURCES
+The public resource roots are:
+.BR machine ", " session ", " client ", " workspace ", " screen ", " pane ,
+.BR tab ", " terminal ", " browser ", " notification ", " agent ", " sidebar ,
+.BR pairing ", " projection ", " provider " and " raw .
+.PP
+Run
+.BI "cmux " resource " \-\-help"
+for the exact paths and flags of one resource.
+.SH ROUTING OPTIONS
+.TP
+.BI \-\-machine " selector"
+Routing default for the target machine.
+.TP
+.BI \-\-session " selector"
+Routing default for the target session.
+.TP
+.BI \-\-socket " path"
+Select an exact local socket.
+.SH OUTPUT
+The output modes are mutually exclusive. With no flag the CLI prints concise
+human text on standard output and diagnostics on standard error.
+.TP
+.B \-\-json
+One JSON result or structured error.
+.TP
+.B \-\-jsonl
+One JSON value per result, stream item, or stream end.
+.TP
+.B \-\-quiet
+No successful output.
+.PP
+JSON modes preserve the server's error code, message, details and retryable
+flag. Requests are limited to 4 MiB; responses and stream items to 16 MiB.
+.SH MUTATIONS
+Every mutation sends a cryptographically random 128\-bit idempotency key unless
+.BI \-\-idempotency\-key " value"
+is supplied. The CLI sends one request and never retries a mutation. Mutations
+that support optimistic concurrency expose
+.BI \-\-expected\-revision " value" .
+.PP
+Repeating a committed key with the same canonical request returns the recorded
+result. Reusing it for another request returns
+.BR idempotency.conflict .
+.B mutation.indeterminate
+means the server crashed during an external effect and will not repeat that key
+automatically.
+.PP
+.B workspace run
+and
+.B pane run
+preserve exact argument arrays after
+.BR \-\- .
+The client never reads or expands
+.BR $SHELL .
+.SH EXIT STATUS
+.TP
+.B 0
+Success or clean stream completion.
+.TP
+.B 1
+Structured server error.
+.TP
+.B 2
+Invalid CLI syntax or local parameter validation failure.
+.TP
+.B 3
+Connection, framing, timeout, or protocol failure.
+.SH ENVIRONMENT
+.TP
+.B CMUX_TUI_TERM
+Override the terminal runtime default for child PTYs.
+.B CMUX_MUX_TERM
+is retained as a legacy fallback.
+.TP
+.B CMUX_MUX_CDP_URL
+Attach browser panes to an existing Chrome DevTools Protocol endpoint instead
+of launching a browser. Both
+.B ws://
+and
+.B http://
+endpoints are supported;
+.B wss://
+is not.
+.TP
+.B TMPDIR
+Base directory for the default session socket path.
+.SH FILES
+.TP
+.I $TMPDIR/cmux\-tui\-<uid>/<session>.sock
+Default session socket.
+.TP
+.I cmux\-tui.json
+Session configuration, including
+.B machine_sidebar
+and
+.B machines
+entries for the machine rail, and
+.B browser
+settings for browser panes.
+.SH EXAMPLES
+.PP
+Start the default session:
+.PP
+.RS
+.B cmux
+.RE
+.PP
+Start a named session without attaching:
+.PP
+.RS
+.B cmux \-\-headless \-\-session agents
+.RE
+.PP
+Create a workspace and run a command in it:
+.PP
+.RS
+.B cmux workspace create \-\-name api
+.br
+.B cmux workspace current run \-\- cargo test
+.RE
+.PP
+Follow session events as JSON lines:
+.PP
+.RS
+.B cmux session current events \-\-jsonl
+.RE
+.SH SEE ALSO
+.BR cmux\-relay (1),
+.BR tmux (1)
+.PP
+Full documentation is in the
+.B cmux\-tui/docs
+directory of the source distribution, and at
+.IR https://github.com/sweetcornna/cmux .
+.SH LICENSE
+GPL\-3.0\-or\-later. See
+.I /usr/share/licenses/cmux/LICENSE
+for the complete text and
+.I /usr/share/doc/cmux/THIRD_PARTY_LICENSES.md
+for third\-party notices.

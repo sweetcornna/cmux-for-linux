@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=cmux
+GenericName=Terminal Multiplexer
+Comment=Terminal multiplexer for AI coding agents, backed by libghostty-vt
+Exec=cmux
+TryExec=cmux
+Icon=cmux
+Terminal=true
+Categories=System;TerminalEmulator;Development;
+Keywords=terminal;multiplexer;tmux;agent;ghostty;session;
+StartupNotify=false

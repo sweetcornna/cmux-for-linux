@@ -1,0 +1,61 @@
+# Maintainer: cmux Linux maintenance branch <travon_evenietyku@sanfranmail.com>
+#
+# Binary package for the cmux TUI, built from the release tarballs produced by
+# packaging/linux/build-tarball.sh on the `linux` maintenance branch.
+#
+# A from-source PKGBUILD would need Zig 0.16 plus a fully vendored Cargo
+# registry inside the build sandbox; the binary package tracks the same
+# artifacts the .deb and .rpm ship.
+
+pkgname=cmux-bin
+_pkgname=cmux
+pkgver=0.0.0
+pkgrel=1
+pkgdesc="Terminal multiplexer TUI for AI coding agents, backed by libghostty-vt"
+arch=('x86_64' 'aarch64')
+url="https://github.com/sweetcornna/cmux"
+license=('GPL-3.0-or-later')
+depends=('glibc')
+provides=('cmux' 'cmux-tui')
+conflicts=('cmux' 'cmux-tui')
+options=('!strip' '!debug')
+
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/cmux-tui-v$pkgver/$_pkgname-$pkgver-linux-x86_64.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/cmux-tui-v$pkgver/$_pkgname-$pkgver-linux-aarch64.tar.gz")
+
+# Replaced by packaging/linux/build-aur.sh with the real digests at release time.
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  local src="$srcdir/$_pkgname-$pkgver-linux-$CARCH"
+
+  install -Dm0755 "$src/bin/cmux-tui"   "$pkgdir/usr/bin/cmux-tui"
+  install -Dm0755 "$src/bin/cmux-relay" "$pkgdir/usr/bin/cmux-relay"
+  ln -sf cmux-tui "$pkgdir/usr/bin/cmux"
+
+  install -Dm0644 "$src/share/applications/cmux.desktop" \
+    "$pkgdir/usr/share/applications/cmux.desktop"
+  install -Dm0644 "$src/share/man/man1/cmux.1.gz" \
+    "$pkgdir/usr/share/man/man1/cmux.1.gz"
+
+  install -Dm0644 "$src/share/bash-completion/completions/cmux" \
+    "$pkgdir/usr/share/bash-completion/completions/cmux"
+  install -Dm0644 "$src/share/zsh/site-functions/_cmux" \
+    "$pkgdir/usr/share/zsh/site-functions/_cmux"
+  install -Dm0644 "$src/share/fish/vendor_completions.d/cmux.fish" \
+    "$pkgdir/usr/share/fish/vendor_completions.d/cmux.fish"
+
+  local size
+  for size in 16 32 128 256 512; do
+    [ -f "$src/share/icons/hicolor/${size}x${size}/apps/cmux.png" ] || continue
+    install -Dm0644 "$src/share/icons/hicolor/${size}x${size}/apps/cmux.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/cmux.png"
+  done
+
+  install -Dm0644 "$src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm0644 "$src/share/doc/cmux/THIRD_PARTY_LICENSES.md" \
+    "$pkgdir/usr/share/doc/$_pkgname/THIRD_PARTY_LICENSES.md"
+  install -Dm0644 "$src/share/doc/cmux/README.md" \
+    "$pkgdir/usr/share/doc/$_pkgname/README.md"
+}
