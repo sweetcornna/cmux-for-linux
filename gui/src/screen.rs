@@ -172,9 +172,9 @@ impl ScreenSet {
             .apply_patch(terminal, render)
     }
 
-    pub fn apply_scroll(&mut self, terminal: &TerminalId, at_bottom: bool) {
+    pub fn apply_scroll(&mut self, terminal: &TerminalId, offset: u64, at_bottom: bool) {
         if let Some(screen) = self.grids.get_mut(terminal) {
-            screen.apply_scroll(at_bottom);
+            screen.apply_scroll(offset, at_bottom);
         }
     }
 }
@@ -187,6 +187,8 @@ pub struct Screen {
     pub default_fg: ColorHex,
     pub default_bg: ColorHex,
     pub scrollback_rows: u32,
+    /// Absolute top row of the viewport, zero-based from the oldest retained row.
+    pub viewport_offset: u64,
     pub at_bottom: bool,
     /// One entry per viewport row, indexed by row number.
     pub rows: Vec<Option<RenderRow>>,
@@ -257,6 +259,7 @@ impl Default for Screen {
             default_fg: ColorHex::parse("#ffffff").expect("valid literal"),
             default_bg: ColorHex::parse("#1e1e1e").expect("valid literal"),
             scrollback_rows: 0,
+            viewport_offset: 0,
             at_bottom: true,
             rows: Vec::new(),
             graphics: ScreenGraphics::default(),
@@ -277,6 +280,7 @@ impl Screen {
         self.default_fg = render.default_fg;
         self.default_bg = render.default_bg;
         self.scrollback_rows = render.scrollback_rows;
+        self.viewport_offset = u64::from(render.scrollback_rows);
         self.at_bottom = true;
         self.rows = place_rows(render.size.rows, render.rows);
         self.graphics.apply_snapshot(render.graphics);
@@ -310,6 +314,11 @@ impl Screen {
         }
         if let Some(scrollback) = render.scrollback_rows {
             self.scrollback_rows = scrollback;
+            self.viewport_offset = if self.at_bottom {
+                u64::from(scrollback)
+            } else {
+                self.viewport_offset.min(u64::from(scrollback))
+            };
         }
         self.cursor = Some(render.cursor);
         if let Some(graphics) = render.graphics {
@@ -337,7 +346,8 @@ impl Screen {
         Ok(())
     }
 
-    pub fn apply_scroll(&mut self, at_bottom: bool) {
+    pub fn apply_scroll(&mut self, offset: u64, at_bottom: bool) {
+        self.viewport_offset = offset.min(u64::from(self.scrollback_rows));
         self.at_bottom = at_bottom;
     }
 
@@ -430,8 +440,8 @@ fn place_rows(row_count: u16, rows: Vec<RenderRow>) -> Vec<Option<RenderRow>> {
 #[cfg(test)]
 mod tests {
     use cmux::{
-        PaneId, RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement, RenderGraphics,
-        TabId,
+        PaneId, RenderCursorStyle, RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement,
+        RenderGraphics, TabId,
     };
 
     use super::*;
@@ -488,6 +498,26 @@ mod tests {
             name: None,
             active_tab_id: Some(tabs[active].id.clone()),
             tabs,
+        }
+    }
+
+    fn empty_patch(scrollback_rows: u32) -> RenderPatch {
+        RenderPatch {
+            cursor: RenderCursor {
+                x: 0,
+                y: 0,
+                style: RenderCursorStyle::Block,
+                blink: false,
+                visible: true,
+                color: None,
+            },
+            full_reset: false,
+            size: None,
+            default_fg: None,
+            default_bg: None,
+            scrollback_rows: Some(scrollback_rows),
+            rows: Vec::new(),
+            graphics: None,
         }
     }
 
@@ -568,5 +598,26 @@ mod tests {
             removed_image_ids: None,
         });
         assert_eq!(state.placements, vec![placement(3, 30)]);
+    }
+
+    #[test]
+    fn scrollback_patches_follow_bottom_but_preserve_scrolled_viewports() {
+        let terminal = TerminalId::parse(format!("term_{:032x}", 1)).unwrap();
+        let mut screen = Screen {
+            terminal: Some(terminal.clone()),
+            scrollback_rows: 10,
+            viewport_offset: 10,
+            ..Screen::default()
+        };
+
+        screen.apply_patch(&terminal, empty_patch(20)).unwrap();
+        assert_eq!(screen.viewport_offset, 20);
+
+        screen.apply_scroll(5, false);
+        screen.apply_patch(&terminal, empty_patch(30)).unwrap();
+        assert_eq!(screen.viewport_offset, 5);
+
+        screen.apply_patch(&terminal, empty_patch(3)).unwrap();
+        assert_eq!(screen.viewport_offset, 3);
     }
 }

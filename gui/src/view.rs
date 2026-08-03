@@ -23,6 +23,7 @@ use crate::config::{
     DEFAULT_LIGHT_BACKGROUND,
 };
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
+use crate::search::{self, SearchUiState};
 
 const TAB_HEIGHT: f64 = 28.0;
 const TAB_FADE_WIDTH: f64 = 100.0;
@@ -32,6 +33,16 @@ const SIDEBAR_SCRIM_HEIGHT: f64 = 50.0;
 const UNFOCUSED_PANE_OPACITY: f64 = 0.70;
 const DIVIDER_HIT_SIZE: f64 = 6.0;
 const DIVIDER_THROTTLE_INTERVAL: Duration = Duration::from_millis(45);
+const SCROLLBAR_WIDTH: f64 = 4.0;
+const SCROLLBAR_ACTIVE_WIDTH: f64 = 7.0;
+const SCROLLBAR_EDGE_INSET: f64 = 3.0;
+const SCROLLBAR_TRACK_INSET: f64 = 3.0;
+const SCROLLBAR_MIN_THUMB: f64 = 24.0;
+const SCROLLBAR_HIT_WIDTH: f64 = 12.0;
+const DEFAULT_FONT_SIZE: f64 = 11.0;
+pub const MIN_FONT_SIZE: f64 = 6.0;
+pub const MAX_FONT_SIZE: f64 = 32.0;
+const FONT_ZOOM_STEP: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlinkState {
@@ -126,6 +137,35 @@ pub struct TabStripState {
     hovered_tab: RefCell<Option<(PaneId, TabId)>>,
 }
 
+#[derive(Debug, Default)]
+pub struct ScrollbarState {
+    hovered: RefCell<Option<TerminalId>>,
+    dragging: RefCell<Option<TerminalId>>,
+}
+
+impl ScrollbarState {
+    pub fn set_hovered(&self, terminal: Option<TerminalId>) -> bool {
+        if *self.hovered.borrow() == terminal {
+            return false;
+        }
+        *self.hovered.borrow_mut() = terminal;
+        true
+    }
+
+    pub fn set_dragging(&self, terminal: Option<TerminalId>) -> bool {
+        if *self.dragging.borrow() == terminal {
+            return false;
+        }
+        *self.dragging.borrow_mut() = terminal;
+        true
+    }
+
+    fn is_active(&self, terminal: &TerminalId) -> bool {
+        self.hovered.borrow().as_ref() == Some(terminal)
+            || self.dragging.borrow().as_ref() == Some(terminal)
+    }
+}
+
 impl TabStripState {
     pub fn hovered_screen(&self) -> Option<ScreenId> {
         self.hovered_screen.borrow().clone()
@@ -168,7 +208,9 @@ impl MouseMoveThrottle {
 }
 
 pub struct Theme {
-    font: pango::FontDescription,
+    font: RefCell<pango::FontDescription>,
+    default_font: pango::FontDescription,
+    default_font_size: f64,
     chrome_mode: ChromeMode,
     overrides: ThemeOverrides,
     chrome: RefCell<ChromeColors>,
@@ -180,8 +222,13 @@ impl Theme {
             ChromeMode::Light => DEFAULT_LIGHT_BACKGROUND,
             ChromeMode::Auto | ChromeMode::Dark => DEFAULT_DARK_BACKGROUND,
         };
+        let mut font = pango::FontDescription::from_string(&settings.font);
+        let default_font_size = clamp_font_size(font_description_size(&font));
+        set_description_size(&mut font, default_font_size);
         Self {
-            font: pango::FontDescription::from_string(&settings.font),
+            font: RefCell::new(font.clone()),
+            default_font: font,
+            default_font_size,
             chrome_mode: settings.chrome,
             overrides: settings.theme,
             chrome: RefCell::new(ChromeColors::derive(
@@ -208,6 +255,69 @@ impl Theme {
     pub fn css(&self) -> String {
         self.chrome.borrow().css()
     }
+
+    pub fn font(&self) -> pango::FontDescription {
+        self.font.borrow().clone()
+    }
+
+    pub fn font_size(&self) -> f64 {
+        font_description_size(&self.font.borrow())
+    }
+
+    pub fn font_percent(&self) -> u32 {
+        (self.font_size() / self.default_font_size * 100.0).round() as u32
+    }
+
+    pub fn zoom_font(&self, direction: i32) -> bool {
+        let next = adjusted_font_size(self.font_size(), f64::from(direction) * FONT_ZOOM_STEP);
+        self.set_font_size(next)
+    }
+
+    pub fn reset_font(&self) -> bool {
+        let current = self.font_size();
+        if (current - self.default_font_size).abs() < f64::EPSILON {
+            return false;
+        }
+        *self.font.borrow_mut() = self.default_font.clone();
+        true
+    }
+
+    fn set_font_size(&self, size: f64) -> bool {
+        let size = clamp_font_size(size);
+        if (self.font_size() - size).abs() < f64::EPSILON {
+            return false;
+        }
+        set_description_size(&mut self.font.borrow_mut(), size);
+        true
+    }
+}
+
+fn font_description_size(description: &pango::FontDescription) -> f64 {
+    let size = f64::from(description.size()) / f64::from(pango::SCALE);
+    if size.is_finite() && size > 0.0 {
+        size
+    } else {
+        DEFAULT_FONT_SIZE
+    }
+}
+
+fn set_description_size(description: &mut pango::FontDescription, size: f64) {
+    if description.is_size_absolute() {
+        description.set_absolute_size(size * f64::from(pango::SCALE));
+    } else {
+        description.set_size((size * f64::from(pango::SCALE)).round() as i32);
+    }
+}
+
+pub fn clamp_font_size(size: f64) -> f64 {
+    if !size.is_finite() {
+        return DEFAULT_FONT_SIZE;
+    }
+    size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+}
+
+pub fn adjusted_font_size(current: f64, delta: f64) -> f64 {
+    clamp_font_size(current + delta)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -225,6 +335,19 @@ pub struct Rect {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarGeometry {
+    pub track: Rect,
+    pub thumb: Rect,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScrollbarHit {
+    pub terminal: TerminalId,
+    pub geometry: ScrollbarGeometry,
+    pub scrollback_rows: u32,
 }
 
 impl Rect {
@@ -359,8 +482,9 @@ impl DividerDragThrottle {
 /// grid lines up with whatever monospace face the desktop resolves.
 pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetrics {
     let context = widget.as_ref().pango_context();
-    context.set_font_description(Some(&theme.font));
-    let metrics = context.metrics(Some(&theme.font), None);
+    let font = theme.font();
+    context.set_font_description(Some(&font));
+    let metrics = context.metrics(Some(&font), None);
     let width = f64::from(metrics.approximate_digit_width()) / f64::from(pango::SCALE);
     let ascent = f64::from(metrics.ascent()) / f64::from(pango::SCALE);
     let descent = f64::from(metrics.descent()) / f64::from(pango::SCALE);
@@ -543,6 +667,97 @@ pub fn split_ratio_at(divider: &SplitDivider, x: f64, y: f64) -> Option<f64> {
     }
     let offset = (position - origin).round().clamp(1.0, extent - 1.0);
     Some(offset / extent)
+}
+
+/// Overlay scrollbar geometry from the server-owned viewport position.
+pub fn scrollbar_geometry(
+    content: Rect,
+    scrollback_rows: u32,
+    viewport_rows: u16,
+    viewport_offset: u64,
+    thumb_width: f64,
+) -> Option<ScrollbarGeometry> {
+    if scrollback_rows == 0 || viewport_rows == 0 || content.height <= 0.0 {
+        return None;
+    }
+    let track = Rect {
+        x: content.x,
+        y: content.y + SCROLLBAR_TRACK_INSET,
+        width: content.width,
+        height: (content.height - 2.0 * SCROLLBAR_TRACK_INSET).max(0.0),
+    };
+    if track.height <= 0.0 || !track.height.is_finite() || !thumb_width.is_finite() {
+        return None;
+    }
+    let total_rows = f64::from(scrollback_rows) + f64::from(viewport_rows);
+    let thumb_height = (track.height * f64::from(viewport_rows) / total_rows)
+        .max(SCROLLBAR_MIN_THUMB.min(track.height))
+        .min(track.height);
+    let travel = (track.height - thumb_height).max(0.0);
+    let progress =
+        viewport_offset.min(u64::from(scrollback_rows)) as f64 / f64::from(scrollback_rows);
+    Some(ScrollbarGeometry {
+        track,
+        thumb: Rect {
+            x: content.x + content.width - thumb_width - SCROLLBAR_EDGE_INSET,
+            y: track.y + progress * travel,
+            width: thumb_width,
+            height: thumb_height,
+        },
+    })
+}
+
+/// Convert a thumb drag from pixels to the corresponding signed row delta.
+pub fn scrollbar_drag_rows(
+    delta_pixels: f64,
+    scrollback_rows: u32,
+    track_height: f64,
+    thumb_height: f64,
+) -> i32 {
+    let travel = track_height - thumb_height;
+    if !delta_pixels.is_finite() || !travel.is_finite() || travel <= 0.0 {
+        return 0;
+    }
+    let rows = (delta_pixels / travel * f64::from(scrollback_rows)).round();
+    rows.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+pub fn scrollbar_at(
+    screens: &ScreenSet,
+    metrics: CellMetrics,
+    width: i32,
+    height: i32,
+    x: f64,
+    y: f64,
+) -> Option<ScrollbarHit> {
+    pane_geometries(screens, metrics, width, height)
+        .into_iter()
+        .filter_map(|pane| {
+            let terminal = pane.terminal?;
+            let screen = screens.grids.get(&terminal)?;
+            if screen.at_bottom {
+                return None;
+            }
+            let geometry = scrollbar_geometry(
+                pane.content,
+                screen.scrollback_rows,
+                screen.size.rows,
+                screen.viewport_offset,
+                SCROLLBAR_WIDTH,
+            )?;
+            let hit = Rect {
+                x: pane.content.x + pane.content.width - SCROLLBAR_HIT_WIDTH,
+                y: geometry.thumb.y,
+                width: SCROLLBAR_HIT_WIDTH,
+                height: geometry.thumb.height,
+            };
+            hit.contains(x, y).then_some(ScrollbarHit {
+                terminal,
+                geometry,
+                scrollback_rows: screen.scrollback_rows,
+            })
+        })
+        .next()
 }
 
 pub fn visible_terminal_sizes(
@@ -955,6 +1170,8 @@ pub fn build(
     theme: Rc<Theme>,
     blink: Rc<Cell<BlinkState>>,
     tab_strip: Rc<TabStripState>,
+    scrollbar: Rc<ScrollbarState>,
+    search_state: Rc<RefCell<SearchUiState>>,
 ) -> DrawingArea {
     let area = DrawingArea::new();
     area.set_focusable(true);
@@ -1005,6 +1222,10 @@ pub fn build(
                 );
             } else if let Some(terminal) = geometry.terminal.as_ref() {
                 if let Some(screen) = screens.grids.get(terminal) {
+                    let search_query = search_state
+                        .borrow()
+                        .visible_query(terminal)
+                        .map(str::to_string);
                     let (r, g, b) = parse_color(screen.default_bg.as_str());
                     cr.set_source_rgb(r, g, b);
                     cr.rectangle(
@@ -1028,6 +1249,7 @@ pub fn build(
                         cr,
                         terminal,
                         screen,
+                        search_query.as_deref(),
                         metrics,
                         geometry.content.height,
                         geometry.pane == workspace.layout.active_pane_id,
@@ -1064,6 +1286,13 @@ pub fn build(
                 );
                 let _ = cr.fill();
             }
+            if let Some(terminal) = geometry.terminal.as_ref() {
+                if let Some(screen) = screens.grids.get(terminal) {
+                    if !screen.at_bottom {
+                        draw_scrollbar(cr, geometry.content, terminal, screen, &chrome, &scrollbar);
+                    }
+                }
+            }
             let _ = cr.restore();
             draw_border(cr, geometry.rect, focused, &chrome);
         }
@@ -1080,6 +1309,76 @@ pub fn build(
         }
     });
     area
+}
+
+fn draw_scrollbar(
+    cr: &gtk4::cairo::Context,
+    content: Rect,
+    terminal: &TerminalId,
+    screen: &Screen,
+    colors: &ChromeColors,
+    state: &ScrollbarState,
+) {
+    let active = state.is_active(terminal);
+    let width = if active {
+        SCROLLBAR_ACTIVE_WIDTH
+    } else {
+        SCROLLBAR_WIDTH
+    };
+    let Some(geometry) = scrollbar_geometry(
+        content,
+        screen.scrollback_rows,
+        screen.size.rows,
+        screen.viewport_offset,
+        width,
+    ) else {
+        return;
+    };
+    let color = if active {
+        colors.scrollbar_thumb_active_foreground
+    } else {
+        colors.scrollbar_thumb_foreground
+    };
+    let (red, green, blue) = color.cairo();
+    cr.set_source_rgba(red, green, blue, if active { 0.95 } else { 0.78 });
+    rounded_rectangle(cr, geometry.thumb, width / 2.0);
+    let _ = cr.fill();
+}
+
+fn rounded_rectangle(cr: &gtk4::cairo::Context, rect: Rect, radius: f64) {
+    let radius = radius.min(rect.width / 2.0).min(rect.height / 2.0).max(0.0);
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    cr.new_sub_path();
+    cr.arc(
+        right - radius,
+        rect.y + radius,
+        radius,
+        -std::f64::consts::FRAC_PI_2,
+        0.0,
+    );
+    cr.arc(
+        right - radius,
+        bottom - radius,
+        radius,
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+    );
+    cr.arc(
+        rect.x + radius,
+        bottom - radius,
+        radius,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+    );
+    cr.arc(
+        rect.x + radius,
+        rect.y + radius,
+        radius,
+        std::f64::consts::PI,
+        std::f64::consts::PI * 1.5,
+    );
+    cr.close_path();
 }
 
 fn draw_screen_bar(
@@ -1284,6 +1583,7 @@ fn draw_grid(
     cr: &gtk4::cairo::Context,
     terminal: &TerminalId,
     screen: &Screen,
+    search_query: Option<&str>,
     metrics: CellMetrics,
     height: f64,
     draw_selection: bool,
@@ -1305,13 +1605,17 @@ fn draw_grid(
         image_cache,
         theme.chrome().sidebar_dim_foreground,
     );
+    if let Some(query) = search_query {
+        draw_search_highlights(cr, screen, metrics, height, query, theme.chrome().accent);
+    }
     if draw_selection && screen.selection.is_some() {
         let (r, g, b) = theme.chrome().selection_background.cairo();
         cr.set_source_rgb(r, g, b);
         selection_path(cr, screen, metrics);
         let _ = cr.fill();
     }
-    draw_grid_text(area, cr, screen, metrics, height, &theme.font, None, blink);
+    let font = theme.font();
+    draw_grid_text(area, cr, screen, metrics, height, &font, None, blink);
     if draw_selection && screen.selection.is_some() {
         if let Some(foreground) = theme.chrome().selection_foreground {
             let _ = cr.save();
@@ -1323,7 +1627,7 @@ fn draw_grid(
                 screen,
                 metrics,
                 height,
-                &theme.font,
+                &font,
                 Some(foreground),
                 blink,
             );
@@ -1368,6 +1672,67 @@ fn draw_grid(
         }
         let _ = cr.fill();
     }
+}
+
+fn draw_search_highlights(
+    cr: &gtk4::cairo::Context,
+    screen: &Screen,
+    metrics: CellMetrics,
+    height: f64,
+    query: &str,
+    accent: Rgb,
+) {
+    let (red, green, blue) = accent.cairo();
+    cr.set_source_rgba(red, green, blue, 0.25);
+    for (row_index, row) in screen.rows.iter().enumerate() {
+        let Some(row) = row else { continue };
+        let y = row_index as f64 * metrics.height;
+        if y >= height {
+            break;
+        }
+        let (text, boundaries) = row_text_and_cell_boundaries(row);
+        for (start, end) in search::find_line_matches(&text, query) {
+            let Some((&start_column, &end_column)) = boundaries.get(start).zip(boundaries.get(end))
+            else {
+                continue;
+            };
+            if end_column <= start_column {
+                continue;
+            }
+            cr.rectangle(
+                f64::from(start_column) * metrics.width,
+                y,
+                f64::from(end_column - start_column) * metrics.width,
+                metrics.height,
+            );
+        }
+    }
+    let _ = cr.fill();
+}
+
+fn row_text_and_cell_boundaries(row: &cmux::RenderRow) -> (String, Vec<u16>) {
+    let mut text = String::new();
+    let mut boundaries = vec![0];
+    let mut column = 0u16;
+    for run in &row.runs {
+        let character_count = run.text.chars().count();
+        if character_count == 0 {
+            continue;
+        }
+        let cells = run
+            .width_hint
+            .unwrap_or_else(|| u16::try_from(character_count).unwrap_or(u16::MAX));
+        text.push_str(&run.text);
+        for index in 1..=character_count {
+            let run_column = ((index as u64 * u64::from(cells))
+                .saturating_add(character_count as u64 - 1)
+                / character_count as u64)
+                .min(u64::from(u16::MAX)) as u16;
+            boundaries.push(column.saturating_add(run_column));
+        }
+        column = column.saturating_add(cells);
+    }
+    (text, boundaries)
 }
 
 pub fn graphic_geometry(
@@ -1826,7 +2191,7 @@ fn draw_browser_placeholder(
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     let _ = cr.fill();
     let layout = area.create_pango_layout(Some("browser tab - not supported"));
-    layout.set_font_description(Some(&theme.font));
+    layout.set_font_description(Some(&theme.font()));
     let (red, green, blue) = colors.sidebar_dim_foreground.cairo();
     cr.set_source_rgb(red, green, blue);
     cr.move_to(rect.x + 12.0, rect.y + 12.0);
@@ -2399,5 +2764,45 @@ mod tests {
         );
         assert!(blinking_content_visible(true, blink));
         assert!(!blink.tick(true));
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_absolute_viewport_offset_and_retained_ratio() {
+        let content = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 200.0,
+            height: 100.0,
+        };
+        let top = scrollbar_geometry(content, 100, 20, 0, 4.0).unwrap();
+        let middle = scrollbar_geometry(content, 100, 20, 50, 4.0).unwrap();
+        let bottom = scrollbar_geometry(content, 100, 20, 100, 4.0).unwrap();
+
+        assert_eq!(top.track.y, 23.0);
+        assert_eq!(top.track.height, 94.0);
+        assert_eq!(top.thumb.height, 24.0);
+        assert_eq!(top.thumb.y, 23.0);
+        assert_eq!(middle.thumb.y, 58.0);
+        assert_eq!(bottom.thumb.y, 93.0);
+        assert_eq!(bottom.thumb.x, 203.0);
+        assert!(scrollbar_geometry(content, 0, 20, 0, 4.0).is_none());
+    }
+
+    #[test]
+    fn scrollbar_drag_pixels_convert_to_signed_incremental_rows() {
+        assert_eq!(scrollbar_drag_rows(35.0, 100, 94.0, 24.0), 50);
+        assert_eq!(scrollbar_drag_rows(-14.0, 100, 94.0, 24.0), -20);
+        assert_eq!(scrollbar_drag_rows(10.0, 100, 24.0, 24.0), 0);
+        assert_eq!(scrollbar_drag_rows(f64::NAN, 100, 94.0, 24.0), 0);
+    }
+
+    #[test]
+    fn runtime_font_size_adjustment_clamps_to_supported_range() {
+        assert_eq!(clamp_font_size(5.0), MIN_FONT_SIZE);
+        assert_eq!(clamp_font_size(33.0), MAX_FONT_SIZE);
+        assert_eq!(adjusted_font_size(6.0, -1.0), MIN_FONT_SIZE);
+        assert_eq!(adjusted_font_size(32.0, 1.0), MAX_FONT_SIZE);
+        assert_eq!(adjusted_font_size(11.0, 1.0), 12.0);
+        assert_eq!(clamp_font_size(f64::NAN), DEFAULT_FONT_SIZE);
     }
 }

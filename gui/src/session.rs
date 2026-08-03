@@ -17,14 +17,15 @@ use std::thread;
 use std::time::Duration;
 
 use cmux::{
-    Client, Config, CreateScreenOptions, Direction, LayoutNode, PaneId, RenderPatch,
-    RenderSnapshot, ScreenId, ScrollOptions, Selector, Size, SplitId, SplitOptions,
+    Client, Config, CreateScreenOptions, Direction, LayoutNode, PaneId, ReadHistoryOptions,
+    RenderPatch, RenderSnapshot, ScreenId, ScrollOptions, Selector, Size, SplitId, SplitOptions,
     SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
     TerminalAttachmentItem, TerminalCreateOptions, TerminalId, TerminalMouseOptions,
     TextInputOptions, WorkspaceId,
 };
 
 use crate::screen::{PaneView, ScreenTabView, TabContent, TabView, WorkspaceView};
+use crate::search::{self, SearchRequest, SearchResults};
 
 /// Short enough that resize and shutdown commands feel immediate without
 /// turning an idle attachment into a busy loop.
@@ -87,8 +88,10 @@ pub enum Update {
     },
     Scroll {
         terminal: TerminalId,
+        offset: u64,
         at_bottom: bool,
     },
+    SearchResults(SearchResults),
     Detached {
         terminal: TerminalId,
     },
@@ -189,6 +192,7 @@ pub enum Input {
         ratio: f64,
     },
     RefreshWorkspaces,
+    Search(SearchRequest),
     /// `None` is meaningful for a focused browser tab: input must not leak to
     /// the terminal that happened to be focused before it.
     SetTarget(Option<TerminalId>),
@@ -488,6 +492,7 @@ fn attachment_loop(
                     } => {
                         let _ = updates.send_blocking(Update::Scroll {
                             terminal: terminal_id,
+                            offset: scroll.offset,
                             at_bottom: scroll.at_bottom,
                         });
                     }
@@ -594,6 +599,7 @@ fn control_loop(
 ) {
     let session = client.session(Selector::current());
     let mut target: Option<TerminalId> = None;
+    let mut history_cache: HashMap<TerminalId, Vec<String>> = HashMap::new();
 
     while let Ok(input) = inputs.recv() {
         match input {
@@ -626,6 +632,18 @@ fn control_loop(
                     .scroll(ScrollOptions { delta_rows })
                 {
                     let _ = updates.send_blocking(Update::Error(format!("scroll failed: {error}")));
+                }
+            }
+            Input::Search(request) => {
+                match search_terminal(&session, &mut history_cache, request) {
+                    Ok(results) => {
+                        let _ = updates.send_blocking(Update::SearchResults(results));
+                    }
+                    Err(error) => {
+                        let _ = updates.send_blocking(Update::Error(format!(
+                            "scrollback search failed: {error}"
+                        )));
+                    }
                 }
             }
             Input::Mouse { terminal, options } => {
@@ -913,6 +931,61 @@ fn refresh_after_focus(client: &Client, updates: &async_channel::Sender<Update>)
     if let Err(error) = publish_workspaces(client, updates) {
         let _ = updates.send_blocking(Update::Error(error));
     }
+}
+
+fn search_terminal(
+    session: &cmux::Session,
+    history_cache: &mut HashMap<TerminalId, Vec<String>>,
+    request: SearchRequest,
+) -> Result<SearchResults, String> {
+    let cache_is_stale = history_cache
+        .get(&request.terminal)
+        .is_none_or(|rows| rows.len() != request.expected_history_rows as usize);
+    if request.refresh || cache_is_stale {
+        let handle = session.terminal(Selector::id(request.terminal.clone()));
+        let mut before = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = handle
+                .read_history(ReadHistoryOptions {
+                    before,
+                    limit: Some(10_000),
+                    styled: Some(false),
+                })
+                .map_err(|error| error.to_string())?;
+            let next = page.next;
+            pages.push((
+                page.start,
+                page.rows.iter().map(search::row_text).collect::<Vec<_>>(),
+            ));
+            let Some(next) = next else { break };
+            if before == Some(next) {
+                return Err("history pagination cursor did not advance".to_string());
+            }
+            before = Some(next);
+        }
+        pages.sort_by_key(|(start, _)| *start);
+        let mut history = Vec::new();
+        for (start, rows) in pages {
+            if start != history.len() as u64 {
+                return Err("retained history changed while it was being paged".to_string());
+            }
+            history.extend(rows);
+        }
+        history_cache.insert(request.terminal.clone(), history);
+    }
+
+    let history = history_cache
+        .get(&request.terminal)
+        .expect("history cache is populated above");
+    let document = search::complete_document(history, &request.viewport, request.viewport_offset);
+    Ok(SearchResults {
+        generation: request.generation,
+        terminal: request.terminal,
+        query: request.query.clone(),
+        history_rows: history.len() as u64,
+        matches: search::find_matches(&document, &request.query),
+    })
 }
 
 /// Publishes workspace catalog data and the focused screen's complete layout.

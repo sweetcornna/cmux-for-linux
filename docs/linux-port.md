@@ -176,6 +176,20 @@ run through the Rust resource bindings on the protocol worker thread; the
 server owns every mutation and the GTK frontend redraws only after refreshed
 topology arrives.
 
+The GTK frontend also has per-pane overlay scrollbars, scrollback search and
+runtime font zoom. Attachment scroll events provide the absolute viewport
+offset used by the 4px rounded thumb; hovering or dragging uses the paired
+active chrome semantic, and reaching the bottom hides it without animation.
+`Ctrl+Shift+F` searches literal text case-insensitively across retained history
+and the current viewport. The protocol worker pages `terminal.history.read`
+backward with `before`/`limit`, caches plain rows per terminal, and returns
+absolute match positions without blocking GTK; Enter and Shift+Enter navigate
+matches and cairo highlights visible hits with accent at 25% opacity. `Ctrl++`,
+`Ctrl+=`, `Ctrl+-` and `Ctrl+0` adjust or reset the configured GTK font at
+runtime within 6pt-32pt, then reuse the existing attachment resize path for
+every visible pane. None of these features adds a client-side VT parser, and
+runtime zoom is never written to configuration.
+
 There is no remaining stage 2 tail.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and

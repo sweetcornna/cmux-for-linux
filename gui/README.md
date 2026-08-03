@@ -40,6 +40,7 @@ normally be terminal-emulation complexity stays server-side.
 | --- | --- |
 | `src/main.rs` | GTK application, window, sidebar, wiring |
 | `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
+| `src/search.rs` | case-insensitive scrollback matching, result navigation and pure search geometry |
 | `src/session.rs` | protocol worker threads; render text and image payloads reach the UI without blocking it on a socket |
 | `src/screen.rs` | cell and image state, with snapshot/patch merge semantics |
 | `src/view.rs` | cairo/Pango/Pixbuf drawing and key-to-bytes translation |
@@ -67,12 +68,13 @@ cargo run --release -- --probe --session main
 | Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
 | Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology refreshes every 3 seconds |
-| Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations and a final authoritative value |
-| Scrollback | the mouse wheel scrolls the viewport |
+| Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
+| Scrollback | the mouse wheel scrolls the viewport; a rounded 4px overlay thumb appears off-bottom, widens on hover, and supports direct dragging |
+| Scrollback search | `Ctrl+Shift+F` opens a prompt-themed search bar; literal case-insensitive matches cover retained history plus the current viewport, Enter/Shift+Enter navigate them, and visible hits use accent at 25% opacity |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
 | Inline images | server-decoded Kitty RGB/RGBA pixels with source cropping, cell-relative scaling, scroll-aware viewport placement and z-order; inactive panes use the same 70% dimming as text |
-| Theme | runtime chrome colors from the active terminal background plus explicit `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
+| Theme | runtime chrome colors from the active terminal background plus explicit `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT`, with non-persistent 6pt-32pt runtime zoom |
 
 The visual metrics and color rules follow
 [`../docs/gtk-design-parity.md`](../docs/gtk-design-parity.md).
@@ -84,6 +86,12 @@ then press the action key:
 
 | Shortcut | Action |
 | --- | --- |
+| `Ctrl+Shift+F` | Open scrollback search for the focused terminal |
+| `Enter` / `Shift+Enter` (in search) | Jump to the previous / next match |
+| `Esc` (in search) | Close scrollback search |
+| `Ctrl++` / `Ctrl+=` | Increase the terminal font size by 1pt, up to 32pt |
+| `Ctrl+-` | Decrease the terminal font size by 1pt, down to 6pt |
+| `Ctrl+0` | Reset the terminal font to the configured default |
 | `Ctrl+B t` | Create a terminal tab in the focused pane (`NewTab`) |
 | `Ctrl+B x` | Close the focused pane tab (`CloseTab`); the server collapses a pane when this was its last tab |
 | `Ctrl+B Tab` / `Ctrl+B Shift+Tab` | Focus the next / previous pane tab, wrapping at either end |
@@ -117,6 +125,13 @@ The GTK frontend honors these keys under `theme` in `cmux-tui.json`:
 - `sidebar_active_bg`
 - `tab_bg`
 - `tab_active_bg`
+- `scrollbar_thumb_fg`
+- `scrollbar_thumb_active_fg`
+- `prompt_bg`
+- `prompt_fg`
+- `prompt_border`
+- `prompt_input_bg`
+- `prompt_input_fg`
 
 Explicit theme colors take precedence over the parity defaults. In particular,
 the 2px active-pane border is off unless `border_active` is configured.
@@ -141,6 +156,9 @@ value in `cmux-gtk.json`:
 CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 ```
 
+Runtime zoom changes only the current process and never writes either config
+file. Each change recomputes cell metrics and resizes every visible pane PTY.
+
 ## Mouse policy
 
 | Input | Handled by the GTK frontend | Forwarded to the pane application |
@@ -151,6 +169,7 @@ CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 | Right-click | Focuses the pane and opens its split/close `PopoverMenu` | No |
 | Drag a workspace row | Reorders it through `Workspace::move_to` and shows the accent drop indicator | No |
 | Drag from a split divider | Resizes the server-owned split through a 6px hit region and shows a row/column resize cursor | No |
+| Drag the overlay scrollbar thumb | Converts thumb travel to retained-history rows and scrolls through the server viewport API | No |
 | Shift+drag | Selects text locally | No |
 | Wheel over an alternate-screen application using mouse input | No local scrollback | Yes |
 | Wheel otherwise | Scrolls local history | No |

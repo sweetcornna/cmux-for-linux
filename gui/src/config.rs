@@ -55,6 +55,13 @@ pub struct ThemeOverrides {
     pub tab_active_background: Option<Rgb>,
     pub border_active: Option<Rgb>,
     pub border_inactive: Option<Rgb>,
+    pub scrollbar_thumb: Option<Rgb>,
+    pub scrollbar_thumb_active: Option<Rgb>,
+    pub prompt_background: Option<Rgb>,
+    pub prompt_foreground: Option<Rgb>,
+    pub prompt_border: Option<Rgb>,
+    pub prompt_input_background: Option<Rgb>,
+    pub prompt_input_foreground: Option<Rgb>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +118,12 @@ pub struct ChromeColors {
     pub toast_background: Rgb,
     pub toast_foreground: Rgb,
     pub scrollbar_thumb_foreground: Rgb,
+    pub scrollbar_thumb_active_foreground: Rgb,
+    pub prompt_background: Rgb,
+    pub prompt_foreground: Rgb,
+    pub prompt_border: Rgb,
+    pub prompt_input_background: Rgb,
+    pub prompt_input_foreground: Rgb,
     pub workspace_rail: Option<Rgb>,
     pub is_light: bool,
 }
@@ -158,7 +171,21 @@ impl ChromeColors {
                 menu_foreground: Rgb(0x30, 0x30, 0x30),
                 toast_background: Rgb(0xd0, 0xd0, 0xd0),
                 toast_foreground: Rgb(0x1c, 0x1c, 0x1c),
-                scrollbar_thumb_foreground: Rgb(0x94, 0x94, 0x94),
+                scrollbar_thumb_foreground: overrides
+                    .scrollbar_thumb
+                    .unwrap_or(Rgb(0x94, 0x94, 0x94)),
+                scrollbar_thumb_active_foreground: overrides
+                    .scrollbar_thumb_active
+                    .unwrap_or(Rgb(0x58, 0x58, 0x58)),
+                prompt_background: overrides.prompt_background.unwrap_or(Rgb(0xe4, 0xe4, 0xe4)),
+                prompt_foreground: overrides.prompt_foreground.unwrap_or(Rgb(0x30, 0x30, 0x30)),
+                prompt_border: overrides.prompt_border.unwrap_or(Rgb(0x94, 0x94, 0x94)),
+                prompt_input_background: overrides
+                    .prompt_input_background
+                    .unwrap_or(Rgb(0xee, 0xee, 0xee)),
+                prompt_input_foreground: overrides
+                    .prompt_input_foreground
+                    .unwrap_or(Rgb(0x1c, 0x1c, 0x1c)),
                 workspace_rail: overrides.sidebar_rail,
                 is_light,
             }
@@ -192,7 +219,21 @@ impl ChromeColors {
                 menu_foreground: Rgb(0xd0, 0xd0, 0xd0),
                 toast_background: Rgb(0x58, 0x58, 0x58),
                 toast_foreground: Rgb(0xee, 0xee, 0xee),
-                scrollbar_thumb_foreground: Rgb(0x94, 0x94, 0x94),
+                scrollbar_thumb_foreground: overrides
+                    .scrollbar_thumb
+                    .unwrap_or(Rgb(0x94, 0x94, 0x94)),
+                scrollbar_thumb_active_foreground: overrides
+                    .scrollbar_thumb_active
+                    .unwrap_or(Rgb(0xd0, 0xd0, 0xd0)),
+                prompt_background: overrides.prompt_background.unwrap_or(Rgb(0x30, 0x30, 0x30)),
+                prompt_foreground: overrides.prompt_foreground.unwrap_or(Rgb(0xd0, 0xd0, 0xd0)),
+                prompt_border: overrides.prompt_border.unwrap_or(Rgb(0x80, 0x80, 0x80)),
+                prompt_input_background: overrides
+                    .prompt_input_background
+                    .unwrap_or(Rgb(0x12, 0x12, 0x12)),
+                prompt_input_foreground: overrides
+                    .prompt_input_foreground
+                    .unwrap_or(Rgb(0xee, 0xee, 0xee)),
                 workspace_rail: overrides.sidebar_rail,
                 is_light,
             }
@@ -260,7 +301,13 @@ impl ChromeColors {
 @define-color menu_fg {menu_fg};
 @define-color toast_bg {toast_bg};
 @define-color toast_fg {toast_fg};
-@define-color scrollbar_thumb_fg {scrollbar_thumb_fg};
+	@define-color scrollbar_thumb_fg {scrollbar_thumb_fg};
+	@define-color scrollbar_thumb_active_fg {scrollbar_thumb_active_fg};
+	@define-color prompt_bg {prompt_bg};
+	@define-color prompt_fg {prompt_fg};
+	@define-color prompt_border {prompt_border};
+	@define-color prompt_input_bg {prompt_input_bg};
+	@define-color prompt_input_fg {prompt_input_fg};
 @define-color sidebar_hover_bg {sidebar_hover_bg};
 
 window.cmux-window,
@@ -434,6 +481,35 @@ popover.rename-prompt > contents {{
   background-color: @toast_bg;
   color: @toast_fg;
 }}
+.search-bar {{
+  min-height: 28px;
+  padding: 3px 6px;
+  border-bottom: 1px solid @prompt_border;
+  border-spacing: 6px;
+  background-color: @prompt_bg;
+  color: @prompt_fg;
+}}
+.search-entry {{
+  min-height: 22px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background-color: @prompt_input_bg;
+  color: @prompt_input_fg;
+}}
+.search-count {{
+  min-width: 48px;
+  color: @prompt_fg;
+  font-size: 11px;
+}}
+.search-close {{
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border-radius: 4px;
+  background-color: transparent;
+  color: @prompt_fg;
+}}
+.search-close:hover {{ background-color: @sidebar_hover_bg; }}
 .sidebar-surface scrollbar slider {{
   min-width: 4px;
   min-height: 24px;
@@ -465,6 +541,12 @@ popover.rename-prompt > contents {{
             toast_bg = self.toast_background.css(),
             toast_fg = self.toast_foreground.css(),
             scrollbar_thumb_fg = self.scrollbar_thumb_foreground.css(),
+            scrollbar_thumb_active_fg = self.scrollbar_thumb_active_foreground.css(),
+            prompt_bg = self.prompt_background.css(),
+            prompt_fg = self.prompt_foreground.css(),
+            prompt_border = self.prompt_border.css(),
+            prompt_input_bg = self.prompt_input_background.css(),
+            prompt_input_fg = self.prompt_input_foreground.css(),
             sidebar_hover_bg = hover,
         )
     }
@@ -684,6 +766,34 @@ fn apply_tui_theme(settings: &mut Settings, document: &Value) {
     apply_optional_color(
         theme.get("tab_active_bg"),
         &mut settings.theme.tab_active_background,
+    );
+    apply_optional_color(
+        theme.get("scrollbar_thumb_fg"),
+        &mut settings.theme.scrollbar_thumb,
+    );
+    apply_optional_color(
+        theme.get("scrollbar_thumb_active_fg"),
+        &mut settings.theme.scrollbar_thumb_active,
+    );
+    apply_optional_color(
+        theme.get("prompt_bg"),
+        &mut settings.theme.prompt_background,
+    );
+    apply_optional_color(
+        theme.get("prompt_fg"),
+        &mut settings.theme.prompt_foreground,
+    );
+    apply_optional_color(
+        theme.get("prompt_border"),
+        &mut settings.theme.prompt_border,
+    );
+    apply_optional_color(
+        theme.get("prompt_input_bg"),
+        &mut settings.theme.prompt_input_background,
+    );
+    apply_optional_color(
+        theme.get("prompt_input_fg"),
+        &mut settings.theme.prompt_input_foreground,
     );
 }
 

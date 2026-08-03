@@ -10,6 +10,7 @@
 
 mod config;
 mod screen;
+mod search;
 mod session;
 mod view;
 
@@ -104,6 +105,14 @@ struct DividerDrag {
     start_y: f64,
     started: Instant,
     throttle: view::DividerDragThrottle,
+}
+
+struct ScrollbarDrag {
+    terminal: TerminalId,
+    scrollback_rows: u32,
+    track_height: f64,
+    thumb_height: f64,
+    sent_rows: i32,
 }
 
 struct Args {
@@ -572,6 +581,79 @@ fn clear_toast(toast: &Label) {
     toast.set_visible(false);
 }
 
+fn make_search_request(
+    screens: &ScreenSet,
+    state: &mut search::SearchUiState,
+    refresh: bool,
+) -> Option<search::SearchRequest> {
+    if !state.open {
+        return None;
+    }
+    let terminal = state.terminal.clone()?;
+    let screen = screens.grids.get(&terminal)?;
+    state.generation = state.generation.wrapping_add(1);
+    Some(search::SearchRequest {
+        generation: state.generation,
+        terminal,
+        query: state.query.clone(),
+        expected_history_rows: screen.scrollback_rows,
+        viewport_offset: screen.viewport_offset,
+        viewport: screen
+            .rows
+            .iter()
+            .map(|row| row.as_ref().map(search::row_text).unwrap_or_default())
+            .collect(),
+        refresh,
+    })
+}
+
+fn request_search(
+    worker: &Worker,
+    screens: &ScreenSet,
+    state: &mut search::SearchUiState,
+    refresh: bool,
+) {
+    if let Some(request) = make_search_request(screens, state, refresh) {
+        let _ = worker.input.send(Input::Search(request));
+    }
+}
+
+fn scroll_to_search_match(
+    worker: &Worker,
+    screens: &ScreenSet,
+    terminal: &TerminalId,
+    line: u64,
+    history_rows: u64,
+) {
+    let Some(screen) = screens.grids.get(terminal) else {
+        return;
+    };
+    let delta_rows =
+        search::scroll_delta_to_line(line, history_rows, screen.size.rows, screen.viewport_offset);
+    if delta_rows != 0 {
+        let _ = worker.input.send(Input::Scroll {
+            terminal: terminal.clone(),
+            delta_rows,
+        });
+    }
+}
+
+fn navigate_search(
+    worker: &Worker,
+    screens: &ScreenSet,
+    state: &mut search::SearchUiState,
+    upward: bool,
+) {
+    let Some(terminal) = state.terminal.clone() else {
+        return;
+    };
+    let history_rows = state.history_rows;
+    let Some(line) = state.navigate(upward).map(|matched| matched.line) else {
+        return;
+    };
+    scroll_to_search_match(worker, screens, &terminal, line, history_rows);
+}
+
 fn refresh_chrome(
     screens: &ScreenSet,
     theme: &view::Theme,
@@ -809,6 +891,8 @@ fn build_ui(application: &Application) {
     ));
     let blink = Rc::new(Cell::new(view::BlinkState::new(false)));
     let tab_strip = Rc::new(view::TabStripState::default());
+    let scrollbar = Rc::new(view::ScrollbarState::default());
+    let search_state = Rc::new(RefCell::new(search::SearchUiState::default()));
 
     let css_provider = CssProvider::new();
     css_provider.load_from_data(&theme.css());
@@ -862,6 +946,8 @@ fn build_ui(application: &Application) {
         Rc::clone(&theme),
         Rc::clone(&blink),
         Rc::clone(&tab_strip),
+        Rc::clone(&scrollbar),
+        Rc::clone(&search_state),
     );
 
     let toast = Label::new(None);
@@ -870,8 +956,31 @@ fn build_ui(application: &Application) {
     toast.set_valign(Align::End);
     toast.set_wrap(true);
     toast.set_visible(false);
+
+    let search_bar = GtkBox::new(Orientation::Horizontal, 6);
+    search_bar.add_css_class("search-bar");
+    search_bar.set_halign(Align::Fill);
+    search_bar.set_valign(Align::Start);
+    search_bar.set_margin_top(28);
+    search_bar.set_visible(false);
+    let search_icon = gtk4::Image::from_icon_name("edit-find-symbolic");
+    let search_entry = Entry::new();
+    search_entry.add_css_class("search-entry");
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Find"));
+    let search_count = Label::new(Some("0/0"));
+    search_count.add_css_class("search-count");
+    let search_close = Button::from_icon_name("window-close-symbolic");
+    search_close.add_css_class("search-close");
+    search_close.set_tooltip_text(Some("Close search"));
+    search_bar.append(&search_icon);
+    search_bar.append(&search_entry);
+    search_bar.append(&search_count);
+    search_bar.append(&search_close);
+
     let terminal_overlay = Overlay::new();
     terminal_overlay.set_child(Some(&terminal));
+    terminal_overlay.add_overlay(&search_bar);
     terminal_overlay.add_overlay(&toast);
     let paned = Paned::builder()
         .orientation(Orientation::Horizontal)
@@ -1000,6 +1109,69 @@ fn build_ui(application: &Application) {
         });
     }
 
+    // --- scrollback search -------------------------------------------------
+    {
+        let search_state = Rc::clone(&search_state);
+        let search_bar = search_bar.clone();
+        let terminal = terminal.clone();
+        search_close.connect_clicked(move |_| {
+            search_state.borrow_mut().close();
+            search_bar.set_visible(false);
+            terminal.grab_focus();
+            terminal.queue_draw();
+        });
+    }
+    {
+        let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let search_state = Rc::clone(&search_state);
+        let search_count = search_count.clone();
+        let terminal = terminal.clone();
+        search_entry.connect_changed(move |entry| {
+            let mut state = search_state.borrow_mut();
+            if !state.open {
+                return;
+            }
+            state.query = entry.text().to_string();
+            state.matches.clear();
+            state.selected = None;
+            search_count.set_text(&state.status());
+            request_search(&worker, &screens.borrow(), &mut state, false);
+            terminal.queue_draw();
+        });
+    }
+    {
+        let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let search_state = Rc::clone(&search_state);
+        let search_count = search_count.clone();
+        let search_bar = search_bar.clone();
+        let terminal = terminal.clone();
+        let keys = EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, modifiers| match key {
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                let mut state = search_state.borrow_mut();
+                navigate_search(
+                    &worker,
+                    &screens.borrow(),
+                    &mut state,
+                    !modifiers.contains(gdk::ModifierType::SHIFT_MASK),
+                );
+                search_count.set_text(&state.status());
+                gtk4::glib::Propagation::Stop
+            }
+            gdk::Key::Escape => {
+                search_state.borrow_mut().close();
+                search_bar.set_visible(false);
+                terminal.grab_focus();
+                terminal.queue_draw();
+                gtk4::glib::Propagation::Stop
+            }
+            _ => gtk4::glib::Propagation::Proceed,
+        });
+        search_entry.add_controller(keys);
+    }
+
     // --- keyboard ---------------------------------------------------------
     let key_controller = EventControllerKey::new();
     {
@@ -1009,8 +1181,78 @@ fn build_ui(application: &Application) {
         let toast = toast.clone();
         let rename_prompt = Rc::clone(&rename_prompt);
         let entries = Rc::clone(&entries);
+        let search_state = Rc::clone(&search_state);
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
+        let search_count = search_count.clone();
+        let theme_for_keys = Rc::clone(&theme);
         let prefix_armed = Cell::new(false);
         key_controller.connect_key_pressed(move |_, key, _, state| {
+            let is_search = state
+                .contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+                && !state.intersects(
+                    gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                )
+                && matches!(key, gdk::Key::F | gdk::Key::f);
+            if is_search {
+                let Some(terminal) = screens.borrow().focused_terminal().cloned() else {
+                    set_toast(&toast, "No focused terminal to search");
+                    return gtk4::glib::Propagation::Stop;
+                };
+                search_state.borrow_mut().close();
+                search_entry.set_text("");
+                let mut search = search_state.borrow_mut();
+                search.begin(terminal);
+                search_count.set_text(&search.status());
+                request_search(&worker, &screens.borrow(), &mut search, true);
+                drop(search);
+                search_bar.set_visible(true);
+                search_entry.grab_focus();
+                terminal_for_keys.queue_draw();
+                return gtk4::glib::Propagation::Stop;
+            }
+            let font_action = if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && !state.intersects(
+                    gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                ) {
+                match key {
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(1),
+                    gdk::Key::minus | gdk::Key::KP_Subtract => Some(-1),
+                    gdk::Key::_0 | gdk::Key::KP_0 => Some(0),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(direction) = font_action {
+                let changed = if direction == 0 {
+                    theme_for_keys.reset_font()
+                } else {
+                    theme_for_keys.zoom_font(direction)
+                };
+                if changed {
+                    sync_attachments(
+                        &worker,
+                        &screens.borrow(),
+                        &terminal_for_keys,
+                        &theme_for_keys,
+                    );
+                    terminal_for_keys.queue_draw();
+                }
+                set_toast(
+                    &toast,
+                    &format!(
+                        "Font {}% ({:.0} pt)",
+                        theme_for_keys.font_percent(),
+                        theme_for_keys.font_size()
+                    ),
+                );
+                return gtk4::glib::Propagation::Stop;
+            }
             let is_prefix = state.contains(gdk::ModifierType::CONTROL_MASK)
                 && !state.intersects(
                     gdk::ModifierType::SHIFT_MASK
@@ -1206,6 +1448,7 @@ fn build_ui(application: &Application) {
     let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
     let move_throttle = Rc::new(RefCell::new(view::MouseMoveThrottle::default()));
     let divider_drag = Rc::new(RefCell::new(None::<DividerDrag>));
+    let scrollbar_drag = Rc::new(RefCell::new(None::<ScrollbarDrag>));
     let divider_drag_direction = Rc::new(Cell::new(None::<LayoutDirection>));
     let suppress_mouse_release = Rc::new(Cell::new(false));
 
@@ -1228,6 +1471,9 @@ fn build_ui(application: &Application) {
         let tab_strip_for_enter = Rc::clone(&tab_strip);
         let tab_strip_for_motion = Rc::clone(&tab_strip);
         let tab_strip_for_leave = Rc::clone(&tab_strip);
+        let scrollbar_for_enter = Rc::clone(&scrollbar);
+        let scrollbar_for_motion = Rc::clone(&scrollbar);
+        let scrollbar_for_leave = Rc::clone(&scrollbar);
         let terminal_for_enter = terminal.clone();
         let terminal_for_motion = terminal.clone();
         let terminal_for_leave = terminal.clone();
@@ -1249,9 +1495,19 @@ fn build_ui(application: &Application) {
                 terminal_for_enter.height(),
             );
             let hovered_tab = view::hovered_pane_tab(&panes, x, y);
+            let hovered_scrollbar = view::scrollbar_at(
+                &screens,
+                view::cell_metrics(&terminal_for_enter, &theme_for_enter),
+                terminal_for_enter.width(),
+                terminal_for_enter.height(),
+                x,
+                y,
+            )
+            .map(|hit| hit.terminal);
             let screen_changed = tab_strip_for_enter.set_hovered_screen(hovered_screen);
             let tab_changed = tab_strip_for_enter.set_hovered_tab(hovered_tab);
-            if screen_changed || tab_changed {
+            let scrollbar_changed = scrollbar_for_enter.set_hovered(hovered_scrollbar);
+            if screen_changed || tab_changed || scrollbar_changed {
                 terminal_for_enter.queue_draw();
             }
             let direction =
@@ -1274,9 +1530,19 @@ fn build_ui(application: &Application) {
                 terminal_for_motion.height(),
             );
             let hovered_tab = view::hovered_pane_tab(&panes, x, y);
+            let hovered_scrollbar = view::scrollbar_at(
+                &screens_ref,
+                view::cell_metrics(&terminal_for_motion, &theme_for_motion),
+                terminal_for_motion.width(),
+                terminal_for_motion.height(),
+                x,
+                y,
+            )
+            .map(|hit| hit.terminal);
             let screen_changed = tab_strip_for_motion.set_hovered_screen(hovered_screen);
             let tab_changed = tab_strip_for_motion.set_hovered_tab(hovered_tab);
-            if screen_changed || tab_changed {
+            let scrollbar_changed = scrollbar_for_motion.set_hovered(hovered_scrollbar.clone());
+            if screen_changed || tab_changed || scrollbar_changed {
                 terminal_for_motion.queue_draw();
             }
             drop(screens_ref);
@@ -1292,6 +1558,10 @@ fn build_ui(application: &Application) {
             });
             terminal_for_motion.set_cursor_from_name(direction.map(resize_cursor));
             if direction.is_some() {
+                throttle_for_motion.borrow_mut().reset();
+                return;
+            }
+            if hovered_scrollbar.is_some() {
                 throttle_for_motion.borrow_mut().reset();
                 return;
             }
@@ -1332,7 +1602,8 @@ fn build_ui(application: &Application) {
             throttle_for_leave.borrow_mut().reset();
             let screen_changed = tab_strip_for_leave.set_hovered_screen(None);
             let tab_changed = tab_strip_for_leave.set_hovered_tab(None);
-            if screen_changed || tab_changed {
+            let scrollbar_changed = scrollbar_for_leave.set_hovered(None);
+            if screen_changed || tab_changed || scrollbar_changed {
                 terminal_for_leave.queue_draw();
             }
             terminal_for_leave
@@ -1416,6 +1687,20 @@ fn build_ui(application: &Application) {
             suppress_for_click.set(false);
             let screens = screens.borrow();
             let button_number = gesture.current_button();
+            if button_number == 1
+                && view::scrollbar_at(
+                    &screens,
+                    view::cell_metrics(&terminal_for_click, &theme),
+                    terminal_for_click.width(),
+                    terminal_for_click.height(),
+                    x,
+                    y,
+                )
+                .is_some()
+            {
+                suppress_for_click.set(true);
+                return;
+            }
             if let Some(geometry) = view::screen_bar_geometry(
                 &screens,
                 terminal_for_click.width(),
@@ -1666,8 +1951,37 @@ fn build_ui(application: &Application) {
         let theme_for_begin = Rc::clone(&theme);
         let divider_drag_for_begin = Rc::clone(&divider_drag);
         let drag_direction_for_begin = Rc::clone(&divider_drag_direction);
+        let scrollbar_drag_for_begin = Rc::clone(&scrollbar_drag);
+        let scrollbar_for_begin = Rc::clone(&scrollbar);
+        let suppress_for_begin = Rc::clone(&suppress_mouse_release);
         drag.connect_drag_begin(move |_, x, y| {
             terminal_for_begin.grab_focus();
+            let metrics = view::cell_metrics(&terminal_for_begin, &theme_for_begin);
+            if let Some(hit) = view::scrollbar_at(
+                &screens_for_begin.borrow(),
+                metrics,
+                terminal_for_begin.width(),
+                terminal_for_begin.height(),
+                x,
+                y,
+            ) {
+                *anchor_for_begin.borrow_mut() = None;
+                *divider_drag_for_begin.borrow_mut() = None;
+                drag_direction_for_begin.set(None);
+                suppress_for_begin.set(true);
+                scrollbar_for_begin.set_dragging(Some(hit.terminal.clone()));
+                *scrollbar_drag_for_begin.borrow_mut() = Some(ScrollbarDrag {
+                    terminal: hit.terminal,
+                    scrollback_rows: hit.scrollback_rows,
+                    track_height: hit.geometry.track.height,
+                    thumb_height: hit.geometry.thumb.height,
+                    sent_rows: 0,
+                });
+                terminal_for_begin.queue_draw();
+                return;
+            }
+            *scrollbar_drag_for_begin.borrow_mut() = None;
+            scrollbar_for_begin.set_dragging(None);
             if let Some(divider) =
                 divider_at(&screens_for_begin.borrow(), &terminal_for_begin, x, y)
             {
@@ -1698,7 +2012,6 @@ fn build_ui(application: &Application) {
             *divider_drag_for_begin.borrow_mut() = None;
             drag_direction_for_begin.set(None);
             terminal_for_begin.set_cursor_from_name(None);
-            let metrics = view::cell_metrics(&terminal_for_begin, &theme_for_begin);
             let geometries = view::pane_geometries(
                 &screens_for_begin.borrow(),
                 metrics,
@@ -1729,8 +2042,26 @@ fn build_ui(application: &Application) {
         let anchor_for_update = Rc::clone(&anchor);
         let theme_for_update = Rc::clone(&theme);
         let divider_drag_for_update = Rc::clone(&divider_drag);
+        let scrollbar_drag_for_update = Rc::clone(&scrollbar_drag);
         let worker_for_update = Rc::clone(&worker);
         drag.connect_drag_update(move |gesture, dx, dy| {
+            if let Some(scroll) = scrollbar_drag_for_update.borrow_mut().as_mut() {
+                let total_rows = view::scrollbar_drag_rows(
+                    dy,
+                    scroll.scrollback_rows,
+                    scroll.track_height,
+                    scroll.thumb_height,
+                );
+                let delta_rows = total_rows.saturating_sub(scroll.sent_rows);
+                if delta_rows != 0 {
+                    let _ = worker_for_update.input.send(Input::Scroll {
+                        terminal: scroll.terminal.clone(),
+                        delta_rows,
+                    });
+                    scroll.sent_rows = total_rows;
+                }
+                return;
+            }
             if let Some(resize) = divider_drag_for_update.borrow_mut().as_mut() {
                 if let Some(ratio) =
                     view::split_ratio_at(&resize.divider, resize.start_x + dx, resize.start_y + dy)
@@ -1771,9 +2102,29 @@ fn build_ui(application: &Application) {
         let terminal_for_end = terminal.clone();
         let screens_for_end = Rc::clone(&screens);
         let divider_drag_for_end = Rc::clone(&divider_drag);
+        let scrollbar_drag_for_end = Rc::clone(&scrollbar_drag);
+        let scrollbar_for_end = Rc::clone(&scrollbar);
         let drag_direction_for_end = Rc::clone(&divider_drag_direction);
         let worker_for_end = Rc::clone(&worker);
         drag.connect_drag_end(move |_, dx, dy| {
+            if let Some(scroll) = scrollbar_drag_for_end.borrow_mut().take() {
+                let total_rows = view::scrollbar_drag_rows(
+                    dy,
+                    scroll.scrollback_rows,
+                    scroll.track_height,
+                    scroll.thumb_height,
+                );
+                let delta_rows = total_rows.saturating_sub(scroll.sent_rows);
+                if delta_rows != 0 {
+                    let _ = worker_for_end.input.send(Input::Scroll {
+                        terminal: scroll.terminal,
+                        delta_rows,
+                    });
+                }
+                scrollbar_for_end.set_dragging(None);
+                terminal_for_end.queue_draw();
+                return;
+            }
             let Some(mut resize) = divider_drag_for_end.borrow_mut().take() else {
                 return;
             };
@@ -1856,6 +2207,8 @@ fn build_ui(application: &Application) {
         let sidebar_scrims = sidebar_scrims.clone();
         let rename_prompt = Rc::clone(&rename_prompt);
         let drop_indicators = Rc::clone(&drop_indicators);
+        let search_state = Rc::clone(&search_state);
+        let search_count = search_count.clone();
         gtk4::glib::spawn_future_local(async move {
             while let Ok(update) = update_rx.recv().await {
                 match update {
@@ -1937,7 +2290,7 @@ fn build_ui(application: &Application) {
                         render,
                     } => {
                         if screens.borrow().contains_terminal(&id) {
-                            screens.borrow_mut().apply_snapshot(id, *render);
+                            screens.borrow_mut().apply_snapshot(id.clone(), *render);
                             refresh_chrome(
                                 &screens.borrow(),
                                 &theme,
@@ -1947,6 +2300,10 @@ fn build_ui(application: &Application) {
                                 &workspaces,
                             );
                             terminal.queue_draw();
+                            let mut state = search_state.borrow_mut();
+                            if state.open && state.terminal.as_ref() == Some(&id) {
+                                request_search(&worker, &screens.borrow(), &mut state, false);
+                            }
                         }
                     }
                     Update::Patch {
@@ -1965,6 +2322,15 @@ fn build_ui(application: &Application) {
                                         &workspaces,
                                     );
                                     terminal.queue_draw();
+                                    let mut state = search_state.borrow_mut();
+                                    if state.open && state.terminal.as_ref() == Some(&id) {
+                                        request_search(
+                                            &worker,
+                                            &screens.borrow(),
+                                            &mut state,
+                                            false,
+                                        );
+                                    }
                                 }
                                 Err(error) => {
                                     set_toast(&toast, &format!("Render desync: {error}"));
@@ -1974,12 +2340,43 @@ fn build_ui(application: &Application) {
                     }
                     Update::Scroll {
                         terminal: id,
+                        offset,
                         at_bottom,
                     } => {
                         let focused = screens.borrow().focused_terminal() == Some(&id);
-                        screens.borrow_mut().apply_scroll(&id, at_bottom);
+                        screens.borrow_mut().apply_scroll(&id, offset, at_bottom);
                         if focused {
                             clear_toast(&toast);
+                        }
+                        terminal.queue_draw();
+                    }
+                    Update::SearchResults(results) => {
+                        let target = {
+                            let mut state = search_state.borrow_mut();
+                            if !state.accept(results) {
+                                None
+                            } else {
+                                search_count.set_text(&state.status());
+                                state
+                                    .selected
+                                    .and_then(|index| state.matches.get(index))
+                                    .map(|matched| {
+                                        (
+                                            state.terminal.clone().expect("open search terminal"),
+                                            matched.line,
+                                            state.history_rows,
+                                        )
+                                    })
+                            }
+                        };
+                        if let Some((search_terminal, line, history_rows)) = target {
+                            scroll_to_search_match(
+                                &worker,
+                                &screens.borrow(),
+                                &search_terminal,
+                                line,
+                                history_rows,
+                            );
                         }
                         terminal.queue_draw();
                     }
