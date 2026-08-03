@@ -7,10 +7,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Duration;
 
 use cmux::{
-    ColorHex, LayoutDirection, LayoutNode, PaneId, RenderCursorStyle, RenderRun, RenderUnderline,
-    Size, TabId, TerminalId,
+    ColorHex, LayoutDirection, LayoutNode, LayoutViewport, PaneId, RenderCursorStyle, RenderRun,
+    RenderUnderline, Size, SplitId, TabId, TerminalId,
 };
 use gtk4::pango;
 use gtk4::prelude::*;
@@ -26,6 +27,8 @@ const TAB_HEIGHT: f64 = 28.0;
 const TAB_FADE_WIDTH: f64 = 100.0;
 const SIDEBAR_SCRIM_HEIGHT: f64 = 50.0;
 const UNFOCUSED_PANE_OPACITY: f64 = 0.70;
+const DIVIDER_HIT_SIZE: f64 = 6.0;
+const DIVIDER_THROTTLE_INTERVAL: Duration = Duration::from_millis(45);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlinkState {
@@ -219,6 +222,66 @@ pub struct PaneGeometry {
     pub stack_header: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitDivider {
+    pub split_id: SplitId,
+    pub pane: PaneId,
+    pub direction: LayoutDirection,
+    pub split_rect: Rect,
+    pub position: f64,
+}
+
+impl SplitDivider {
+    fn hit_rect(&self) -> Rect {
+        match self.direction {
+            LayoutDirection::Horizontal => Rect {
+                x: self.position - DIVIDER_HIT_SIZE / 2.0,
+                y: self.split_rect.y,
+                width: DIVIDER_HIT_SIZE,
+                height: self.split_rect.height,
+            },
+            LayoutDirection::Vertical => Rect {
+                x: self.split_rect.x,
+                y: self.position - DIVIDER_HIT_SIZE / 2.0,
+                width: self.split_rect.width,
+                height: DIVIDER_HIT_SIZE,
+            },
+        }
+    }
+
+    fn distance_from_line(&self, x: f64, y: f64) -> f64 {
+        match self.direction {
+            LayoutDirection::Horizontal => (x - self.position).abs(),
+            LayoutDirection::Vertical => (y - self.position).abs(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DividerDragThrottle {
+    last_sent: Option<(Duration, f64)>,
+}
+
+impl DividerDragThrottle {
+    pub fn should_send(&mut self, now: Duration, ratio: f64, final_update: bool) -> bool {
+        if final_update {
+            self.last_sent = Some((now, ratio));
+            return true;
+        }
+        if self.last_sent.is_some_and(|(_, sent)| sent == ratio) {
+            return false;
+        }
+        if self
+            .last_sent
+            .is_some_and(|(sent_at, _)| now.saturating_sub(sent_at) < DIVIDER_THROTTLE_INTERVAL)
+        {
+            return false;
+        }
+        self.last_sent = Some((now, ratio));
+        true
+    }
+}
+
 /// Measures one cell from the font itself rather than assuming a size, so the
 /// grid lines up with whatever monospace face the desktop resolves.
 pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetrics {
@@ -257,6 +320,51 @@ pub fn pane_geometries(
         walk_layout(&workspace.layout.root, area, workspace, metrics, &mut panes);
     }
     panes
+}
+
+pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<SplitDivider> {
+    let Some(workspace) = screens.workspace.as_ref() else {
+        return Vec::new();
+    };
+    if workspace.layout.zoomed_pane_id.is_some() {
+        return Vec::new();
+    }
+    let area = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(width.max(0)),
+        height: f64::from(height.max(0)),
+    };
+    let mut dividers = Vec::new();
+    walk_dividers(
+        &workspace.layout.root,
+        area,
+        &workspace.layout.active_pane_id,
+        &mut dividers,
+    );
+    dividers
+}
+
+pub fn split_divider_at(dividers: &[SplitDivider], x: f64, y: f64) -> Option<&SplitDivider> {
+    dividers
+        .iter()
+        .filter(|divider| divider.hit_rect().contains(x, y))
+        .min_by(|left, right| {
+            left.distance_from_line(x, y)
+                .total_cmp(&right.distance_from_line(x, y))
+        })
+}
+
+pub fn split_ratio_at(divider: &SplitDivider, x: f64, y: f64) -> Option<f64> {
+    let (origin, extent, position) = match divider.direction {
+        LayoutDirection::Horizontal => (divider.split_rect.x, divider.split_rect.width, x),
+        LayoutDirection::Vertical => (divider.split_rect.y, divider.split_rect.height, y),
+    };
+    if !origin.is_finite() || !extent.is_finite() || !position.is_finite() || extent < 2.0 {
+        return None;
+    }
+    let offset = (position - origin).round().clamp(1.0, extent - 1.0);
+    Some(offset / extent)
 }
 
 pub fn visible_terminal_sizes(
@@ -318,34 +426,95 @@ fn walk_layout(
             );
         }
         LayoutNode::Viewport(viewport) => {
-            let widths: Vec<f64> = viewport
-                .columns
-                .iter()
-                .map(|column| (rect.width * column.width).max(1.0))
-                .collect();
-            let active_index = viewport
-                .columns
-                .iter()
-                .position(|column| node_contains(&column.root, &workspace.layout.active_pane_id));
-            let active_left = active_index
-                .map(|index| widths.iter().take(index).sum::<f64>())
-                .unwrap_or(0.0);
-            let active_right = active_index
-                .map(|index| active_left + widths[index])
-                .unwrap_or(rect.width);
-            let offset = (active_right - rect.width).max(0.0).min(active_left);
-            let mut x = rect.x - offset;
-            for (column, width) in viewport.columns.iter().zip(widths) {
-                walk_layout(
-                    &column.root,
-                    Rect { x, width, ..rect },
-                    workspace,
-                    metrics,
-                    out,
-                );
-                x += width;
+            for (child, child_rect) in
+                viewport_children(viewport, rect, &workspace.layout.active_pane_id)
+            {
+                walk_layout(child, child_rect, workspace, metrics, out);
             }
         }
+    }
+}
+
+fn walk_dividers(node: &LayoutNode, rect: Rect, active_pane: &PaneId, out: &mut Vec<SplitDivider>) {
+    match node {
+        LayoutNode::Leaf(_) | LayoutNode::Stack(_) => {}
+        LayoutNode::Split(split) => {
+            let (first, second) = split_rect(rect, split.direction, split.ratio);
+            let extent = match split.direction {
+                LayoutDirection::Horizontal => rect.width,
+                LayoutDirection::Vertical => rect.height,
+            };
+            if extent >= 2.0 {
+                if let Some(pane) = first_pane_id(&split.first) {
+                    let position = match split.direction {
+                        LayoutDirection::Horizontal => second.x,
+                        LayoutDirection::Vertical => second.y,
+                    };
+                    out.push(SplitDivider {
+                        split_id: split.split_id.clone(),
+                        pane: pane.clone(),
+                        direction: split.direction,
+                        split_rect: rect,
+                        position,
+                    });
+                }
+            }
+            walk_dividers(&split.first, first, active_pane, out);
+            walk_dividers(&split.second, second, active_pane, out);
+        }
+        LayoutNode::Viewport(viewport) => {
+            for (child, child_rect) in viewport_children(viewport, rect, active_pane) {
+                walk_dividers(child, child_rect, active_pane, out);
+            }
+        }
+    }
+}
+
+fn viewport_children<'a>(
+    viewport: &'a LayoutViewport,
+    rect: Rect,
+    active_pane: &PaneId,
+) -> Vec<(&'a LayoutNode, Rect)> {
+    let widths: Vec<f64> = viewport
+        .columns
+        .iter()
+        .map(|column| (rect.width * column.width).max(1.0))
+        .collect();
+    let active_index = viewport
+        .columns
+        .iter()
+        .position(|column| node_contains(&column.root, active_pane));
+    let active_left = active_index
+        .map(|index| widths.iter().take(index).sum::<f64>())
+        .unwrap_or(0.0);
+    let active_right = active_index
+        .map(|index| active_left + widths[index])
+        .unwrap_or(rect.width);
+    let offset = (active_right - rect.width).max(0.0).min(active_left);
+    let mut x = rect.x - offset;
+    viewport
+        .columns
+        .iter()
+        .zip(widths)
+        .map(|(column, width)| {
+            let child = (column.root.as_ref(), Rect { x, width, ..rect });
+            x += width;
+            child
+        })
+        .collect()
+}
+
+fn first_pane_id(node: &LayoutNode) -> Option<&PaneId> {
+    match node {
+        LayoutNode::Leaf(leaf) => Some(&leaf.pane_id),
+        LayoutNode::Split(split) => {
+            first_pane_id(&split.first).or_else(|| first_pane_id(&split.second))
+        }
+        LayoutNode::Stack(stack) => stack.pane_ids.first(),
+        LayoutNode::Viewport(viewport) => viewport
+            .columns
+            .iter()
+            .find_map(|column| first_pane_id(&column.root)),
     }
 }
 
@@ -1356,6 +1525,73 @@ mod tests {
         assert!(sizes
             .iter()
             .all(|(_, size)| *size == Size { cols: 50, rows: 28 }));
+    }
+
+    #[test]
+    fn divider_hit_testing_uses_six_pixel_region_and_nearest_line() {
+        let screens = split_workspace(false);
+        let dividers = split_dividers(&screens, 1000, 600);
+        assert_eq!(dividers.len(), 1);
+        assert_eq!(dividers[0].position, 500.0);
+        assert_eq!(
+            split_divider_at(&dividers, 497.0, 300.0).map(|hit| &hit.split_id),
+            Some(&dividers[0].split_id)
+        );
+        assert!(split_divider_at(&dividers, 502.99, 300.0).is_some());
+        assert!(split_divider_at(&dividers, 496.99, 300.0).is_none());
+        assert!(split_divider_at(&dividers, 500.0, 600.0).is_none());
+
+        let vertical = SplitDivider {
+            direction: LayoutDirection::Vertical,
+            position: 300.0,
+            ..dividers[0].clone()
+        };
+        assert!(split_divider_at(std::slice::from_ref(&vertical), 200.0, 297.0).is_some());
+        assert!(split_divider_at(std::slice::from_ref(&vertical), 200.0, 303.0).is_none());
+
+        let mut nearer = dividers[0].clone();
+        nearer.split_id = SplitId::parse(format!("split_{:032x}", 2)).unwrap();
+        nearer.position = 501.0;
+        let candidates = vec![dividers[0].clone(), nearer];
+        assert_eq!(
+            split_divider_at(&candidates, 500.75, 300.0).map(|hit| &hit.split_id),
+            Some(&candidates[1].split_id)
+        );
+    }
+
+    #[test]
+    fn divider_ratio_uses_parent_axis_rounding_and_valid_clamps() {
+        let screens = split_workspace(false);
+        let horizontal = split_dividers(&screens, 1000, 600).remove(0);
+        assert_eq!(split_ratio_at(&horizontal, 700.4, 100.0), Some(0.7));
+        assert_eq!(split_ratio_at(&horizontal, -100.0, 100.0), Some(0.001));
+        assert_eq!(split_ratio_at(&horizontal, 1200.0, 100.0), Some(0.999));
+
+        let vertical = SplitDivider {
+            direction: LayoutDirection::Vertical,
+            split_rect: Rect {
+                x: 25.0,
+                y: 40.0,
+                width: 300.0,
+                height: 200.0,
+            },
+            position: 140.0,
+            ..horizontal
+        };
+        assert_eq!(split_ratio_at(&vertical, 100.0, 90.0), Some(0.25));
+        assert_eq!(split_ratio_at(&vertical, 100.0, 500.0), Some(0.995));
+    }
+
+    #[test]
+    fn divider_throttle_limits_intermediate_updates_and_always_sends_final() {
+        let mut throttle = DividerDragThrottle::default();
+        assert!(throttle.should_send(Duration::ZERO, 0.5, false));
+        assert!(!throttle.should_send(Duration::from_millis(10), 0.5, false));
+        assert!(!throttle.should_send(Duration::from_millis(44), 0.6, false));
+        assert!(throttle.should_send(Duration::from_millis(45), 0.6, false));
+        assert!(!throttle.should_send(Duration::from_millis(60), 0.7, false));
+        assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
+        assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
     }
 
     #[test]

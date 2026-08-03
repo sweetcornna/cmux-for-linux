@@ -124,8 +124,10 @@ sequences. Mouse checks included clicking in `htop` and wheel input in an
 alternate-screen application. Additional stage 2 items now implemented and
 covered by the GUI tests are `Ctrl+Shift+V` through the server's
 bracketed-paste path, cell-throttled no-button mouse movement for mode 1003
-applications, and protocol-driven cursor and text blink animation with a stable
-unfocused cursor.
+applications, protocol-driven cursor and text blink animation with a stable
+unfocused cursor, and the pure divider hit-test, ratio and throttle logic. Pane
+split/close commands from the default `Ctrl+B` keymap and a right-click menu,
+plus drag-to-resize split dividers, are now implemented as well.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
@@ -136,13 +138,14 @@ resolved background, with auto/light/dark semantics and explicit
 `cmux-tui.json` theme values taking precedence. This remains a presentation
 change only; render state, input, mouse reporting and PTY sizing still cross
 `cmux.protocol/1`, and the server remains the sole VT implementation.
+Pane creation, close and divider ratios likewise run through the Rust resource
+bindings on the protocol worker thread; the server owns each layout mutation
+and the GTK frontend redraws only after refreshed topology arrives.
 
 The remaining stage 2 tail is:
 
 - Inline images are not implemented. The work was assessed at roughly 450-650
   lines and deferred.
-- Panes cannot be created, closed or resized from the GUI itself. Window-driven
-  PTY resizing is implemented, but pane-divider dragging is not.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
 both affecting any Rust SDK consumer: the typed render decoder rejected the

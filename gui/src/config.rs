@@ -381,6 +381,16 @@ paned.cmux-split > separator:active {{
     @chrome_separator 60%, @chrome_separator 70%,
     transparent 70%, transparent 100%);
 }}
+popover.cmux-menu > contents {{
+  background-color: @menu_bg;
+  color: @menu_fg;
+}}
+popover.cmux-menu modelbutton {{
+  color: @menu_fg;
+}}
+popover.cmux-menu modelbutton:hover {{
+  background-color: @selection_bg;
+}}
 .toast {{
   margin: 12px;
   padding: 6px 10px;

@@ -16,16 +16,19 @@ mod view;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use cmux::{InputModifier, MouseButton, TerminalId, TerminalMouseKind, TerminalMouseOptions};
-use gtk4::gdk;
+use cmux::{
+    Direction, InputModifier, LayoutDirection, MouseButton, PaneId, ScreenId, TerminalId,
+    TerminalMouseKind, TerminalMouseOptions, WorkspaceId,
+};
 use gtk4::prelude::*;
+use gtk4::{gdk, gio};
 use gtk4::{
     Align, Application, ApplicationWindow, Box as GtkBox, CenterBox, CssProvider, DrawingArea,
     EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
     GestureClick, GestureDrag, Label, ListBox, ListBoxRow, Orientation, Overlay, PackType, Paned,
-    ScrolledWindow, SelectionMode, WindowControls,
+    PopoverMenu, ScrolledWindow, SelectionMode, WindowControls,
 };
 
 use screen::ScreenSet;
@@ -42,6 +45,22 @@ struct MouseTarget {
     row: u16,
     column: u16,
     can_scroll_locally: bool,
+}
+
+#[derive(Clone)]
+struct PaneTarget {
+    workspace: WorkspaceId,
+    screen: ScreenId,
+    pane: PaneId,
+}
+
+struct DividerDrag {
+    target: PaneTarget,
+    divider: view::SplitDivider,
+    start_x: f64,
+    start_y: f64,
+    started: Instant,
+    throttle: view::DividerDragThrottle,
 }
 
 struct Args {
@@ -181,6 +200,64 @@ fn mouse_target(
         column: column.min(screen.size.cols.saturating_sub(1)),
         can_scroll_locally: screen.scrollback_rows > 0 || !screen.at_bottom,
     })
+}
+
+fn focused_pane_target(screens: &ScreenSet) -> Option<PaneTarget> {
+    let workspace = screens.workspace.as_ref()?;
+    Some(PaneTarget {
+        workspace: workspace.workspace_id.clone(),
+        screen: workspace.screen_id.clone(),
+        pane: workspace.layout.active_pane_id.clone(),
+    })
+}
+
+fn divider_at(
+    screens: &ScreenSet,
+    terminal: &DrawingArea,
+    x: f64,
+    y: f64,
+) -> Option<view::SplitDivider> {
+    let dividers = view::split_dividers(screens, terminal.width(), terminal.height());
+    view::split_divider_at(&dividers, x, y).cloned()
+}
+
+fn resize_cursor(direction: LayoutDirection) -> &'static str {
+    match direction {
+        LayoutDirection::Horizontal => "col-resize",
+        LayoutDirection::Vertical => "row-resize",
+    }
+}
+
+fn send_split(worker: &Worker, target: &PaneTarget, direction: Direction) {
+    let _ = worker.input.send(Input::SplitPane {
+        workspace: target.workspace.clone(),
+        screen: target.screen.clone(),
+        pane: target.pane.clone(),
+        direction,
+    });
+}
+
+fn send_close(worker: &Worker, target: &PaneTarget) {
+    let _ = worker.input.send(Input::ClosePane {
+        workspace: target.workspace.clone(),
+        screen: target.screen.clone(),
+        pane: target.pane.clone(),
+    });
+}
+
+fn send_split_ratio(
+    worker: &Worker,
+    target: &PaneTarget,
+    divider: &view::SplitDivider,
+    ratio: f64,
+) {
+    let _ = worker.input.send(Input::SetSplitRatio {
+        workspace: target.workspace.clone(),
+        screen: target.screen.clone(),
+        pane: target.pane.clone(),
+        split: divider.split_id.clone(),
+        ratio,
+    });
 }
 
 fn input_modifiers(state: gdk::ModifierType) -> Vec<InputModifier> {
@@ -444,6 +521,52 @@ fn build_ui(application: &Application) {
     window.set_size_request(300, 200);
     window.set_titlebar(Some(&titlebar));
 
+    let context_target = Rc::new(RefCell::new(None::<PaneTarget>));
+    let pane_menu_model = gio::Menu::new();
+    pane_menu_model.append(Some("Split right"), Some("pane.split-right"));
+    pane_menu_model.append(Some("Split down"), Some("pane.split-down"));
+    pane_menu_model.append(Some("Close pane"), Some("pane.close"));
+    let pane_menu = PopoverMenu::from_model(Some(&pane_menu_model));
+    pane_menu.add_css_class("cmux-menu");
+    pane_menu.set_has_arrow(false);
+    pane_menu.set_parent(&terminal);
+
+    let pane_actions = gio::SimpleActionGroup::new();
+    let split_right = gio::SimpleAction::new("split-right", None);
+    {
+        let worker = Rc::clone(&worker);
+        let context_target = Rc::clone(&context_target);
+        split_right.connect_activate(move |_, _| {
+            if let Some(target) = context_target.borrow().as_ref() {
+                send_split(&worker, target, Direction::Right);
+            }
+        });
+    }
+    pane_actions.add_action(&split_right);
+    let split_down = gio::SimpleAction::new("split-down", None);
+    {
+        let worker = Rc::clone(&worker);
+        let context_target = Rc::clone(&context_target);
+        split_down.connect_activate(move |_, _| {
+            if let Some(target) = context_target.borrow().as_ref() {
+                send_split(&worker, target, Direction::Down);
+            }
+        });
+    }
+    pane_actions.add_action(&split_down);
+    let close_pane = gio::SimpleAction::new("close", None);
+    {
+        let worker = Rc::clone(&worker);
+        let context_target = Rc::clone(&context_target);
+        close_pane.connect_activate(move |_, _| {
+            if let Some(target) = context_target.borrow().as_ref() {
+                send_close(&worker, target);
+            }
+        });
+    }
+    pane_actions.add_action(&close_pane);
+    terminal.insert_action_group("pane", Some(&pane_actions));
+
     {
         let window = window.clone();
         let adjusting = Cell::new(false);
@@ -508,7 +631,52 @@ fn build_ui(application: &Application) {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
         let terminal_for_keys = terminal.clone();
+        let toast = toast.clone();
+        let prefix_armed = Cell::new(false);
         key_controller.connect_key_pressed(move |_, key, _, state| {
+            let is_prefix = state.contains(gdk::ModifierType::CONTROL_MASK)
+                && !state.intersects(
+                    gdk::ModifierType::SHIFT_MASK
+                        | gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK,
+                )
+                && matches!(key, gdk::Key::B | gdk::Key::b);
+            if prefix_armed.replace(false) {
+                if is_prefix {
+                    let _ = worker.input.send(Input::Bytes(vec![0x02]));
+                    return gtk4::glib::Propagation::Stop;
+                }
+                let target = focused_pane_target(&screens.borrow());
+                match key.to_unicode() {
+                    Some('%') => {
+                        if let Some(target) = target.as_ref() {
+                            send_split(&worker, target, Direction::Right);
+                        } else {
+                            set_toast(&toast, "No focused pane to split");
+                        }
+                    }
+                    Some('"') => {
+                        if let Some(target) = target.as_ref() {
+                            send_split(&worker, target, Direction::Down);
+                        } else {
+                            set_toast(&toast, "No focused pane to split");
+                        }
+                    }
+                    Some('X') => {
+                        if let Some(target) = target.as_ref() {
+                            send_close(&worker, target);
+                        } else {
+                            set_toast(&toast, "No focused pane to close");
+                        }
+                    }
+                    _ => {}
+                }
+                return gtk4::glib::Propagation::Stop;
+            }
+            if is_prefix {
+                prefix_armed.set(true);
+                return gtk4::glib::Propagation::Stop;
+            }
             if view::is_copy_shortcut(key, state) {
                 if let Some(text) = screens.borrow().selected_text() {
                     terminal_for_keys.clipboard().set_text(&text);
@@ -559,6 +727,9 @@ fn build_ui(application: &Application) {
 
     let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
     let move_throttle = Rc::new(RefCell::new(view::MouseMoveThrottle::default()));
+    let divider_drag = Rc::new(RefCell::new(None::<DividerDrag>));
+    let divider_drag_direction = Rc::new(Cell::new(None::<LayoutDirection>));
+    let suppress_mouse_release = Rc::new(Cell::new(false));
 
     // --- pointer motion ---------------------------------------------------
     {
@@ -571,16 +742,38 @@ fn build_ui(application: &Application) {
         let throttle_for_enter = Rc::clone(&move_throttle);
         let throttle_for_motion = Rc::clone(&move_throttle);
         let throttle_for_leave = Rc::clone(&move_throttle);
+        let screens_for_enter = Rc::clone(&screens);
+        let screens_for_motion = Rc::clone(&screens);
+        let drag_direction_for_motion = Rc::clone(&divider_drag_direction);
+        let drag_direction_for_leave = Rc::clone(&divider_drag_direction);
+        let terminal_for_enter = terminal.clone();
         let terminal_for_motion = terminal.clone();
+        let terminal_for_leave = terminal.clone();
         let motion = EventControllerMotion::new();
         motion.connect_enter(move |_, x, y| {
             pointer_for_enter.set(Some((x, y)));
             throttle_for_enter.borrow_mut().reset();
+            let direction = divider_at(&screens_for_enter.borrow(), &terminal_for_enter, x, y)
+                .map(|divider| divider.direction);
+            terminal_for_enter.set_cursor_from_name(direction.map(resize_cursor));
         });
         motion.connect_motion(move |controller, x, y| {
             pointer_for_motion.set(Some((x, y)));
             let state = controller.current_event_state();
             let held = mouse_button_held(state);
+            let direction = drag_direction_for_motion.get().or_else(|| {
+                (!held)
+                    .then(|| {
+                        divider_at(&screens_for_motion.borrow(), &terminal_for_motion, x, y)
+                            .map(|divider| divider.direction)
+                    })
+                    .flatten()
+            });
+            terminal_for_motion.set_cursor_from_name(direction.map(resize_cursor));
+            if direction.is_some() {
+                throttle_for_motion.borrow_mut().reset();
+                return;
+            }
             if held && state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
             }
@@ -616,6 +809,8 @@ fn build_ui(application: &Application) {
         motion.connect_leave(move |_| {
             pointer_for_leave.set(None);
             throttle_for_leave.borrow_mut().reset();
+            terminal_for_leave
+                .set_cursor_from_name(drag_direction_for_leave.get().map(resize_cursor));
         });
         terminal.add_controller(motion);
     }
@@ -633,6 +828,9 @@ fn build_ui(application: &Application) {
             let Some((x, y)) = pointer.get() else {
                 return gtk4::glib::Propagation::Stop;
             };
+            if divider_at(&screens.borrow(), &terminal_for_scroll, x, y).is_some() {
+                return gtk4::glib::Propagation::Stop;
+            }
             let metrics = view::cell_metrics(&terminal_for_scroll, &theme);
             let Some(target) = mouse_target(&screens.borrow(), &terminal_for_scroll, metrics, x, y)
             else {
@@ -680,11 +878,20 @@ fn build_ui(application: &Application) {
         let theme_for_release = Rc::clone(&theme);
         let terminal_for_click = terminal.clone();
         let terminal_for_release = terminal.clone();
+        let context_target_for_click = Rc::clone(&context_target);
+        let pane_menu_for_click = pane_menu.clone();
+        let suppress_for_click = Rc::clone(&suppress_mouse_release);
+        let suppress_for_release = Rc::clone(&suppress_mouse_release);
         let click = GestureClick::new();
         click.set_button(0);
         click.connect_pressed(move |gesture, _, x, y| {
             terminal_for_click.grab_focus();
+            suppress_for_click.set(false);
             let screens = screens.borrow();
+            if divider_at(&screens, &terminal_for_click, x, y).is_some() {
+                suppress_for_click.set(true);
+                return;
+            }
             let Some(workspace) = screens.workspace.as_ref() else {
                 return;
             };
@@ -697,7 +904,8 @@ fn build_ui(application: &Application) {
             let Some(pane) = geometries.iter().find(|pane| pane.rect.contains(x, y)) else {
                 return;
             };
-            if let Some(tab) = pane.tabs.iter().find(|tab| tab.rect.contains(x, y)) {
+            let tab = pane.tabs.iter().find(|tab| tab.rect.contains(x, y));
+            if let Some(tab) = tab {
                 let _ = worker.input.send(Input::FocusTab {
                     workspace: workspace.workspace_id.clone(),
                     screen: workspace.screen_id.clone(),
@@ -705,23 +913,42 @@ fn build_ui(application: &Application) {
                     tab: tab.id.clone(),
                     target: tab.terminal.clone(),
                 });
+            } else {
+                let target = workspace
+                    .pane(&pane.pane)
+                    .and_then(|pane| pane.active_terminal())
+                    .cloned();
+                let _ = worker.input.send(Input::FocusPane {
+                    workspace: workspace.workspace_id.clone(),
+                    screen: workspace.screen_id.clone(),
+                    pane: pane.pane.clone(),
+                    target,
+                });
+            }
+            let button_number = gesture.current_button();
+            if button_number == 3 {
+                *context_target_for_click.borrow_mut() = Some(PaneTarget {
+                    workspace: workspace.workspace_id.clone(),
+                    screen: workspace.screen_id.clone(),
+                    pane: pane.pane.clone(),
+                });
+                suppress_for_click.set(true);
+                pane_menu_for_click.set_pointing_to(Some(&gdk::Rectangle::new(
+                    x.floor() as i32,
+                    y.floor() as i32,
+                    1,
+                    1,
+                )));
+                pane_menu_for_click.popup();
                 return;
             }
-            let target = workspace
-                .pane(&pane.pane)
-                .and_then(|pane| pane.active_terminal())
-                .cloned();
-            let _ = worker.input.send(Input::FocusPane {
-                workspace: workspace.workspace_id.clone(),
-                screen: workspace.screen_id.clone(),
-                pane: pane.pane.clone(),
-                target,
-            });
+            if tab.is_some() {
+                return;
+            }
             let state = gesture.current_event_state();
             if state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
             }
-            let button_number = gesture.current_button();
             let Some(button) = mouse_button(button_number) else {
                 return;
             };
@@ -743,6 +970,9 @@ fn build_ui(application: &Application) {
         });
         click.connect_released(move |gesture, _, x, y| {
             let button_number = gesture.current_button();
+            if button_number == 3 || suppress_for_release.replace(false) {
+                return;
+            }
             let state = gesture.current_event_state();
             if state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
@@ -780,14 +1010,47 @@ fn build_ui(application: &Application) {
         type DragAnchor = (cmux::TerminalId, (u16, u16), view::Rect);
         let screens = Rc::clone(&screens);
         let drag = GestureDrag::new();
+        drag.set_button(1);
         let anchor: Rc<RefCell<Option<DragAnchor>>> = Rc::new(RefCell::new(None));
 
         let terminal_for_begin = terminal.clone();
         let screens_for_begin = Rc::clone(&screens);
         let anchor_for_begin = Rc::clone(&anchor);
         let theme_for_begin = Rc::clone(&theme);
+        let divider_drag_for_begin = Rc::clone(&divider_drag);
+        let drag_direction_for_begin = Rc::clone(&divider_drag_direction);
         drag.connect_drag_begin(move |_, x, y| {
             terminal_for_begin.grab_focus();
+            if let Some(divider) =
+                divider_at(&screens_for_begin.borrow(), &terminal_for_begin, x, y)
+            {
+                let target = screens_for_begin
+                    .borrow()
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| PaneTarget {
+                        workspace: workspace.workspace_id.clone(),
+                        screen: workspace.screen_id.clone(),
+                        pane: divider.pane.clone(),
+                    });
+                if let Some(target) = target {
+                    *anchor_for_begin.borrow_mut() = None;
+                    drag_direction_for_begin.set(Some(divider.direction));
+                    terminal_for_begin.set_cursor_from_name(Some(resize_cursor(divider.direction)));
+                    *divider_drag_for_begin.borrow_mut() = Some(DividerDrag {
+                        target,
+                        divider,
+                        start_x: x,
+                        start_y: y,
+                        started: Instant::now(),
+                        throttle: view::DividerDragThrottle::default(),
+                    });
+                    return;
+                }
+            }
+            *divider_drag_for_begin.borrow_mut() = None;
+            drag_direction_for_begin.set(None);
+            terminal_for_begin.set_cursor_from_name(None);
             let metrics = view::cell_metrics(&terminal_for_begin, &theme_for_begin);
             let geometries = view::pane_geometries(
                 &screens_for_begin.borrow(),
@@ -815,9 +1078,28 @@ fn build_ui(application: &Application) {
         });
 
         let terminal_for_update = terminal.clone();
+        let screens_for_update = Rc::clone(&screens);
         let anchor_for_update = Rc::clone(&anchor);
         let theme_for_update = Rc::clone(&theme);
+        let divider_drag_for_update = Rc::clone(&divider_drag);
+        let worker_for_update = Rc::clone(&worker);
         drag.connect_drag_update(move |gesture, dx, dy| {
+            if let Some(resize) = divider_drag_for_update.borrow_mut().as_mut() {
+                if let Some(ratio) =
+                    view::split_ratio_at(&resize.divider, resize.start_x + dx, resize.start_y + dy)
+                {
+                    let elapsed = resize.started.elapsed();
+                    if resize.throttle.should_send(elapsed, ratio, false) {
+                        send_split_ratio(
+                            &worker_for_update,
+                            &resize.target,
+                            &resize.divider,
+                            ratio,
+                        );
+                    }
+                }
+                return;
+            }
             let Some((start_x, start_y)) = gesture.start_point() else {
                 return;
             };
@@ -825,7 +1107,7 @@ fn build_ui(application: &Application) {
                 return;
             };
             let metrics = view::cell_metrics(&terminal_for_update, &theme_for_update);
-            let mut screens = screens.borrow_mut();
+            let mut screens = screens_for_update.borrow_mut();
             let Some(screen) = screens.grids.get_mut(&terminal_id) else {
                 return;
             };
@@ -837,6 +1119,29 @@ fn build_ui(application: &Application) {
             );
             screen.set_selection(start, head);
             terminal_for_update.queue_draw();
+        });
+
+        let terminal_for_end = terminal.clone();
+        let screens_for_end = Rc::clone(&screens);
+        let divider_drag_for_end = Rc::clone(&divider_drag);
+        let drag_direction_for_end = Rc::clone(&divider_drag_direction);
+        let worker_for_end = Rc::clone(&worker);
+        drag.connect_drag_end(move |_, dx, dy| {
+            let Some(mut resize) = divider_drag_for_end.borrow_mut().take() else {
+                return;
+            };
+            let x = resize.start_x + dx;
+            let y = resize.start_y + dy;
+            if let Some(ratio) = view::split_ratio_at(&resize.divider, x, y) {
+                let elapsed = resize.started.elapsed();
+                if resize.throttle.should_send(elapsed, ratio, true) {
+                    send_split_ratio(&worker_for_end, &resize.target, &resize.divider, ratio);
+                }
+            }
+            drag_direction_for_end.set(None);
+            let direction = divider_at(&screens_for_end.borrow(), &terminal_for_end, x, y)
+                .map(|divider| divider.direction);
+            terminal_for_end.set_cursor_from_name(direction.map(resize_cursor));
         });
         terminal.add_controller(drag);
     }

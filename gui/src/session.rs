@@ -16,9 +16,10 @@ use std::thread;
 use std::time::Duration;
 
 use cmux::{
-    Client, Config, LayoutNode, PaneId, RenderPatch, RenderSnapshot, ScreenId, ScrollOptions,
-    Selector, Size, StreamPoll, TabContentId, TabId, TerminalAttachOptions, TerminalAttachmentItem,
-    TerminalId, TerminalMouseOptions, TextInputOptions, WorkspaceId,
+    Client, Config, Direction, LayoutNode, PaneId, RenderPatch, RenderSnapshot, ScreenId,
+    ScrollOptions, Selector, Size, SplitId, SplitOptions, SplitRatioOptions, StreamPoll,
+    TabContentId, TabId, TerminalAttachOptions, TerminalAttachmentItem, TerminalId,
+    TerminalMouseOptions, TextInputOptions, WorkspaceId,
 };
 
 use crate::screen::{PaneView, TabContent, TabView, WorkspaceView};
@@ -83,6 +84,24 @@ pub enum Input {
         pane: PaneId,
         tab: TabId,
         target: Option<TerminalId>,
+    },
+    SplitPane {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+        direction: Direction,
+    },
+    ClosePane {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+    },
+    SetSplitRatio {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+        split: SplitId,
+        ratio: f64,
     },
     RefreshWorkspaces,
     /// `None` is meaningful for a focused browser tab: input must not leak to
@@ -510,6 +529,63 @@ fn control_loop(
                     Err(error) => {
                         let _ = updates
                             .send_blocking(Update::Error(format!("tab focus failed: {error}")));
+                    }
+                }
+            }
+            Input::SplitPane {
+                workspace,
+                screen,
+                pane,
+                direction,
+            } => {
+                let handle = session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane));
+                match handle.split(SplitOptions::new(direction)) {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("pane split failed: {error}")));
+                    }
+                }
+            }
+            Input::ClosePane {
+                workspace,
+                screen,
+                pane,
+            } => {
+                let handle = session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane));
+                match handle.close() {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("pane close failed: {error}")));
+                    }
+                }
+            }
+            Input::SetSplitRatio {
+                workspace,
+                screen,
+                pane,
+                split,
+                ratio,
+            } => {
+                let handle = session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane));
+                match handle.set_split_ratio(SplitRatioOptions {
+                    split_id: split,
+                    ratio,
+                }) {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("pane resize failed: {error}")));
                     }
                 }
             }

@@ -13,6 +13,7 @@ cargo run --release -- --session main
 - connects to a running cmux session over `cmux.protocol/1`
 - lists the session's workspaces in a sidebar
 - renders pane splits and tabs from the server's styled render stream
+- creates, closes and resizes panes through server-owned layout mutations
 - sends keyboard and supported mouse input back to each pane's PTY
 
 ## What it deliberately does not do
@@ -50,12 +51,12 @@ cargo run --release -- --probe --session main
 | | |
 | --- | --- |
 | Window chrome | custom 28px titlebar, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
-| Panes | split layouts with per-pane PTY sizing and click-to-focus |
-| Pane chrome | derived 1px separators, optional configured 2px active borders, and 70% dimming for inactive panes |
+| Panes | server-owned split layouts with per-pane PTY sizing, click-to-focus, split-right/split-down creation and pane close from the keyboard or context menu |
+| Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |
 | Tabs | an always-visible 28px strip with focused/unfocused active states and the upstream action-lane fade |
-| Input | keyboard input, including Ctrl and Alt sequences; `Ctrl+Shift+V` paste with server-side bracketed-paste handling; mouse input to applications |
+| Input | keyboard input, including Ctrl and Alt sequences; `Ctrl+B %` / `Ctrl+B "` split right/down, `Ctrl+B X` closes a pane, `Ctrl+Shift+V` pastes through server-side bracketed-paste handling, and mouse input reaches applications |
 | Workspaces | macOS-parity sidebar rows, draggable width clamped to one third of the window, switching, and a topology refresh every 3 seconds |
-| Resize | dynamic window resize updates the pane PTY sizes |
+| Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations and a final authoritative value |
 | Scrollback | the mouse wheel scrolls the viewport |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
@@ -113,6 +114,8 @@ CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 | Input | Handled by the GTK frontend | Forwarded to the pane application |
 | --- | --- | --- |
 | Click | Focuses the pane | The button event is forwarded when the application has requested mouse input |
+| Right-click | Focuses the pane and opens its split/close `PopoverMenu` | No |
+| Drag from a split divider | Resizes the server-owned split through a 6px hit region and shows a row/column resize cursor | No |
 | Shift+drag | Selects text locally | No |
 | Wheel over an alternate-screen application using mouse input | No local scrollback | Yes |
 | Wheel otherwise | Scrolls local history | No |
@@ -139,4 +142,3 @@ The following were checked against live sessions:
 
 - Inline images are not implemented. The work was assessed at roughly 450-650
   lines and deferred.
-- No pane create, close or resize from the GUI itself.
