@@ -257,6 +257,74 @@ pub struct RenderRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RenderGraphicFormat {
+    Rgb,
+    Rgba,
+    Unsupported(String),
+}
+
+impl RenderGraphicFormat {
+    pub fn channels(&self) -> Option<u8> {
+        match self {
+            Self::Rgb => Some(3),
+            Self::Rgba => Some(4),
+            Self::Unsupported(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderGraphicImage {
+    pub image_id: u32,
+    pub generation: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: RenderGraphicFormat,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderGraphicPlacement {
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub ordinal: u32,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub viewport_visible: bool,
+    pub anchor_col: Option<u16>,
+    pub anchor_row: Option<u32>,
+    pub z: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderGraphics {
+    pub generation: u64,
+    pub images: Option<Vec<RenderGraphicImage>>,
+    pub placements: Vec<RenderGraphicPlacement>,
+    pub removed_image_ids: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderGraphicsDelta {
+    pub generation: u64,
+    pub images: Option<Vec<RenderGraphicImage>>,
+    pub placements: Option<Vec<RenderGraphicPlacement>>,
+    pub removed_image_ids: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenderSnapshot {
     pub size: Size,
     pub cursor: RenderCursor,
@@ -264,6 +332,7 @@ pub struct RenderSnapshot {
     pub default_bg: ColorHex,
     pub scrollback_rows: u32,
     pub rows: Vec<RenderRow>,
+    pub graphics: Option<RenderGraphics>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,6 +344,7 @@ pub struct RenderPatch {
     pub default_bg: Option<ColorHex>,
     pub scrollback_rows: Option<u32>,
     pub rows: Vec<RenderRow>,
+    pub graphics: Option<RenderGraphicsDelta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -744,15 +814,11 @@ fn decode_render_snapshot(value: Value) -> Result<RenderSnapshot> {
             "render snapshot must contain each viewport row exactly once".to_string(),
         ));
     }
-    // The server sends `graphics` and `history_epoch` in render snapshots (see
-    // the generated RenderStateEvent, which carries both), but this hand-written
-    // decoder never consumed them, so `finish` rejected every real snapshot with
-    // "render snapshot contains unknown fields: graphics, history_epoch".
-    // Consume and discard them: this frontend renders text runs only.
-    let _ = take_optional(&mut object, "graphics");
+    let graphics =
+        take_optional(&mut object, "graphics").map(decode_render_graphics).transpose()?;
     let _ = take_optional(&mut object, "history_epoch");
     finish(object, "render snapshot")?;
-    Ok(RenderSnapshot { size, cursor, default_fg, default_bg, scrollback_rows, rows })
+    Ok(RenderSnapshot { size, cursor, default_fg, default_bg, scrollback_rows, rows, graphics })
 }
 
 fn decode_render_patch(value: Value) -> Result<RenderPatch> {
@@ -781,11 +847,143 @@ fn decode_render_patch(value: Value) -> Result<RenderPatch> {
             "render resize patch rows must equal size.rows".to_string(),
         ));
     }
-    // Same omission as decode_render_snapshot; render deltas carry these too.
-    let _ = take_optional(&mut object, "graphics");
+    let graphics =
+        take_optional(&mut object, "graphics").map(decode_render_graphics_delta).transpose()?;
     let _ = take_optional(&mut object, "history_epoch");
     finish(object, "render patch")?;
-    Ok(RenderPatch { cursor, full_reset, size, default_fg, default_bg, scrollback_rows, rows })
+    Ok(RenderPatch {
+        cursor,
+        full_reset,
+        size,
+        default_fg,
+        default_bg,
+        scrollback_rows,
+        rows,
+        graphics,
+    })
+}
+
+fn decode_render_graphics(value: Value) -> Result<RenderGraphics> {
+    let mut object = object(value, "render graphics")?;
+    let generation = take_u64(&mut object, "generation")?;
+    let images = take_optional(&mut object, "images")
+        .map(|value| decode_render_graphic_images(value, "render graphics images"))
+        .transpose()?;
+    let placements = decode_render_graphic_placements(take_required(&mut object, "placements")?)?;
+    let removed_image_ids = take_optional(&mut object, "removed_image_ids")
+        .map(|value| decode_u32_array(value, "render graphics removed_image_ids"))
+        .transpose()?;
+    finish(object, "render graphics")?;
+    Ok(RenderGraphics { generation, images, placements, removed_image_ids })
+}
+
+fn decode_render_graphics_delta(value: Value) -> Result<RenderGraphicsDelta> {
+    let mut object = object(value, "render graphics delta")?;
+    let generation = take_u64(&mut object, "generation")?;
+    let images = take_optional(&mut object, "images")
+        .map(|value| decode_render_graphic_images(value, "render graphics delta images"))
+        .transpose()?;
+    let placements = take_optional(&mut object, "placements")
+        .map(decode_render_graphic_placements)
+        .transpose()?;
+    let removed_image_ids = take_optional(&mut object, "removed_image_ids")
+        .map(|value| decode_u32_array(value, "render graphics delta removed_image_ids"))
+        .transpose()?;
+    finish(object, "render graphics delta")?;
+    Ok(RenderGraphicsDelta { generation, images, placements, removed_image_ids })
+}
+
+fn decode_render_graphic_images(value: Value, context: &str) -> Result<Vec<RenderGraphicImage>> {
+    let values = value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| Error::UnexpectedEnvelope(format!("{context} must be an array")))?;
+    values.into_iter().map(decode_render_graphic_image).collect()
+}
+
+fn decode_render_graphic_image(value: Value) -> Result<RenderGraphicImage> {
+    let mut object = object(value, "render graphic image")?;
+    let image_id = take_u32(&mut object, "id")?;
+    let generation = take_u64(&mut object, "generation")?;
+    let width = take_u32(&mut object, "width")?;
+    let height = take_u32(&mut object, "height")?;
+    let format = match take_required_string(&mut object, "format")?.as_str() {
+        "rgb" => RenderGraphicFormat::Rgb,
+        "rgba" => RenderGraphicFormat::Rgba,
+        value => RenderGraphicFormat::Unsupported(value.to_string()),
+    };
+    let data = take_base64(&mut object, "data")?;
+    finish(object, "render graphic image")?;
+    Ok(RenderGraphicImage { image_id, generation, width, height, format, data })
+}
+
+fn decode_render_graphic_placements(value: Value) -> Result<Vec<RenderGraphicPlacement>> {
+    let values = value.as_array().cloned().ok_or_else(|| {
+        Error::UnexpectedEnvelope("render graphic placements must be an array".to_string())
+    })?;
+    values.into_iter().map(decode_render_graphic_placement).collect()
+}
+
+fn decode_render_graphic_placement(value: Value) -> Result<RenderGraphicPlacement> {
+    let mut object = object(value, "render graphic placement")?;
+    let image_id = take_u32(&mut object, "image_id")?;
+    let placement_id = take_u32(&mut object, "placement_id")?;
+    let ordinal = take_u32(&mut object, "ordinal")?;
+    let x_offset = take_u32(&mut object, "x_offset")?;
+    let y_offset = take_u32(&mut object, "y_offset")?;
+    let source_x = take_u32(&mut object, "source_x")?;
+    let source_y = take_u32(&mut object, "source_y")?;
+    let source_width = take_u32(&mut object, "source_width")?;
+    let source_height = take_u32(&mut object, "source_height")?;
+    let columns = take_u32(&mut object, "columns")?;
+    let rows = take_u32(&mut object, "rows")?;
+    let grid_cols = take_u32(&mut object, "grid_cols")?;
+    let grid_rows = take_u32(&mut object, "grid_rows")?;
+    let pixel_width = take_u32(&mut object, "pixel_width")?;
+    let pixel_height = take_u32(&mut object, "pixel_height")?;
+    let viewport_col = take_i32(&mut object, "viewport_col")?;
+    let viewport_row = take_i32(&mut object, "viewport_row")?;
+    let viewport_visible = take_bool(&mut object, "viewport_visible")?;
+    let anchor_col = take_optional(&mut object, "anchor_col")
+        .map(|value| parse_u16_value(&value, "anchor_col"))
+        .transpose()?;
+    let anchor_row = take_optional(&mut object, "anchor_row")
+        .map(|value| parse_u32_value(&value, "anchor_row"))
+        .transpose()?;
+    let z = take_i32(&mut object, "z")?;
+    finish(object, "render graphic placement")?;
+    Ok(RenderGraphicPlacement {
+        image_id,
+        placement_id,
+        ordinal,
+        x_offset,
+        y_offset,
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+        columns,
+        rows,
+        grid_cols,
+        grid_rows,
+        pixel_width,
+        pixel_height,
+        viewport_col,
+        viewport_row,
+        viewport_visible,
+        anchor_col,
+        anchor_row,
+        z,
+    })
+}
+
+fn decode_u32_array(value: Value, context: &str) -> Result<Vec<u32>> {
+    value
+        .as_array()
+        .ok_or_else(|| Error::UnexpectedEnvelope(format!("{context} must be an array")))?
+        .iter()
+        .map(|value| parse_u32_value(value, context))
+        .collect()
 }
 
 fn decode_render_scroll(value: Value) -> Result<RenderScroll> {
@@ -1025,6 +1223,19 @@ fn parse_u32_value(value: &Value, key: &str) -> Result<u32> {
         .ok_or_else(|| Error::UnexpectedEnvelope(format!("{key} must be a uint32")))
 }
 
+fn take_u64(object: &mut Map<String, Value>, key: &str) -> Result<u64> {
+    take_required(object, key)?
+        .as_u64()
+        .ok_or_else(|| Error::UnexpectedEnvelope(format!("{key} must be a uint64")))
+}
+
+fn take_i32(object: &mut Map<String, Value>, key: &str) -> Result<i32> {
+    take_required(object, key)?
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| Error::UnexpectedEnvelope(format!("{key} must be an int32")))
+}
+
 fn take_decimal(object: &mut Map<String, Value>, key: &str) -> Result<u64> {
     wire::parse_decimal(&take_required(object, key)?, key)
 }
@@ -1125,6 +1336,44 @@ mod tests {
         })
     }
 
+    fn graphic_placement(image_id: u32) -> Value {
+        json!({
+            "image_id": image_id,
+            "placement_id": 9,
+            "ordinal": 2,
+            "x_offset": 3,
+            "y_offset": 4,
+            "source_x": 1,
+            "source_y": 2,
+            "source_width": 5,
+            "source_height": 6,
+            "columns": 2,
+            "rows": 3,
+            "grid_cols": 3,
+            "grid_rows": 4,
+            "pixel_width": 20,
+            "pixel_height": 60,
+            "viewport_col": -1,
+            "viewport_row": 7,
+            "viewport_visible": true,
+            "anchor_col": 8,
+            "anchor_row": 42,
+            "z": -2
+        })
+    }
+
+    fn graphic_image(format: &str, data: &str) -> Value {
+        let mut image = json!({
+            "generation": 3,
+            "width": 2,
+            "height": 1,
+            "format": format,
+            "data": data
+        });
+        image.as_object_mut().unwrap().insert("id".to_string(), json!(41));
+        image
+    }
+
     #[test]
     fn terminal_render_snapshot_decodes_without_a_vt_emulator() {
         let item = decode_terminal_item(
@@ -1150,6 +1399,81 @@ mod tests {
         assert_eq!(render.size, Size { cols: 4, rows: 2 });
         assert_eq!(render.rows[1].runs[0].text, "two");
         assert!(render.rows[0].runs[0].has_attr(RenderRun::ATTR_BOLD));
+        assert!(render.graphics.is_none());
+    }
+
+    #[test]
+    fn terminal_render_graphics_decode_pixels_and_geometry() {
+        let item = decode_terminal_item(
+            json!({
+                "kind": "snapshot",
+                "terminal_id": TERMINAL,
+                "render": {
+                    "size": {"cols": 4, "rows": 1},
+                    "cursor": cursor(),
+                    "default_fg": "#ffffff",
+                    "default_bg": "#000000",
+                    "scrollback_rows": 7,
+                    "history_epoch": 11,
+                    "rows": [row(0, "one")],
+                    "graphics": {
+                        "generation": 13,
+                        "images": [graphic_image("rgba", "AQIDBAUGBwg=")],
+                        "placements": [graphic_placement(41)]
+                    }
+                }
+            }),
+            None,
+            0,
+        )
+        .unwrap();
+        let TerminalAttachmentItem::Snapshot { render, .. } = item else {
+            panic!("expected snapshot");
+        };
+        let graphics = render.graphics.expect("graphics");
+        assert_eq!(graphics.generation, 13);
+        assert_eq!(graphics.images.as_ref().unwrap()[0].data, (1..=8).collect::<Vec<_>>());
+        assert_eq!(graphics.images.as_ref().unwrap()[0].format.channels(), Some(4));
+        assert_eq!(graphics.placements[0].viewport_col, -1);
+        assert_eq!(graphics.placements[0].anchor_row, Some(42));
+        assert_eq!(graphics.placements[0].z, -2);
+    }
+
+    #[test]
+    fn terminal_render_graphics_delta_preserves_optional_tables() {
+        let item = decode_terminal_item(
+            json!({
+                "kind": "patch",
+                "terminal_id": TERMINAL,
+                "render": {
+                    "cursor": cursor(),
+                    "full_reset": false,
+                    "rows": [],
+                    "graphics": {
+                        "generation": 14,
+                        "removed_image_ids": [41, 42]
+                    }
+                }
+            }),
+            None,
+            0,
+        )
+        .unwrap();
+        let TerminalAttachmentItem::Patch { render, .. } = item else {
+            panic!("expected patch");
+        };
+        let graphics = render.graphics.expect("graphics delta");
+        assert_eq!(graphics.generation, 14);
+        assert_eq!(graphics.removed_image_ids, Some(vec![41, 42]));
+        assert!(graphics.images.is_none());
+        assert!(graphics.placements.is_none());
+    }
+
+    #[test]
+    fn terminal_render_graphics_preserve_unsupported_image_formats() {
+        let image = decode_render_graphic_image(graphic_image("future-encoded", "AA==")).unwrap();
+        assert_eq!(image.format, RenderGraphicFormat::Unsupported("future-encoded".to_string()));
+        assert_eq!(image.format.channels(), None);
     }
 
     #[test]

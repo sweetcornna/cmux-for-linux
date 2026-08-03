@@ -5,17 +5,18 @@
 //! server's layout rectangles and stamps its styled runs inside them.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
 use cmux::{
-    ColorHex, LayoutDirection, LayoutNode, LayoutViewport, PaneId, RenderCursorStyle, RenderRun,
-    RenderUnderline, Size, SplitId, TabId, TerminalId,
+    ColorHex, LayoutDirection, LayoutNode, LayoutViewport, PaneId, RenderCursorStyle,
+    RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline, Size, SplitId, TabId,
+    TerminalId,
 };
 use gtk4::pango;
 use gtk4::prelude::*;
-use gtk4::{gdk, DrawingArea};
+use gtk4::{gdk, gdk_pixbuf, DrawingArea};
 
 use crate::config::{
     ChromeColors, ChromeMode, Rgb, Settings, ThemeOverrides, DEFAULT_DARK_BACKGROUND,
@@ -204,6 +205,14 @@ impl Rect {
             && self.y + self.height > other.y
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GraphicGeometry {
+    pub destination: Rect,
+    pub source: Rect,
+}
+
+type ImageCache = HashMap<(TerminalId, u32, u64), Option<gdk_pixbuf::Pixbuf>>;
 
 #[derive(Clone, Debug)]
 pub struct TabHit {
@@ -768,6 +777,7 @@ pub fn build(
     area.set_focusable(true);
     area.set_hexpand(true);
     area.set_vexpand(true);
+    let image_cache = RefCell::new(ImageCache::new());
 
     area.set_draw_func(move |area, cr, width, height| {
         let chrome = theme.chrome();
@@ -776,6 +786,14 @@ pub fn build(
         let _ = cr.paint();
 
         let screens = screens.borrow();
+        let mut image_cache = image_cache.borrow_mut();
+        image_cache.retain(|(terminal, image_id, generation), _| {
+            screens
+                .grids
+                .get(terminal)
+                .and_then(|screen| screen.graphics.images.get(image_id))
+                .is_some_and(|image| image.generation == *generation)
+        });
         let metrics = cell_metrics(area, &theme);
         let geometries = pane_geometries(&screens, metrics, width, height);
         let Some(workspace) = screens.workspace.as_ref() else {
@@ -825,12 +843,14 @@ pub fn build(
                     draw_grid(
                         area,
                         cr,
+                        terminal,
                         screen,
                         metrics,
                         geometry.content.height,
                         geometry.pane == workspace.layout.active_pane_id,
                         &theme,
                         blink.get(),
+                        &mut image_cache,
                     );
                     let _ = cr.restore();
                 }
@@ -953,17 +973,29 @@ pub fn draw_task_status_ring(
 fn draw_grid(
     area: &DrawingArea,
     cr: &gtk4::cairo::Context,
+    terminal: &TerminalId,
     screen: &Screen,
     metrics: CellMetrics,
     height: f64,
     draw_selection: bool,
     theme: &Theme,
     blink: BlinkState,
+    image_cache: &mut ImageCache,
 ) {
     if !screen.is_initialized() {
         return;
     }
     draw_grid_backgrounds(cr, screen, metrics, height);
+    draw_graphics(
+        cr,
+        terminal,
+        screen,
+        metrics,
+        height,
+        true,
+        image_cache,
+        theme.chrome().sidebar_dim_foreground,
+    );
     if draw_selection && screen.selection.is_some() {
         let (r, g, b) = theme.chrome().selection_background.cairo();
         cr.set_source_rgb(r, g, b);
@@ -989,6 +1021,16 @@ fn draw_grid(
             let _ = cr.restore();
         }
     }
+    draw_graphics(
+        cr,
+        terminal,
+        screen,
+        metrics,
+        height,
+        false,
+        image_cache,
+        theme.chrome().sidebar_dim_foreground,
+    );
 
     if let Some(cursor) = &screen.cursor {
         if !cursor.visible {
@@ -1017,6 +1059,175 @@ fn draw_grid(
         }
         let _ = cr.fill();
     }
+}
+
+pub fn graphic_geometry(
+    placement: &RenderGraphicPlacement,
+    image: &RenderGraphicImage,
+    metrics: CellMetrics,
+) -> Option<GraphicGeometry> {
+    if !placement.viewport_visible
+        || placement.source_width == 0
+        || placement.source_height == 0
+        || placement.source_x.checked_add(placement.source_width)? > image.width
+        || placement.source_y.checked_add(placement.source_height)? > image.height
+    {
+        return None;
+    }
+
+    let source_width = f64::from(placement.source_width);
+    let source_height = f64::from(placement.source_height);
+    let (width, height) = match (placement.columns, placement.rows) {
+        (0, 0) => (
+            f64::from(placement.pixel_width),
+            f64::from(placement.pixel_height),
+        ),
+        (columns, 0) => {
+            let width = f64::from(columns) * metrics.width;
+            (width, width * source_height / source_width)
+        }
+        (0, rows) => {
+            let height = f64::from(rows) * metrics.height;
+            (height * source_width / source_height, height)
+        }
+        (columns, rows) => (
+            f64::from(columns) * metrics.width,
+            f64::from(rows) * metrics.height,
+        ),
+    };
+    if width <= 0.0 || height <= 0.0 || !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+
+    Some(GraphicGeometry {
+        destination: Rect {
+            x: f64::from(placement.viewport_col) * metrics.width + f64::from(placement.x_offset),
+            y: f64::from(placement.viewport_row) * metrics.height + f64::from(placement.y_offset),
+            width,
+            height,
+        },
+        source: Rect {
+            x: f64::from(placement.source_x),
+            y: f64::from(placement.source_y),
+            width: source_width,
+            height: source_height,
+        },
+    })
+}
+
+fn decode_graphic_image(image: &RenderGraphicImage) -> Option<gdk_pixbuf::Pixbuf> {
+    let width = i32::try_from(image.width).ok().filter(|width| *width > 0)?;
+    let height = i32::try_from(image.height)
+        .ok()
+        .filter(|height| *height > 0)?;
+    let channels = u32::from(image.format.channels()?);
+    let rowstride = image.width.checked_mul(channels)?;
+    let expected = usize::try_from(rowstride.checked_mul(image.height)?).ok()?;
+    if image.data.len() != expected {
+        return None;
+    }
+    let rowstride = i32::try_from(rowstride).ok().filter(|stride| *stride > 0)?;
+    let bytes = gtk4::glib::Bytes::from_owned(image.data.clone());
+    Some(gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gdk_pixbuf::Colorspace::Rgb,
+        channels == 4,
+        8,
+        width,
+        height,
+        rowstride,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_graphics(
+    cr: &gtk4::cairo::Context,
+    terminal: &TerminalId,
+    screen: &Screen,
+    metrics: CellMetrics,
+    height: f64,
+    behind_text: bool,
+    image_cache: &mut ImageCache,
+    placeholder_color: Rgb,
+) {
+    let mut placements = screen
+        .graphics
+        .placements
+        .iter()
+        .filter(|placement| (placement.z < 0) == behind_text)
+        .collect::<Vec<_>>();
+    placements.sort_by_key(|placement| {
+        (
+            placement.z,
+            placement.image_id,
+            placement.placement_id,
+            placement.ordinal,
+        )
+    });
+
+    for placement in placements {
+        let Some(image) = screen.graphics.images.get(&placement.image_id) else {
+            continue;
+        };
+        let Some(geometry) = graphic_geometry(placement, image, metrics) else {
+            continue;
+        };
+        let viewport = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(screen.size.cols) * metrics.width,
+            height,
+        };
+        if !geometry.destination.intersects(viewport) {
+            continue;
+        }
+
+        let key = (terminal.clone(), image.image_id, image.generation);
+        let pixbuf = image_cache
+            .entry(key)
+            .or_insert_with(|| decode_graphic_image(image));
+        if let Some(pixbuf) = pixbuf {
+            draw_pixbuf(cr, pixbuf, geometry);
+        } else {
+            draw_graphic_placeholder(cr, geometry.destination, placeholder_color);
+        }
+    }
+}
+
+fn draw_pixbuf(cr: &gtk4::cairo::Context, pixbuf: &gdk_pixbuf::Pixbuf, geometry: GraphicGeometry) {
+    let _ = cr.save();
+    cr.rectangle(
+        geometry.destination.x,
+        geometry.destination.y,
+        geometry.destination.width,
+        geometry.destination.height,
+    );
+    cr.clip();
+    cr.translate(geometry.destination.x, geometry.destination.y);
+    cr.scale(
+        geometry.destination.width / geometry.source.width,
+        geometry.destination.height / geometry.source.height,
+    );
+    cr.set_source_pixbuf(pixbuf, -geometry.source.x, -geometry.source.y);
+    cr.source().set_filter(gtk4::cairo::Filter::Bilinear);
+    let _ = cr.paint();
+    let _ = cr.restore();
+}
+
+fn draw_graphic_placeholder(cr: &gtk4::cairo::Context, rect: Rect, color: Rgb) {
+    let (red, green, blue) = color.cairo();
+    cr.set_source_rgba(red, green, blue, 0.85);
+    cr.set_line_width(1.0);
+    let x = rect.x + 0.5;
+    let y = rect.y + 0.5;
+    let width = (rect.width - 1.0).max(0.0);
+    let height = (rect.height - 1.0).max(0.0);
+    cr.rectangle(x, y, width, height);
+    cr.move_to(x, y);
+    cr.line_to(x + width, y + height);
+    cr.move_to(x + width, y);
+    cr.line_to(x, y + height);
+    let _ = cr.stroke();
 }
 
 fn draw_grid_backgrounds(
@@ -1398,8 +1609,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use cmux::{
-        LayoutDocument, LayoutLeaf, LayoutSplit, PaneId, ScreenId, SplitId, TabId, TerminalId,
-        WorkspaceId,
+        LayoutDocument, LayoutLeaf, LayoutSplit, PaneId, RenderGraphicFormat, ScreenId, SplitId,
+        TabId, TerminalId, WorkspaceId,
     };
 
     use super::*;
@@ -1415,6 +1626,43 @@ mod tests {
 
     fn terminal(number: u8) -> TerminalId {
         TerminalId::parse(format!("term_{number:032x}")).unwrap()
+    }
+
+    fn graphic_image() -> RenderGraphicImage {
+        RenderGraphicImage {
+            image_id: 41,
+            generation: 2,
+            width: 100,
+            height: 50,
+            format: RenderGraphicFormat::Rgba,
+            data: vec![0; 100 * 50 * 4],
+        }
+    }
+
+    fn graphic_placement() -> RenderGraphicPlacement {
+        RenderGraphicPlacement {
+            image_id: 41,
+            placement_id: 7,
+            ordinal: 1,
+            x_offset: 3,
+            y_offset: 4,
+            source_x: 10,
+            source_y: 5,
+            source_width: 40,
+            source_height: 20,
+            columns: 2,
+            rows: 3,
+            grid_cols: 3,
+            grid_rows: 4,
+            pixel_width: 33,
+            pixel_height: 44,
+            viewport_col: -1,
+            viewport_row: 2,
+            viewport_visible: true,
+            anchor_col: Some(8),
+            anchor_row: Some(42),
+            z: -2,
+        }
     }
 
     fn split_workspace(two_tabs: bool) -> ScreenSet {
@@ -1643,6 +1891,91 @@ mod tests {
         assert!(throttle.should_report(&second, 2, 4));
         throttle.reset();
         assert!(throttle.should_report(&second, 2, 4));
+    }
+
+    #[test]
+    fn graphic_geometry_scales_cell_axes_and_keeps_viewport_offsets() {
+        let image = graphic_image();
+        let placement = graphic_placement();
+        let metrics = CellMetrics {
+            width: 10.0,
+            height: 20.0,
+            baseline: 15.0,
+        };
+
+        let geometry = graphic_geometry(&placement, &image, metrics).unwrap();
+        assert_eq!(
+            geometry,
+            GraphicGeometry {
+                destination: Rect {
+                    x: -7.0,
+                    y: 44.0,
+                    width: 20.0,
+                    height: 60.0,
+                },
+                source: Rect {
+                    x: 10.0,
+                    y: 5.0,
+                    width: 40.0,
+                    height: 20.0,
+                },
+            }
+        );
+
+        let mut width_only = placement.clone();
+        width_only.rows = 0;
+        let geometry = graphic_geometry(&width_only, &image, metrics).unwrap();
+        assert_eq!(
+            (geometry.destination.width, geometry.destination.height),
+            (20.0, 10.0)
+        );
+
+        let mut height_only = placement.clone();
+        height_only.columns = 0;
+        let geometry = graphic_geometry(&height_only, &image, metrics).unwrap();
+        assert_eq!(
+            (geometry.destination.width, geometry.destination.height),
+            (120.0, 60.0)
+        );
+
+        let mut native = placement;
+        native.columns = 0;
+        native.rows = 0;
+        let geometry = graphic_geometry(&native, &image, metrics).unwrap();
+        assert_eq!(
+            (geometry.destination.width, geometry.destination.height),
+            (33.0, 44.0)
+        );
+    }
+
+    #[test]
+    fn graphic_geometry_rejects_hidden_empty_and_out_of_bounds_sources() {
+        let image = graphic_image();
+        let metrics = CellMetrics {
+            width: 10.0,
+            height: 20.0,
+            baseline: 15.0,
+        };
+        let mut placement = graphic_placement();
+        placement.viewport_visible = false;
+        assert!(graphic_geometry(&placement, &image, metrics).is_none());
+
+        placement.viewport_visible = true;
+        placement.source_width = 0;
+        assert!(graphic_geometry(&placement, &image, metrics).is_none());
+
+        placement.source_width = 95;
+        assert!(graphic_geometry(&placement, &image, metrics).is_none());
+    }
+
+    #[test]
+    fn graphic_decode_rejects_bad_pixels_and_unsupported_formats_without_panicking() {
+        let mut image = graphic_image();
+        image.data.pop();
+        assert!(decode_graphic_image(&image).is_none());
+
+        image.format = RenderGraphicFormat::Unsupported("future-encoded".to_string());
+        assert!(decode_graphic_image(&image).is_none());
     }
 
     #[test]

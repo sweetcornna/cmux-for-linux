@@ -14,8 +14,9 @@
 use std::collections::{HashMap, HashSet};
 
 use cmux::{
-    ColorHex, LayoutDocument, PaneId, RenderCursor, RenderPatch, RenderRow, RenderSnapshot,
-    ScreenId, Size, TabId, TerminalId, WorkspaceId,
+    ColorHex, LayoutDocument, PaneId, RenderCursor, RenderGraphicImage, RenderGraphicPlacement,
+    RenderGraphics, RenderGraphicsDelta, RenderPatch, RenderRow, RenderSnapshot, ScreenId, Size,
+    TabId, TerminalId, WorkspaceId,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,8 +169,62 @@ pub struct Screen {
     pub at_bottom: bool,
     /// One entry per viewport row, indexed by row number.
     pub rows: Vec<Option<RenderRow>>,
+    /// Server-decoded pixels and their current viewport placements.
+    pub graphics: ScreenGraphics,
     /// Frontend-owned selection, as ((start_row, start_col), (end_row, end_col)).
     pub selection: Option<((u16, u16), (u16, u16))>,
+}
+
+#[derive(Debug, Default)]
+pub struct ScreenGraphics {
+    pub generation: u64,
+    pub images: HashMap<u32, RenderGraphicImage>,
+    pub placements: Vec<RenderGraphicPlacement>,
+}
+
+impl ScreenGraphics {
+    fn apply_snapshot(&mut self, graphics: Option<RenderGraphics>) {
+        self.generation = graphics.as_ref().map_or(0, |graphics| graphics.generation);
+        self.images.clear();
+        self.placements.clear();
+        let Some(graphics) = graphics else { return };
+
+        if let Some(removed) = graphics.removed_image_ids {
+            for image_id in removed {
+                self.images.remove(&image_id);
+            }
+        }
+        if let Some(images) = graphics.images {
+            self.images
+                .extend(images.into_iter().map(|image| (image.image_id, image)));
+        }
+        self.placements = graphics.placements;
+        self.remove_dangling_placements();
+    }
+
+    fn apply_delta(&mut self, graphics: RenderGraphicsDelta) {
+        self.generation = graphics.generation;
+        if let Some(removed) = graphics.removed_image_ids {
+            for image_id in removed {
+                self.images.remove(&image_id);
+                self.placements
+                    .retain(|placement| placement.image_id != image_id);
+            }
+        }
+        if let Some(images) = graphics.images {
+            self.images
+                .extend(images.into_iter().map(|image| (image.image_id, image)));
+        }
+        if let Some(placements) = graphics.placements {
+            self.placements = placements;
+        }
+        self.remove_dangling_placements();
+    }
+
+    fn remove_dangling_placements(&mut self) {
+        self.placements
+            .retain(|placement| self.images.contains_key(&placement.image_id));
+    }
 }
 
 impl Default for Screen {
@@ -183,6 +238,7 @@ impl Default for Screen {
             scrollback_rows: 0,
             at_bottom: true,
             rows: Vec::new(),
+            graphics: ScreenGraphics::default(),
             selection: None,
         }
     }
@@ -202,6 +258,7 @@ impl Screen {
         self.scrollback_rows = render.scrollback_rows;
         self.at_bottom = true;
         self.rows = place_rows(render.size.rows, render.rows);
+        self.graphics.apply_snapshot(render.graphics);
         // The old selection pointed into a grid that no longer exists.
         self.selection = None;
     }
@@ -234,6 +291,9 @@ impl Screen {
             self.scrollback_rows = scrollback;
         }
         self.cursor = Some(render.cursor);
+        if let Some(graphics) = render.graphics {
+            self.graphics.apply_delta(graphics);
+        }
 
         if render.full_reset {
             let size = render.size.unwrap_or(self.size);
@@ -344,4 +404,105 @@ fn place_rows(row_count: u16, rows: Vec<RenderRow>) -> Vec<Option<RenderRow>> {
         }
     }
     placed
+}
+
+#[cfg(test)]
+mod tests {
+    use cmux::{RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement, RenderGraphics};
+
+    use super::*;
+
+    fn image(id: u32, generation: u64, byte: u8) -> RenderGraphicImage {
+        RenderGraphicImage {
+            image_id: id,
+            generation,
+            width: 1,
+            height: 1,
+            format: RenderGraphicFormat::Rgba,
+            data: vec![byte, byte, byte, 255],
+        }
+    }
+
+    fn placement(image_id: u32, placement_id: u32) -> RenderGraphicPlacement {
+        RenderGraphicPlacement {
+            image_id,
+            placement_id,
+            ordinal: 0,
+            x_offset: 0,
+            y_offset: 0,
+            source_x: 0,
+            source_y: 0,
+            source_width: 1,
+            source_height: 1,
+            columns: 1,
+            rows: 1,
+            grid_cols: 1,
+            grid_rows: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+            viewport_col: 0,
+            viewport_row: 0,
+            viewport_visible: true,
+            anchor_col: Some(0),
+            anchor_row: Some(0),
+            z: 0,
+        }
+    }
+
+    #[test]
+    fn graphics_snapshot_replaces_the_complete_scene() {
+        let mut state = ScreenGraphics::default();
+        state.images.insert(99, image(99, 1, 99));
+        state.placements.push(placement(99, 99));
+
+        state.apply_snapshot(Some(RenderGraphics {
+            generation: 4,
+            images: Some(vec![image(1, 2, 1), image(2, 3, 2)]),
+            placements: vec![placement(1, 10), placement(2, 20)],
+            removed_image_ids: None,
+        }));
+
+        assert_eq!(state.generation, 4);
+        assert_eq!(state.images.len(), 2);
+        assert!(!state.images.contains_key(&99));
+        assert_eq!(state.placements.len(), 2);
+
+        state.apply_snapshot(None);
+        assert_eq!(state.generation, 0);
+        assert!(state.images.is_empty());
+        assert!(state.placements.is_empty());
+    }
+
+    #[test]
+    fn graphics_delta_merges_pixels_and_replaces_only_present_placements() {
+        let mut state = ScreenGraphics::default();
+        state.apply_snapshot(Some(RenderGraphics {
+            generation: 1,
+            images: Some(vec![image(1, 1, 1), image(2, 1, 2)]),
+            placements: vec![placement(1, 10), placement(2, 20)],
+            removed_image_ids: None,
+        }));
+
+        state.apply_delta(RenderGraphicsDelta {
+            generation: 2,
+            images: Some(vec![image(2, 2, 8), image(3, 1, 3)]),
+            placements: None,
+            removed_image_ids: Some(vec![1]),
+        });
+
+        assert_eq!(state.generation, 2);
+        assert_eq!(state.images.len(), 2);
+        assert_eq!(state.images[&2].generation, 2);
+        assert_eq!(state.images[&2].data[0], 8);
+        assert!(state.images.contains_key(&3));
+        assert_eq!(state.placements, vec![placement(2, 20)]);
+
+        state.apply_delta(RenderGraphicsDelta {
+            generation: 3,
+            images: None,
+            placements: Some(vec![placement(3, 30)]),
+            removed_image_ids: None,
+        });
+        assert_eq!(state.placements, vec![placement(3, 30)]);
+    }
 }

@@ -55,8 +55,9 @@ pub use options::{
 pub use stream::StreamCancellation;
 pub use typed_stream::{
     BrowserAttachment, BrowserAttachmentItem, BrowserFrameMime, ColorHex, RenderCursor,
-    RenderCursorStyle, RenderPatch, RenderRow, RenderRun, RenderScroll, RenderSnapshot,
-    RenderUnderline, ResetReason, ResourceChange, ResourceKind, ResourceReference,
+    RenderCursorStyle, RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement,
+    RenderGraphics, RenderGraphicsDelta, RenderPatch, RenderRow, RenderRun, RenderScroll,
+    RenderSnapshot, RenderUnderline, ResetReason, ResourceChange, ResourceKind, ResourceReference,
     SessionDeltaEvent, SessionEvent, SessionEventStream, SessionSnapshotEvent, SidebarViewItem,
     SidebarViewStream, TerminalAttachment, TerminalAttachmentItem,
 };

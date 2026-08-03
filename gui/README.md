@@ -19,9 +19,10 @@ cargo run --release -- --session main
 ## What it deliberately does not do
 
 **It contains no terminal emulator.** `cmux-tui/spec/render.md` makes the server
-the only VT implementation: it sends styled runs, a cursor and resolved
-colours, and a client draws them. So there is no VT parser here, no libghostty,
-no VTE — only a cell grid, Pango text and a key mapper. Everything that would
+the only VT implementation: it sends styled runs, a cursor, resolved colours
+and decoded Kitty image pixels with placement geometry, and a client draws
+them. So there is no VT parser here, no libghostty, no VTE - only a cell grid,
+Pango text, Pixbuf/cairo image drawing and a key mapper. Everything that would
 normally be terminal-emulation complexity stays server-side.
 
 ## Layout
@@ -30,9 +31,9 @@ normally be terminal-emulation complexity stays server-side.
 | --- | --- |
 | `src/main.rs` | GTK application, window, sidebar, wiring |
 | `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
-| `src/session.rs` | protocol worker threads; the UI thread never blocks on a socket |
-| `src/screen.rs` | the cell grid, and snapshot/patch merge semantics |
-| `src/view.rs` | cairo/Pango drawing and key-to-bytes translation |
+| `src/session.rs` | protocol worker threads; render text and image payloads reach the UI without blocking it on a socket |
+| `src/screen.rs` | cell and image state, with snapshot/patch merge semantics |
+| `src/view.rs` | cairo/Pango/Pixbuf drawing and key-to-bytes translation |
 
 It lives outside `cmux-tui/` because `packaging/linux/sync-upstream.sh`
 replaces that directory wholesale from upstream.
@@ -60,6 +61,7 @@ cargo run --release -- --probe --session main
 | Scrollback | the mouse wheel scrolls the viewport |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
+| Inline images | server-decoded Kitty RGB/RGBA pixels with source cropping, cell-relative scaling, scroll-aware viewport placement and z-order; inactive panes use the same 70% dimming as text |
 | Theme | runtime chrome colors from the active terminal background plus explicit `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
 
 The visual metrics and color rules follow
@@ -140,5 +142,4 @@ The following were checked against live sessions:
 
 ## Known gaps
 
-- Inline images are not implemented. The work was assessed at roughly 450-650
-  lines and deferred.
+No remaining stage 2 gaps are currently tracked.

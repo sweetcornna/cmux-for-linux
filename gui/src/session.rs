@@ -40,10 +40,12 @@ pub enum Update {
     },
     Snapshot {
         terminal: TerminalId,
+        /// Includes SDK-decoded image pixels and full placement state.
         render: Box<RenderSnapshot>,
     },
     Patch {
         terminal: TerminalId,
+        /// Includes image upserts/deletions and optional placement replacement.
         render: Box<RenderPatch>,
     },
     Scroll {

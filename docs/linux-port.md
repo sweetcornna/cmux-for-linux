@@ -111,7 +111,7 @@ available if a future stage needs terminal emulation client-side.
 | --- | --- | --- |
 | 0 | Fork, Linux-only tree, toolchain, native packages | **done** |
 | 1 | GTK4 window driven over `cmux.protocol/1`: workspace sidebar, terminal rendering, keyboard, resize, scrollback, selection | **done** - see [`../gui/README.md`](../gui/README.md) |
-| 2 | Parity pass: pane layouts, tabs, mouse input, themes, macOS visual parity and input behavior | **substantially done** - verified items and remaining tail below |
+| 2 | Parity pass: pane layouts, tabs, mouse input, themes, macOS visual parity and input behavior | **done** |
 | 3 | Package the GUI alongside the TUI | **done** - separate `cmux-gtk` package |
 
 The stage 2 work verified against live sessions includes pane splits with
@@ -127,7 +127,13 @@ bracketed-paste path, cell-throttled no-button mouse movement for mode 1003
 applications, protocol-driven cursor and text blink animation with a stable
 unfocused cursor, and the pure divider hit-test, ratio and throttle logic. Pane
 split/close commands from the default `Ctrl+B` keymap and a right-click menu,
-plus drag-to-resize split dividers, are now implemented as well.
+plus drag-to-resize split dividers, are now implemented as well. The final
+stage 2 item, inline Kitty graphics, now uses the server's decoded RGB/RGBA
+pixels and placement geometry: snapshots replace the scene, deltas merge image
+upserts/deletions and replace placements when supplied, and server-projected
+viewport coordinates keep images aligned while scrolling. Cairo preserves
+source cropping and z-order around text, while the pane-wide inactive scrim
+dims images and text together to 70%.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
@@ -142,16 +148,15 @@ Pane creation, close and divider ratios likewise run through the Rust resource
 bindings on the protocol worker thread; the server owns each layout mutation
 and the GTK frontend redraws only after refreshed topology arrives.
 
-The remaining stage 2 tail is:
-
-- Inline images are not implemented. The work was assessed at roughly 450-650
-  lines and deferred.
+There is no remaining stage 2 tail.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
 both affecting any Rust SDK consumer: the typed render decoder rejected the
 fields the server actually sends, and a protocol client had no way to claim
 sizing authority for its own viewer lease. Neither was a protocol problem;
-both were the public Rust surface lagging its own server.
+both were the public Rust surface lagging its own server. Inline rendering adds
+a later SDK patch that exposes the already-generated graphics schema through
+the public typed render decoder instead of discarding it.
 
 ## Tracking upstream
 

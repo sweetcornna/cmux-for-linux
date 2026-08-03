@@ -106,19 +106,42 @@ fn probe() -> gtk4::glib::ExitCode {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         match rx.recv_blocking() {
-            Ok(Update::Snapshot { terminal, render }) => println!(
-                "snapshot terminal={terminal:?} size={}x{} rows={} fg={} bg={}",
-                render.size.cols,
-                render.size.rows,
-                render.rows.len(),
-                render.default_fg.as_str(),
-                render.default_bg.as_str()
-            ),
-            Ok(Update::Patch { terminal, render }) => println!(
-                "patch terminal={terminal:?} full_reset={} rows={}",
-                render.full_reset,
-                render.rows.len()
-            ),
+            Ok(Update::Snapshot { terminal, render }) => {
+                let (images, placements) = render.graphics.as_ref().map_or((0, 0), |graphics| {
+                    (
+                        graphics.images.as_ref().map_or(0, Vec::len),
+                        graphics.placements.len(),
+                    )
+                });
+                println!(
+                    "snapshot terminal={terminal:?} size={}x{} rows={} images={} placements={} fg={} bg={}",
+                    render.size.cols,
+                    render.size.rows,
+                    render.rows.len(),
+                    images,
+                    placements,
+                    render.default_fg.as_str(),
+                    render.default_bg.as_str()
+                );
+            }
+            Ok(Update::Patch { terminal, render }) => {
+                let (images, placements, removed) =
+                    render.graphics.as_ref().map_or((0, 0, 0), |graphics| {
+                        (
+                            graphics.images.as_ref().map_or(0, Vec::len),
+                            graphics.placements.as_ref().map_or(0, Vec::len),
+                            graphics.removed_image_ids.as_ref().map_or(0, Vec::len),
+                        )
+                    });
+                println!(
+                    "patch terminal={terminal:?} full_reset={} rows={} image_upserts={} placements={} image_removals={}",
+                    render.full_reset,
+                    render.rows.len(),
+                    images,
+                    placements,
+                    removed
+                );
+            }
             Ok(Update::Workspaces(list)) => {
                 let specs = list
                     .iter()

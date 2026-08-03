@@ -28,9 +28,9 @@ already carry both fields, so this is the public decoder lagging its own
 server rather than a protocol disagreement.
 
 The patch consumes and discards them in `decode_render_snapshot` and
-`decode_render_patch`. `cmux-gtk` renders text runs only, so dropping the
-graphics payload loses nothing it would draw — inline images would need real
-handling here.
+`decode_render_patch`. This is the compatibility base in the carried patch
+series; patch 0004 builds on it and replaces the graphics discard with public
+typed decoding.
 
 Reproduce without the patch:
 
@@ -89,3 +89,22 @@ side of the same code path.
 
 Like 0001 and 0002, the missing paste route affects any protocol client, not
 just this fork, and is worth reporting upstream.
+
+## 0004 - expose render graphics through the typed Rust SDK
+
+The generated private protocol already defines `RenderGraphics`,
+`RenderGraphicsDelta`, raw RGB/RGBA images, placement geometry and image
+deletions, but the public resource API used by `terminal.attach()` discarded
+that field in patch 0001. This patch adds public equivalents to
+`RenderSnapshot` and `RenderPatch`, decodes base64 pixels to bytes at the SDK
+boundary, and preserves optional fields so frames from servers without
+graphics remain compatible. Unknown future image formats remain typed as
+unsupported instead of failing the whole attachment; a renderer can skip or
+show a placeholder for that image.
+
+This is a new patch rather than a rewrite of 0001 even though both touch the
+same decoder. Keeping 0001 unchanged preserves the original compatibility fix
+and makes the dependency explicit: sync applies 0001 first, then 0004 promotes
+the consumed graphics value into typed data. It also keeps the carried patch
+history reviewable and localizes future upstream conflicts to the semantic
+upgrade.
