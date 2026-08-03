@@ -44,22 +44,41 @@ separates protocol failures from drawing failures:
 cargo run --release -- --probe --session main
 ```
 
+## Features
+
+| | |
+| --- | --- |
+| Rendering | styled runs with colour, bold, italic, underline, inverse and faint; block/underline/bar cursor |
+| Input | full keyboard, including Ctrl and Alt sequences and the arrow/navigation keys |
+| Workspaces | sidebar lists them and switches the attached terminal; refreshed every 3s so workspaces created elsewhere appear |
+| Resize | the PTY follows the window — the frontend claims exclusive sizing authority for its viewer lease |
+| Scrollback | mouse wheel scrolls the viewport; the status line shows when it is not at the bottom |
+| Selection | drag to select, `Ctrl+Shift+C` copies to the clipboard |
+
 ## Verified
 
-On Ubuntu 26.04, against a live session: styled runs render with correct
-colours, bold, italic, underline, inverse and faint; `ls --color` output and
-shell prompt colours match the TUI; the block cursor tracks the server's
-position; and text typed into the window reaches the PTY, with the result
-arriving back through the render stream. Keyboard verification needs a window
-manager — under a bare `Xvfb` nothing grants focus and every key press is
-silently dropped, which looks like a broken key handler.
+On Ubuntu 26.04, against live sessions:
+
+- styled runs render with correct colours and all five attributes; `ls --color`
+  output and shell prompt colours match the TUI;
+- text typed into the window reaches the PTY, confirmed by reading the terminal
+  back over the protocol;
+- resizing the window resizes the PTY: 80x24 → 98x36 → 54x19 → 126x45, with the
+  server reporting `accepted=true` at each step;
+- clicking a sidebar row re-attaches to that workspace's terminal;
+- the wheel scrolls into history and the status line switches to "scrolled back";
+- a drag selects text and `Ctrl+Shift+C` puts it on the clipboard.
+
+Two things make GUI testing under `Xvfb` misleading, and both produced false
+failures before being accounted for: nothing grants keyboard focus without a
+window manager, and `xdotool search` also matches GTK's 1x1 helper windows, so
+resizing "the window" can silently resize nothing.
 
 ## Known gaps
 
-- One terminal only. The sidebar lists workspaces and focuses them, but the
-  view stays attached to the terminal it first found.
-- The viewer size is fixed at 100x30. Resizing the window does not resize the
-  terminal: the viewer lease lives on the attachment's connection, which the
-  stream-reading thread owns while blocked on the iterator.
-- No scrollback, selection, mouse input, splits, tabs or theming.
+- One terminal per workspace. A workspace with several terminals attaches to
+  the first; there is no tab strip yet.
+- No splits or tabs of its own — it renders one terminal, not a pane layout.
+- No mouse reporting to the application, and no theming beyond the server's
+  colours.
 - `graphics` payloads (inline images) are dropped; see `../patches/README.md`.

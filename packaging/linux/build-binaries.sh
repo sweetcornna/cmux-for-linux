@@ -60,5 +60,26 @@ if [ "${CMUX_NO_STRIP:-0}" != 1 ] && command -v strip >/dev/null 2>&1; then
   done
 fi
 
+# The GTK frontend is a separate crate and a separate package: a headless
+# server should not pull GTK4 in just to run the multiplexer. Built only when
+# its development headers are present, and never fatal when they are not.
+if [ "${CMUX_WITH_GUI:-auto}" != "0" ] && [ -f "$REPO_ROOT/gui/Cargo.toml" ]; then
+  if pkg-config --exists gtk4 2>/dev/null; then
+    log "building cmux-gtk"
+    ( cd "$REPO_ROOT/gui" && cargo build --profile "$PROFILE" )
+    gui_src="$REPO_ROOT/gui/target/$profile_dir/cmux-gtk"
+    if [ -x "$gui_src" ]; then
+      install -m 0755 "$gui_src" "$BUILD_DIR/bin/cmux-gtk"
+      if [ "${CMUX_NO_STRIP:-0}" != 1 ] && command -v strip >/dev/null 2>&1; then
+        strip --strip-unneeded "$BUILD_DIR/bin/cmux-gtk"
+      fi
+    fi
+  elif [ "${CMUX_WITH_GUI:-auto}" = "1" ]; then
+    die "CMUX_WITH_GUI=1 but gtk4 development files are missing (install libgtk-4-dev)"
+  else
+    log "gtk4 development files not found; skipping cmux-gtk"
+  fi
+fi
+
 log "binaries staged in $BUILD_DIR/bin"
 ls -la "$BUILD_DIR/bin"

@@ -69,7 +69,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang libclang-dev dpkg-dev fakeroot
+          sudo apt-get install -y -qq clang libclang-dev dpkg-dev fakeroot libgtk-4-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -105,13 +105,21 @@ jobs:
       - name: Install-test the .deb
         if: matrix.arch == 'x86_64'
         run: |
-          deb="$(find build/linux/dist -name '*.deb' -print -quit)"
-          sudo apt-get install -y -qq "$PWD/$deb"
+          core="$(find build/linux/dist -name 'cmux_*.deb' -print -quit)"
+          gui="$(find build/linux/dist -name 'cmux-gtk_*.deb' -print -quit)"
+          sudo apt-get install -y -qq "$PWD/$core" "$PWD/$gui"
           command -v cmux
+          command -v cmux-gtk
           cmux --version || true
           man --where cmux
           dpkg -L cmux | sort
-          sudo apt-get remove -y -qq cmux
+          # The core package must not drag GTK in; that is the whole reason
+          # the frontend is packaged separately.
+          if dpkg -s cmux | grep -q 'libgtk'; then
+            echo "::error::the core package depends on GTK" >&2
+            exit 1
+          fi
+          sudo apt-get remove -y -qq cmux cmux-gtk
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

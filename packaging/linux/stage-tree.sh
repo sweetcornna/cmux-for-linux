@@ -88,3 +88,23 @@ install -m 0644 "$TUI_DIR/README.md" "$STAGE/usr/share/doc/$PKG_NAME/README.md"
 
 printf '%s\n' "$VERSION" > "$BUILD_DIR/VERSION"
 log "staged tree ready ($(du -sh "$STAGE" | cut -f1))"
+
+# The GTK frontend is staged separately so it can ship as its own package and
+# leave the core install free of GTK dependencies.
+GUI_STAGE="${CMUX_GUI_STAGE:-$BUILD_DIR/stage-gui}"
+rm -rf "$GUI_STAGE"
+if [ -x "$BUILD_DIR/bin/cmux-gtk" ]; then
+  log "staging cmux-gtk into $GUI_STAGE"
+  install -D -m 0755 "$BUILD_DIR/bin/cmux-gtk" "$GUI_STAGE/usr/bin/cmux-gtk"
+  install -D -m 0644 "$PKG_DIR/common/cmux-gtk.desktop" \
+    "$GUI_STAGE/usr/share/applications/cmux-gtk.desktop"
+  install -D -m 0644 "$REPO_ROOT/LICENSE" \
+    "$GUI_STAGE/usr/share/doc/$PKG_NAME-gtk/copyright"
+  install -D -m 0644 "$REPO_ROOT/LICENSE" \
+    "$GUI_STAGE/usr/share/licenses/$PKG_NAME-gtk/LICENSE"
+  install -D -m 0644 "$REPO_ROOT/gui/README.md" \
+    "$GUI_STAGE/usr/share/doc/$PKG_NAME-gtk/README.md"
+  log "gui tree ready ($(du -sh "$GUI_STAGE" | cut -f1))"
+else
+  log "no cmux-gtk binary; skipping the gui package tree"
+fi

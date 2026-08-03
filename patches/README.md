@@ -41,3 +41,29 @@ cargo run --release -p cmux-gtk -- --probe --session <name>
 
 This affects any Rust SDK consumer of `terminal.attach()`, not just this fork,
 and is worth reporting upstream.
+
+## 0002 — let a terminal attachment claim sizing authority
+
+A viewer lease says "I am looking at this terminal at this size"; it does not
+resize the PTY. Sizing authority is a separate request, `client.sizing.set`,
+and the server rejects it unless the *same client* already holds a size lease:
+
+```
+the selected client has no size lease for the terminal
+```
+
+The SDK's `Client::set_sizing` sends that over the shared control connection,
+which is a different client from the one holding the lease, so it can never
+succeed. The lease lives on the attachment's own connection, and
+`TerminalAttachment` exposed only `resize` and `release`; `connection_control`
+is `pub(crate)`.
+
+The result is that a Rust protocol client can render a terminal but can never
+drive its size. The patch adds `TerminalAttachment::set_sizing`, which issues
+the request on the connection that owns the lease.
+
+Verified: with the patch, resizing the `cmux-gtk` window drives the PTY
+through 80x24 → 98x36 → 54x19 → 126x45. Without it the PTY stays at whatever
+size it was created with.
+
+Like 0001, this affects any Rust SDK consumer, not just this fork.

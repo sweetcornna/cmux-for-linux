@@ -440,6 +440,33 @@ impl TerminalAttachment {
         )
     }
 
+    /// Claims or releases sizing authority for this attachment's viewer lease.
+    ///
+    /// `Client::set_sizing` sends `client.sizing.set` over the shared control
+    /// connection, which is a different client from the one holding the lease,
+    /// so it always fails with "the selected client has no size lease for the
+    /// terminal". Sizing has to be requested on the connection that owns the
+    /// lease, and only this type has one.
+    ///
+    /// Without it a protocol client can render a terminal but can never drive
+    /// its PTY size: the viewer lease alone does not resize anything.
+    pub fn set_sizing(
+        &mut self,
+        terminal: &TerminalId,
+        enabled: bool,
+        exclusive: Option<bool>,
+    ) -> Result<()> {
+        self.inner.connection_control(
+            ops::CLIENT_SIZING_SET,
+            Params::new()
+                .string(field::CLIENT, "current")
+                .string(field::TERMINAL, terminal.as_str())
+                .boolean(field::ENABLED, enabled)
+                .optional_bool(field::EXCLUSIVE, exclusive),
+        )?;
+        Ok(())
+    }
+
     pub fn viewer_resize(&mut self, size: Size) -> Result<super::model::ViewerResizeResult> {
         self.resize(size)
     }

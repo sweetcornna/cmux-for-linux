@@ -12,7 +12,7 @@ at cmux 0.64.21 (preserved at the `pre-linux-prune` tag), not estimated.
 | `cmux-tui` multiplexer + public CLI | Rust | **shipping** — packaged as .deb/.rpm/AUR/AppImage/tarball |
 | `cmux-relay` transport | Rust | **shipping** — same packages |
 | `libghostty-vt` terminal emulation | Zig | **shipping** — built from the `ghostty` submodule |
-| Linux GUI | — | **not started** — see [A Linux GUI](#a-linux-gui) |
+| `cmux-gtk` GTK4 frontend | Rust | **shipping** — packaged as `cmux-gtk` |
 
 Verified on Ubuntu 26.04 x86_64: the `.deb` installs, puts `cmux` on `PATH`,
 registers the man page, starts a headless session, and drives a real PTY
@@ -102,18 +102,26 @@ exercises. A GUI becomes a window that speaks the protocol, and the protocol
 is already specified (`cmux-tui/spec/`), already tested, and already running
 on Linux.
 
-Terminal rendering has a supported path that does not involve Apple
-frameworks: the `ghostty` submodule carries a GTK app runtime at
-`src/apprt/gtk/` (`App.zig`, `Surface.zig`). The 42 `GhosttyKit` imports in
-the removed macOS app were the Apple XCFramework wrapper around the same
-library.
+In the end the GUI needed no terminal emulator at all. `spec/render.md` makes
+the server the only VT implementation — clients draw styled runs, place the
+cursor and send input — so `cmux-gtk` contains no VT parser and links neither
+libghostty nor VTE. The `ghostty` submodule's GTK app runtime at
+`src/apprt/gtk/` remains available if a future stage needs real terminal
+emulation client-side, but rendering server-sent runs turned out to be both
+simpler and the contract upstream designed for.
 
 | Stage | Deliverable | State |
 | --- | --- | --- |
 | 0 | Fork, Linux-only tree, toolchain, native packages | **done** |
-| 1 | GTK4 shell: one window, session/workspace sidebar, one terminal surface via ghostty's GTK apprt, driven over `cmux.protocol/1` | not started |
-| 2 | Parity pass: splits, tabs, layouts, the agent notification surface | not started |
-| 3 | Package the GUI alongside the TUI in the same five formats | not started |
+| 1 | GTK4 window driven over `cmux.protocol/1`: workspace sidebar, terminal rendering, keyboard, resize, scrollback, selection | **done** — see [`../gui/README.md`](../gui/README.md) |
+| 2 | Parity pass: splits, tabs, pane layouts, the agent notification surface | not started |
+| 3 | Package the GUI alongside the TUI | **done** — separate `cmux-gtk` package |
+
+Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
+both affecting any Rust SDK consumer: the typed render decoder rejected the
+fields the server actually sends, and a protocol client had no way to claim
+sizing authority for its own viewer lease. Neither was a protocol problem;
+both were the public Rust surface lagging its own server.
 
 ## Tracking upstream
 

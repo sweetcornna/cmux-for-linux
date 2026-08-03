@@ -17,7 +17,18 @@ modifies upstream code.
 | `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | README, third-party notices, GPL-3.0 text |
 
-There is no GUI package yet; see [`../../docs/linux-port.md`](../../docs/linux-port.md).
+A second package, **`cmux-gtk`**, ships the GTK4 frontend:
+
+| Path | Contents |
+| --- | --- |
+| `/usr/bin/cmux-gtk` | GTK4 window onto a running cmux session |
+| `/usr/share/applications/cmux-gtk.desktop` | desktop entry (`Terminal=false`) |
+
+It is deliberately separate: the core package depends only on `libc`, `libm`
+and `libgcc_s`, so a headless server is never dragged into GTK4. CI asserts
+that the core package has no GTK dependency. `build-binaries.sh` builds the
+frontend only when gtk4 development files are present; `CMUX_WITH_GUI=1`
+turns a missing toolchain into an error, `CMUX_WITH_GUI=0` skips it.
 
 ## Build requirements
 
@@ -32,6 +43,7 @@ There is no GUI package yet; see [`../../docs/linux-port.md`](../../docs/linux-p
 - `docker` for `.rpm` (a Fedora container supplies `rpmbuild`), or a local
   `rpmbuild` with `CMUX_RPM_NATIVE=1`
 - network access on the first AppImage build, to fetch `appimagetool`
+- `libgtk-4-dev` for the optional `cmux-gtk` package
 
 ## Usage
 

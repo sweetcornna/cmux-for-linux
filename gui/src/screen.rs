@@ -24,6 +24,8 @@ pub struct Screen {
     pub at_bottom: bool,
     /// One entry per viewport row, indexed by row number.
     pub rows: Vec<Option<RenderRow>>,
+    /// Frontend-owned selection, as ((start_row, start_col), (end_row, end_col)).
+    pub selection: Option<((u16, u16), (u16, u16))>,
 }
 
 impl Default for Screen {
@@ -37,6 +39,7 @@ impl Default for Screen {
             scrollback_rows: 0,
             at_bottom: true,
             rows: Vec::new(),
+            selection: None,
         }
     }
 }
@@ -55,6 +58,8 @@ impl Screen {
         self.scrollback_rows = render.scrollback_rows;
         self.at_bottom = true;
         self.rows = place_rows(render.size.rows, render.rows);
+        // The old selection pointed into a grid that no longer exists.
+        self.selection = None;
     }
 
     /// Returns an error string when the patch cannot be applied. A frontend
@@ -86,6 +91,7 @@ impl Screen {
             let size = render.size.unwrap_or(self.size);
             self.size = size;
             self.rows = place_rows(size.rows, render.rows);
+            self.selection = None;
             return Ok(());
         }
 
@@ -104,6 +110,76 @@ impl Screen {
 
     pub fn apply_scroll(&mut self, at_bottom: bool) {
         self.at_bottom = at_bottom;
+    }
+
+    /// Selection is frontend-owned state: `spec/native-frontend.md` puts
+    /// selection, hover and scroll position on the client, not the mux.
+    pub fn set_selection(&mut self, anchor: (u16, u16), head: (u16, u16)) {
+        self.selection = Some(normalize(anchor, head));
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn is_selected(&self, row: u16, column: u16) -> bool {
+        let Some((start, end)) = self.selection else { return false };
+        // Linear selection, the way a terminal selects: full rows between the
+        // endpoints, partial rows at each end.
+        if row < start.0 || row > end.0 {
+            return false;
+        }
+        if start.0 == end.0 {
+            return column >= start.1 && column < end.1;
+        }
+        if row == start.0 {
+            return column >= start.1;
+        }
+        if row == end.0 {
+            return column < end.1;
+        }
+        true
+    }
+
+    /// The selected text, with trailing blanks on each row trimmed the way a
+    /// terminal copy does.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection?;
+        let mut lines = Vec::new();
+        for row_index in start.0..=end.0 {
+            let Some(Some(row)) = self.rows.get(usize::from(row_index)) else {
+                continue;
+            };
+            let mut line = String::new();
+            let mut column = 0u16;
+            for run in &row.runs {
+                let cells = run
+                    .width_hint
+                    .unwrap_or_else(|| run.text.chars().count() as u16);
+                for (offset, character) in run.text.chars().enumerate() {
+                    let cell = column.saturating_add(offset as u16);
+                    if self.is_selected(row_index, cell) {
+                        line.push(character);
+                    }
+                }
+                column = column.saturating_add(cells);
+            }
+            lines.push(line.trim_end().to_string());
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        Some(lines.join("\n"))
+    }
+}
+
+/// Orders two cell coordinates into (top-left-most, bottom-right-most). The
+/// head column is exclusive so a click without a drag selects nothing.
+fn normalize(anchor: (u16, u16), head: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (head.0, head.1) >= (anchor.0, anchor.1) {
+        (anchor, head)
+    } else {
+        (head, anchor)
     }
 }
 

@@ -172,6 +172,31 @@ pub fn build(screen: Rc<RefCell<Screen>>) -> DrawingArea {
             }
         }
 
+        // Selection overlay, drawn over the runs so it tints text and
+        // background alike without needing a second text pass.
+        if screen.selection.is_some() {
+            cr.set_source_rgba(0.35, 0.55, 0.9, 0.35);
+            for row_index in 0..screen.rows.len() {
+                let row = row_index as u16;
+                let y = row_index as f64 * metrics.height;
+                let mut run_start: Option<u16> = None;
+                for column in 0..=screen.size.cols {
+                    let selected = column < screen.size.cols && screen.is_selected(row, column);
+                    match (selected, run_start) {
+                        (true, None) => run_start = Some(column),
+                        (false, Some(start)) => {
+                            let x = f64::from(start) * metrics.width;
+                            let w = f64::from(column - start) * metrics.width;
+                            cr.rectangle(x, y, w, metrics.height);
+                            run_start = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let _ = cr.fill();
+        }
+
         if let Some(cursor) = &screen.cursor {
             if cursor.visible {
                 let x = f64::from(cursor.x) * metrics.width;
@@ -199,6 +224,27 @@ pub fn build(screen: Rc<RefCell<Screen>>) -> DrawingArea {
     });
 
     area
+}
+
+/// Pixel position to grid cell, clamped to the viewport.
+pub fn cell_at(metrics: CellMetrics, size: cmux::Size, x: f64, y: f64) -> (u16, u16) {
+    let column = (x / metrics.width).floor().max(0.0) as u32;
+    let row = (y / metrics.height).floor().max(0.0) as u32;
+    (
+        row.min(u32::from(size.rows.saturating_sub(1))) as u16,
+        column.min(u32::from(size.cols)) as u16,
+    )
+}
+
+/// How many whole cells fit in a widget of this pixel size.
+pub fn viewport_size(metrics: CellMetrics, width: i32, height: i32) -> cmux::Size {
+    let cols = (f64::from(width) / metrics.width).floor().max(1.0) as u32;
+    let rows = (f64::from(height) / metrics.height).floor().max(1.0) as u32;
+    cmux::Size {
+        // The protocol caps a viewport at u16; clamp rather than wrap.
+        cols: cols.min(u32::from(u16::MAX)) as u16,
+        rows: rows.min(u32::from(u16::MAX)) as u16,
+    }
 }
 
 /// Translates a GDK key press into the bytes a PTY expects.

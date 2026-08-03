@@ -42,6 +42,25 @@ for format in "${formats[@]}"; do
   fi
 done
 
+# The GTK frontend, when it was built, ships as its own package so a headless
+# install is not dragged into GTK4.
+if [ -d "$BUILD_DIR/stage-gui/usr/bin" ]; then
+  for format in "${formats[@]}"; do
+    case "$format" in
+      deb|rpm)
+        log "--- $format (cmux-gtk) ---"
+        if ! CMUX_PKG_NAME="$PKG_NAME-gtk" CMUX_STAGE="$BUILD_DIR/stage-gui" \
+             "$PKG_DIR/build-$format.sh"; then
+          log "warning: $format (cmux-gtk) failed"
+          failed+=("$format-gtk")
+        fi
+        ;;
+    esac
+  done
+else
+  log "no gui stage tree; the GTK frontend is not packaged"
+fi
+
 log "artifacts for $PKG_NAME $VERSION ($RUST_ARCH):"
 ls -la "$BUILD_DIR/dist" 2>/dev/null | sed 's/^/    /'
 

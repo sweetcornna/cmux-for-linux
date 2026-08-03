@@ -10,6 +10,7 @@ distributions expect, and drops everything else.
 
 ```bash
 sudo apt install ./cmux_<version>_amd64.deb    # Debian / Ubuntu
+sudo apt install ./cmux-gtk_<version>_amd64.deb  # optional GTK4 window
 sudo dnf install ./cmux-<version>.x86_64.rpm   # Fedora / RHEL
 yay -S cmux-bin                                # Arch (AUR)
 ./cmux-<version>-x86_64.AppImage               # anywhere
@@ -26,11 +27,25 @@ cmux workspace current run -- cargo test
 
 `man cmux` documents the full noun-first CLI.
 
+For a window instead of a TUI:
+
+```bash
+cmux --headless --session main &
+cmux-gtk --session main
+```
+
+`cmux-gtk` renders a terminal, switches workspaces from a sidebar, resizes the
+PTY with the window, scrolls back with the wheel and copies a drag-selection
+with `Ctrl+Shift+C`. It is a separate package so the core install stays free
+of GTK dependencies — see [`gui/README.md`](gui/README.md).
+
 ## What is in this repository
 
 | Path | What it is |
 | --- | --- |
 | `cmux-tui/` | the Rust workspace: the TUI multiplexer, public CLI, relay, and PTY layer |
+| `gui/` | `cmux-gtk`, a GTK4 frontend that speaks `cmux.protocol/1` |
+| `patches/` | fixes this fork carries against upstream files |
 | `ghostty/` | submodule supplying `libghostty-vt`, the terminal emulator |
 | `packaging/linux/` | everything that turns the above into `.deb`, `.rpm`, AUR, AppImage and tarball |
 | `docs/linux-port.md` | port status, measurements, and the plan for a Linux GUI |
