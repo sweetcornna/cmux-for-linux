@@ -29,8 +29,8 @@ fi
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
-FILES="bin/cmux bin/cmux-tui bin/cmux-relay bin/cmux-open-here
-share/applications/cmux.desktop
+FILES="bin/cmux bin/cmux-tui bin/cmux-relay bin/cmux-gtk bin/cmux-open-here
+share/applications/cmux.desktop share/applications/cmux-gtk.desktop
 share/man/man1/cmux.1.gz
 share/bash-completion/completions/cmux
 share/zsh/site-functions/_cmux
@@ -76,4 +76,4 @@ case ":$PATH:" in
   *) echo "note: $PREFIX/bin is not in PATH; add it to your shell profile" >&2 ;;
 esac
 
-echo "done — run 'cmux' to start the default session"
+echo "done — run 'cmux' for the TUI or 'cmux-gtk' for the GTK frontend"

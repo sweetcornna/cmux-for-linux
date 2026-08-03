@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # Build a self-contained AppImage from the staged FHS tree.
 #
-# cmux is a terminal application, so the AppImage is a relocatable single-file
-# distribution rather than a desktop launcher target: running it drops straight
-# into the TUI in the calling terminal. Symlinking or renaming the AppImage to
-# cmux-relay runs the relay binary instead, which keeps the pair together in
-# one file.
+# The AppImage carries the TUI, relay and GTK4 frontend together. Running it
+# from a shell opens the TUI; its desktop entry and a cmux-gtk symlink dispatch
+# to the GUI, while a cmux-relay symlink dispatches to the relay.
 
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 
@@ -43,8 +41,11 @@ mkdir -p "$appdir" "$OUT_DIR"
 
 cp -a "$STAGE/usr" "$appdir/usr"
 
-# AppImage requires the desktop file, its icon and .DirIcon at the AppDir root.
-install -m 0644 "$STAGE/usr/share/applications/cmux.desktop" "$appdir/cmux.desktop"
+# AppImage requires one desktop file, its icon and .DirIcon at the AppDir root.
+# Its launcher selects the GUI while the AppImage's CLI default remains the TUI.
+sed -e 's/^Exec=.*/Exec=cmux --gtk/' \
+    -e 's/^TryExec=.*/TryExec=cmux/' \
+    "$STAGE/usr/share/applications/cmux-gtk.desktop" > "$appdir/cmux.desktop"
 if [ -f "$STAGE/usr/share/icons/hicolor/256x256/apps/cmux.png" ]; then
   install -m 0644 "$STAGE/usr/share/icons/hicolor/256x256/apps/cmux.png" "$appdir/cmux.png"
   cp "$appdir/cmux.png" "$appdir/.DirIcon"
@@ -55,8 +56,8 @@ cat > "$appdir/AppRun" <<'EOF'
 # AppRun for the cmux AppImage.
 #
 # Dispatch on the name the AppImage was invoked as, so one file can provide
-# both cmux and cmux-relay. ARGV0 is set by the AppImage runtime and holds the
-# name the user actually typed.
+# all three commands. The root desktop entry uses --gtk because desktop
+# integration invokes the AppImage by its artifact name.
 set -eu
 
 HERE="$(dirname "$(readlink -f "$0")")"
@@ -68,8 +69,14 @@ export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/sha
 invoked="$(basename "${ARGV0:-$0}")"
 case "$invoked" in
   cmux-relay*) exec "$HERE/usr/bin/cmux-relay" "$@" ;;
-  *)           exec "$HERE/usr/bin/cmux-tui" "$@" ;;
+  cmux-gtk*)   exec "$HERE/usr/bin/cmux-gtk" "$@" ;;
 esac
+
+if [ "${1:-}" = "--gtk" ]; then
+  shift
+  exec "$HERE/usr/bin/cmux-gtk" "$@"
+fi
+exec "$HERE/usr/bin/cmux-tui" "$@"
 EOF
 chmod 0755 "$appdir/AppRun"
 

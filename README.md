@@ -10,7 +10,6 @@ distributions expect, and drops everything else.
 
 ```bash
 sudo apt install ./cmux_<version>_amd64.deb      # Debian / Ubuntu
-sudo apt install ./cmux-gtk_<version>_amd64.deb  # optional GTK4 window
 sudo dnf install ./cmux-<version>.x86_64.rpm     # Fedora / RHEL
 yay -S cmux-bin                                  # Arch (AUR)
 ./cmux-<version>-x86_64.AppImage                 # anywhere
@@ -30,24 +29,25 @@ cmux workspace current run -- cargo test
 For a window instead of a TUI:
 
 ```bash
-cmux --headless --session main &
-cmux-gtk --session main
+cmux-gtk                         # connect to "main", starting it if needed
+cmux-gtk --session agents        # use another session
 ```
 
 `cmux-gtk` renders pane splits and tabs, switches workspaces from a sidebar,
 resizes each pane's PTY with the window, scrolls back with the wheel and copies
-a drag-selection with `Ctrl+Shift+C`. It is a separate package so the core
-install stays free of GTK dependencies. See [`gui/README.md`](gui/README.md).
+a drag-selection with `Ctrl+Shift+C`. It is installed by the same `cmux`
+package as the TUI and relay. Clicking the cmux GTK desktop icon starts the GUI
+and automatically starts the default session when none is running. See
+[`gui/README.md`](gui/README.md).
 
 ## GTK frontend vs the TUI
 
-Normal cmux is the TUI installed by the `cmux` package. It is the
+Normal cmux is the TUI frontend installed by the `cmux` package. It is the
 terminal-native multiplexer, runs anywhere cmux can run, including over SSH,
 and is also the server that every frontend attaches to when run with
-`--headless`. The `cmux` package is required whether you use the TUI, the GTK
-frontend, or both.
+`--headless`. The same package installs both frontends.
 
-`cmux-gtk` is an optional native window onto a running cmux session. It speaks
+`cmux-gtk` is the native GTK4 window onto a cmux session. It speaks
 the same protocol, uses the same server and displays the same session. It is a
 different face for the session, not a fork of multiplexer behavior.
 
@@ -72,7 +72,7 @@ yet.
 | Machine rail and SSH targets | Yes | No |
 | Works over SSH without X or Wayland | Yes | No |
 
-The packages coexist. A GTK window and any number of TUI attachments can view
+The two frontends coexist. A GTK window and any number of TUI attachments can view
 the same session at the same time.
 
 ## What is in this repository
@@ -91,20 +91,23 @@ iOS app, the Xcode project, the web and webview surfaces, and upstream's
 macOS/iOS CI. The full pre-prune tree is kept at the `pre-linux-prune` tag and
 in the `upstream` remote.
 
-## What the packages install
+## What the package installs
 
 | Path | Contents |
 | --- | --- |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching upstream's npm command name |
 | `/usr/bin/cmux-tui` | the multiplexer and public CLI |
 | `/usr/bin/cmux-relay` | stdio-to-socket transport primitive |
-| `/usr/share/applications/cmux.desktop` | desktop entry |
+| `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session automatically when needed |
+| `/usr/share/applications/cmux.desktop` | TUI desktop entry (`Terminal=true`) |
+| `/usr/share/applications/cmux-gtk.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons |
 | `/usr/share/man/man1/cmux.1.gz` | man page |
 | `/usr/share/{bash-completion,zsh,fish}/...` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | docs, third-party notices, GPL-3.0 text |
 
-The binaries link only `libc`, `libm` and `libgcc_s`.
+The TUI and relay link only `libc`, `libm` and `libgcc_s`; `cmux-gtk` also uses
+the packaged GTK4, Pango and cairo runtime libraries.
 
 ## Building from source
 
@@ -113,7 +116,7 @@ git clone https://github.com/sweetcornna/cmux-for-linux.git
 cd cmux-for-linux
 git submodule update --init --filter=blob:none ghostty
 
-sudo apt install clang libclang-dev dpkg-dev fakeroot   # or your distro's equivalents
+sudo apt install clang libclang-dev libgtk-4-dev dpkg-dev fakeroot
 # plus a Rust toolchain and Zig 0.16.x on PATH
 
 packaging/linux/build-all.sh
@@ -148,8 +151,8 @@ packaging bugs belong here.
 
 ## Licence
 
-cmux is **GPL-3.0-or-later**, which is what makes this fork and its packages
-redistributable. Every package ships the licence text at
+cmux is **GPL-3.0-or-later**, which is what makes this fork and its package
+formats redistributable. Every format ships the licence text at
 `/usr/share/licenses/cmux/LICENSE` and upstream's third-party notices at
 `/usr/share/doc/cmux/THIRD_PARTY_LICENSES.md`.
 

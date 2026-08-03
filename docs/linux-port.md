@@ -11,13 +11,14 @@ against the upstream tree at cmux 0.64.21 (preserved at the
 | Component | Language | Linux status |
 | --- | --- | --- |
 | `cmux-tui` multiplexer + public CLI | Rust | **shipping** - packaged as .deb/.rpm/AUR/AppImage/tarball |
-| `cmux-relay` transport | Rust | **shipping** - same packages |
+| `cmux-relay` transport | Rust | **shipping** - same full `cmux` package |
 | `libghostty-vt` terminal emulation | Zig | **shipping** - built from the `ghostty` submodule |
-| `cmux-gtk` GTK4 frontend | Rust | **shipping** - packaged as `cmux-gtk` |
+| `cmux-gtk` GTK4 frontend | Rust | **shipping** - included in the same full `cmux` package |
 
-Verified on Ubuntu 26.04 x86_64: the `.deb` installs, puts `cmux` on `PATH`,
-registers the man page, starts a headless session, and drives a real PTY
-through `libghostty-vt`. The `.rpm` installs in a `fedora:42` container.
+Verified on Ubuntu 26.04 x86_64: the single `.deb` installs `cmux`,
+`cmux-relay` and `cmux-gtk`, registers both desktop entries and the man page,
+starts a headless session, and drives a real PTY through `libghostty-vt`. The
+`.rpm` installs the same full payload in a `fedora:42` container.
 
 ## Build dependencies Linux needs and upstream CI does not
 
@@ -37,9 +38,11 @@ through `libghostty-vt`. The `.rpm` installs in a `fedora:42` container.
   This is the single most likely first-build failure on a clean Linux host.
 - **The `ghostty` submodule.** `git submodule update --init ghostty`. A blobless
   fetch (`--filter=blob:none`) is enough and much faster than a full clone.
+- **GTK4 development files.** The full package always includes `cmux-gtk`, so
+  Debian and Ubuntu builds require `libgtk-4-dev` (or the distro equivalent).
 
-Nothing else is required. The resulting binaries link only `libc`, `libm` and
-`libgcc_s`.
+The TUI and relay link only `libc`, `libm` and `libgcc_s`; the GTK frontend
+also links the GTK4, Pango and cairo runtime libraries.
 
 ## What was removed, and the measurement behind it
 
@@ -98,7 +101,7 @@ The GUI is a client of `cmux.protocol/1`, not a Swift port.
 
 `cmux-tui-core` implements the session/workspace/screen/pane/tab/terminal tree
 and serves that protocol over a Unix socket. It is the code that ships in this
-repository's packages and that the PTY test above exercises. The GUI is a
+repository's full package and that the PTY test above exercises. The GUI is a
 window that speaks the protocol.
 
 The GUI needs no terminal emulator. `spec/render.md` makes the server the only
@@ -107,12 +110,17 @@ VT implementation: clients draw styled runs, place the cursor and send input.
 VTE. The `ghostty` submodule's GTK app runtime at `src/apprt/gtk/` remains
 available if a future stage needs terminal emulation client-side.
 
+Launching `cmux-gtk` with no arguments targets the default `main` session. If
+its socket is missing or refuses the connection, the frontend starts a
+headless `cmux` child and retries for up to five seconds; `--probe` remains a
+connection-only diagnostic and never starts a session.
+
 | Stage | Deliverable | State |
 | --- | --- | --- |
 | 0 | Fork, Linux-only tree, toolchain, native packages | **done** |
 | 1 | GTK4 window driven over `cmux.protocol/1`: workspace sidebar, terminal rendering, keyboard, resize, scrollback, selection | **done** - see [`../gui/README.md`](../gui/README.md) |
 | 2 | Parity pass: pane layouts, tabs, mouse input, themes, macOS visual parity and input behavior | **done** |
-| 3 | Package the GUI alongside the TUI | **done** - separate `cmux-gtk` package |
+| 3 | Package the GUI alongside the TUI | **done** - both frontends ship in the full `cmux` package |
 
 The stage 2 work verified against live sessions includes pane splits with
 per-pane PTY sizing, a tab strip, click-to-focus, mouse forwarding to terminal
@@ -179,9 +187,9 @@ Nothing in this repository is intended as an upstream contribution.
 
 ## Licensing
 
-cmux is GPL-3.0-or-later, which is what makes this fork and its packages
+cmux is GPL-3.0-or-later, which is what makes this fork and its package formats
 redistributable. The corresponding source stays available at
-`https://github.com/sweetcornna/cmux-for-linux`. Every package ships the
+`https://github.com/sweetcornna/cmux-for-linux`. Every format ships the
 licence text at `/usr/share/licenses/cmux/LICENSE` and upstream's third-party
 notices at `/usr/share/doc/cmux/THIRD_PARTY_LICENSES.md`.
 

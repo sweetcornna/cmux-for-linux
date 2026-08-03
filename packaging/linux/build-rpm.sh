@@ -7,9 +7,7 @@
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 
 detect_arch
-# Each package has its own spec: the file lists, dependencies and %check
-# assertions differ, so one spec with conditionals would be worse.
-RPM_PKG_NAME="${CMUX_PKG_NAME:-$PKG_NAME}"
+RPM_PKG_NAME="$PKG_NAME"
 SPEC="$PKG_DIR/rpm/$RPM_PKG_NAME.spec"
 [ -f "$SPEC" ] || die "no spec for package '$RPM_PKG_NAME' at $SPEC"
 STAGE="${CMUX_STAGE:-$BUILD_DIR/stage}"

@@ -3,14 +3,23 @@
 A GTK4 frontend for cmux. See
 [`../docs/linux-port.md`](../docs/linux-port.md) for the Linux port status.
 
+The native Linux `cmux` package installs the TUI, relay and this GTK frontend
+together. After installing it, launch `cmux-gtk` or click its desktop icon:
+
 ```bash
-cmux --headless --session main &     # a session to attach to
-cargo run --release -- --session main
+sudo apt install ./cmux_<version>_amd64.deb
+cmux-gtk
 ```
+
+With no arguments it connects to the `main` session. If that session is not
+running, the GUI starts `cmux --headless --session main`, waits up to five
+seconds and then attaches. `--session <name>` applies the same behavior to a
+named session. From a source checkout, use
+`cargo run --release -- --session main` in this directory.
 
 ## What it does
 
-- connects to a running cmux session over `cmux.protocol/1`
+- connects to a cmux session over `cmux.protocol/1`, starting it when needed
 - lists the session's workspaces in a sidebar
 - renders pane splits and tabs from the server's styled render stream
 - creates, closes and resizes panes through server-owned layout mutations
@@ -40,8 +49,8 @@ replaces that directory wholesale from upstream.
 
 ## Debugging
 
-`--probe` runs the protocol worker with no GTK and prints every update, which
-separates protocol failures from drawing failures:
+`--probe` runs the protocol worker with no GTK or automatic session startup and
+prints every update, which separates protocol failures from drawing failures:
 
 ```bash
 cargo run --release -- --probe --session main

@@ -10,7 +10,8 @@
 //! 50ms poll timeout to every other pane's latency.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -28,6 +29,41 @@ use crate::screen::{PaneView, TabContent, TabView, WorkspaceView};
 /// turning an idle attachment into a busy loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug)]
+struct RetrySchedule {
+    interval: Duration,
+    timeout: Duration,
+    elapsed: Duration,
+}
+
+impl RetrySchedule {
+    fn new(interval: Duration, timeout: Duration) -> Self {
+        Self {
+            interval,
+            timeout,
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+impl Iterator for RetrySchedule {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.interval.is_zero() {
+            return None;
+        }
+        let next = self.elapsed.checked_add(self.interval)?;
+        if next > self.timeout {
+            return None;
+        }
+        self.elapsed = next;
+        Some(self.interval)
+    }
+}
 
 #[derive(Debug)]
 pub enum Update {
@@ -149,6 +185,7 @@ impl Worker {
 pub fn spawn(
     session_name: String,
     socket: Option<PathBuf>,
+    auto_start: bool,
     updates: async_channel::Sender<Update>,
 ) -> Worker {
     let (input_tx, input_rx) = mpsc::channel::<Input>();
@@ -160,13 +197,10 @@ pub fn spawn(
             None => Config::from_env_or_default_session(&session_name),
         };
 
-        let client = match Client::connect(config) {
+        let client = match connect(&session_name, config, auto_start, &updates) {
             Ok(client) => client,
-            Err(error) => {
-                let _ = updates.send_blocking(Update::Error(format!(
-                    "could not connect to session '{session_name}': {error}. \
-                     Start one with `cmux --headless --session {session_name}`."
-                )));
+            Err(message) => {
+                let _ = updates.send_blocking(Update::Error(message));
                 return;
             }
         };
@@ -187,6 +221,79 @@ pub fn spawn(
         input: input_tx,
         control: control_tx,
     }
+}
+
+fn connect(
+    session_name: &str,
+    config: Config,
+    auto_start: bool,
+    updates: &async_channel::Sender<Update>,
+) -> Result<Client, String> {
+    let first_error = match Client::connect(config.clone()) {
+        Ok(client) => return Ok(client),
+        Err(error) => error,
+    };
+
+    if !auto_start || !session_is_unavailable(&first_error, &config.socket_path) {
+        return Err(format!(
+            "Could not connect to session '{session_name}': {first_error}"
+        ));
+    }
+
+    let _ = updates.send_blocking(Update::Error(format!(
+        "Starting cmux session '{session_name}'..."
+    )));
+    start_headless_session(session_name, &config.socket_path)?;
+
+    let mut last_error = first_error.to_string();
+    for delay in RetrySchedule::new(STARTUP_RETRY_INTERVAL, STARTUP_TIMEOUT) {
+        thread::sleep(delay);
+        match Client::connect(config.clone()) {
+            Ok(client) => return Ok(client),
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+
+    Err(format!(
+        "Could not connect to session '{session_name}' after starting cmux and waiting {} seconds: \
+         {last_error}",
+        STARTUP_TIMEOUT.as_secs()
+    ))
+}
+
+fn session_is_unavailable(error: &cmux::Error, socket_path: &Path) -> bool {
+    let cmux::Error::Connection(message) = error else {
+        return false;
+    };
+    if !socket_path.exists() {
+        return true;
+    }
+
+    let message = message.to_ascii_lowercase();
+    message.contains("connection refused") || message.contains("os error 111")
+}
+
+fn start_headless_session(session_name: &str, socket_path: &Path) -> Result<(), String> {
+    let mut child = Command::new("cmux")
+        .arg("--headless")
+        .arg("--session")
+        .arg(session_name)
+        .arg("--socket")
+        .arg(socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            format!("Could not start cmux session '{session_name}': failed to run `cmux`: {error}")
+        })?;
+
+    // Reap a server that exits early; a successful headless session normally
+    // keeps this thread parked until the GTK process itself exits.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 struct AttachmentWorker {
@@ -727,5 +834,38 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
             .columns
             .iter()
             .find_map(|column| active_tab_for_pane(&column.root, pane)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetrySchedule;
+    use std::time::Duration;
+
+    #[test]
+    fn startup_retry_schedule_covers_the_timeout_without_exceeding_it() {
+        let delays = RetrySchedule::new(Duration::from_millis(200), Duration::from_secs(5))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays.len(), 25);
+        assert!(delays
+            .iter()
+            .all(|delay| *delay == Duration::from_millis(200)));
+        assert_eq!(delays.into_iter().sum::<Duration>(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn startup_retry_schedule_stops_before_a_partial_interval() {
+        let delays = RetrySchedule::new(Duration::from_millis(200), Duration::from_millis(450))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![Duration::from_millis(200); 2]);
+    }
+
+    #[test]
+    fn startup_retry_schedule_rejects_a_zero_interval() {
+        let delays = RetrySchedule::new(Duration::ZERO, Duration::from_secs(5)).collect::<Vec<_>>();
+
+        assert!(delays.is_empty());
     }
 }

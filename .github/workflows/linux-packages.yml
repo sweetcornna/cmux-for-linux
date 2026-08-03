@@ -16,6 +16,7 @@ on:
     tags: ['linux-v*']
     paths:
       - 'cmux-tui/**'
+      - 'gui/**'
       - 'packaging/linux/**'
       - 'ghostty'
       - '.github/workflows/linux-packages.yml'
@@ -23,6 +24,7 @@ on:
     branches: [linux]
     paths:
       - 'cmux-tui/**'
+      - 'gui/**'
       - 'packaging/linux/**'
       - '.github/workflows/linux-packages.yml'
   workflow_dispatch:
@@ -75,7 +77,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: cmux-tui
+          workspaces: |
+            cmux-tui -> target
+            gui -> target
 
       - name: Install Zig ${{ env.ZIG_VERSION }}
         run: |
@@ -105,21 +109,17 @@ jobs:
       - name: Install-test the .deb
         if: matrix.arch == 'x86_64'
         run: |
-          core="$(find build/linux/dist -name 'cmux_*.deb' -print -quit)"
-          gui="$(find build/linux/dist -name 'cmux-gtk_*.deb' -print -quit)"
-          sudo apt-get install -y -qq "$PWD/$core" "$PWD/$gui"
+          mapfile -t debs < <(find build/linux/dist -name '*.deb' -type f)
+          test "${#debs[@]}" -eq 1
+          sudo apt-get install -y -qq "$PWD/${debs[0]}"
           command -v cmux
           command -v cmux-gtk
           cmux --version || true
           man --where cmux
           dpkg -L cmux | sort
-          # The core package must not drag GTK in; that is the whole reason
-          # the frontend is packaged separately.
-          if dpkg -s cmux | grep -q 'libgtk'; then
-            echo "::error::the core package depends on GTK" >&2
-            exit 1
-          fi
-          sudo apt-get remove -y -qq cmux cmux-gtk
+          dpkg -s cmux
+          dpkg -s cmux | sed -n '/^Depends:/p' | grep -qi 'libgtk'
+          sudo apt-get remove -y -qq cmux
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -188,6 +188,6 @@ jobs:
           Formats: \`.deb\`, \`.rpm\`, AppImage, portable tarball, and the AUR \`PKGBUILD\`.
           Every artifact has a matching \`.sha256\`.
 
-          These packages ship the Rust \`cmux-tui\` multiplexer and \`cmux-relay\`. The macOS
-          Swift application is not part of this fork." \
+          Each artifact ships the Rust \`cmux-tui\` multiplexer, \`cmux-relay\`, and the
+          \`cmux-gtk\` GTK4 frontend. The macOS Swift application is not part of this fork." \
             $(find build/linux/dist -type f | sort)

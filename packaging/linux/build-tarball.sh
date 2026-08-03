@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build the portable .tar.gz plus its install.sh.
 #
-# The archive holds the same FHS tree every other format installs, rooted at
-# the archive top level, so `install.sh --prefix /usr/local` is a plain copy.
+# The archive holds the same complete TUI, relay and GTK4 FHS tree every other
+# format installs, rooted at the archive top level, so
+# `install.sh --prefix /usr/local` is a plain copy.
 
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 

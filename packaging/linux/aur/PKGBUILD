@@ -1,6 +1,6 @@
 # Maintainer: cmux for linux <travon_evenietyku@sanfranmail.com>
 #
-# Binary package for the cmux TUI, built from the release tarballs produced by
+# Binary package for cmux, built from the release tarballs produced by
 # packaging/linux/build-tarball.sh in the cmux for linux fork.
 #
 # A from-source PKGBUILD would need Zig 0.16 plus a fully vendored Cargo
@@ -11,14 +11,14 @@ pkgname=cmux-bin
 _pkgname=cmux
 pkgver=0.0.0
 pkgrel=1
-pkgdesc="Terminal multiplexer TUI for AI coding agents, backed by libghostty-vt"
+pkgdesc="Terminal multiplexer with TUI and GTK4 frontends for AI coding agents"
 arch=('x86_64' 'aarch64')
 url="https://github.com/sweetcornna/cmux-for-linux"
 license=('GPL-3.0-or-later')
-depends=('glibc')
+depends=('glibc' 'gtk4')
 optdepends=('python-nautilus: "New cmux window/workspace here" in Nautilus')
-provides=('cmux' 'cmux-tui')
-conflicts=('cmux' 'cmux-tui')
+provides=('cmux' 'cmux-tui' 'cmux-gtk')
+conflicts=('cmux' 'cmux-tui' 'cmux-gtk')
 options=('!strip' '!debug')
 
 source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/linux-v$pkgver/$_pkgname-$pkgver-linux-x86_64.tar.gz")
@@ -33,6 +33,7 @@ package() {
 
   install -Dm0755 "$src/bin/cmux-tui"       "$pkgdir/usr/bin/cmux-tui"
   install -Dm0755 "$src/bin/cmux-relay"     "$pkgdir/usr/bin/cmux-relay"
+  install -Dm0755 "$src/bin/cmux-gtk"       "$pkgdir/usr/bin/cmux-gtk"
   install -Dm0755 "$src/bin/cmux-open-here" "$pkgdir/usr/bin/cmux-open-here"
   ln -sf cmux-tui "$pkgdir/usr/bin/cmux"
 
@@ -51,6 +52,8 @@ package() {
 
   install -Dm0644 "$src/share/applications/cmux.desktop" \
     "$pkgdir/usr/share/applications/cmux.desktop"
+  install -Dm0644 "$src/share/applications/cmux-gtk.desktop" \
+    "$pkgdir/usr/share/applications/cmux-gtk.desktop"
   install -Dm0644 "$src/share/man/man1/cmux.1.gz" \
     "$pkgdir/usr/share/man/man1/cmux.1.gz"
 
@@ -73,4 +76,6 @@ package() {
     "$pkgdir/usr/share/doc/$_pkgname/THIRD_PARTY_LICENSES.md"
   install -Dm0644 "$src/share/doc/cmux/README.md" \
     "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  install -Dm0644 "$src/share/doc/cmux/GUI.md" \
+    "$pkgdir/usr/share/doc/$_pkgname/GUI.md"
 }

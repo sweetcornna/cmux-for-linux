@@ -85,10 +85,10 @@ fn parse_args() -> Args {
                     "cmux-gtk — GTK4 frontend for cmux\n\n\
                      USAGE\n  \
                      cmux-gtk [--session <name>] [--socket <path>] [--probe]\n\n\
-                     Connects to a running cmux session. Start one with\n  \
-                     cmux --headless --session <name>\n\n\
-                     --probe runs the protocol workers without GTK and prints every\n\
-                     update, which separates protocol failures from drawing ones."
+                     Connects to a cmux session, starting a headless one when needed.\n\n\
+                     --probe runs the protocol workers without GTK or automatic session\n\
+                     startup and prints every update, which separates protocol failures\n\
+                     from drawing ones."
                 );
                 std::process::exit(0);
             }
@@ -101,7 +101,7 @@ fn parse_args() -> Args {
 fn probe() -> gtk4::glib::ExitCode {
     let args = parse_args();
     let (tx, rx) = async_channel::unbounded::<Update>();
-    let worker = session::spawn(args.session.clone(), args.socket.clone(), tx);
+    let worker = session::spawn(args.session.clone(), args.socket.clone(), false, tx);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
@@ -474,6 +474,7 @@ fn build_ui(application: &Application) {
     let worker = Rc::new(session::spawn(
         args.session.clone(),
         args.socket.clone(),
+        true,
         update_tx,
     ));
     let blink = Rc::new(Cell::new(view::BlinkState::new(false)));

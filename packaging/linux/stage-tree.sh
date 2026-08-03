@@ -13,7 +13,7 @@ source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 STAGE="${1:-$BUILD_DIR/stage}"
 VERSION="$(resolve_version)"
 
-for bin in cmux-tui cmux-relay; do
+for bin in cmux-tui cmux-relay cmux-gtk; do
   [ -x "$BUILD_DIR/bin/$bin" ] || \
     die "missing $BUILD_DIR/bin/$bin — run packaging/linux/build-binaries.sh first"
 done
@@ -35,6 +35,7 @@ mkdir -p \
 # written against the upstream binary name keep working.
 install -m 0755 "$BUILD_DIR/bin/cmux-tui" "$STAGE/usr/bin/cmux-tui"
 install -m 0755 "$BUILD_DIR/bin/cmux-relay" "$STAGE/usr/bin/cmux-relay"
+install -m 0755 "$BUILD_DIR/bin/cmux-gtk" "$STAGE/usr/bin/cmux-gtk"
 ln -sf cmux-tui "$STAGE/usr/bin/cmux"
 
 # Helper behind every file-manager context-menu entry.
@@ -55,8 +56,10 @@ for action in cmux-window cmux-workspace; do
     "$STAGE/usr/share/nemo/actions/$action.nemo_action"
 done
 
-# Desktop entry + icons.
+# TUI and GUI desktop entries + shared icons.
 install -m 0644 "$PKG_DIR/common/cmux.desktop" "$STAGE/usr/share/applications/cmux.desktop"
+install -m 0644 "$PKG_DIR/common/cmux-gtk.desktop" \
+  "$STAGE/usr/share/applications/cmux-gtk.desktop"
 for size in 16 32 128 256 512; do
   src="$PKG_DIR/common/icons/cmux-$size.png"
   [ -f "$src" ] || continue
@@ -85,26 +88,7 @@ install -m 0644 "$REPO_ROOT/LICENSE" "$STAGE/usr/share/doc/$PKG_NAME/copyright"
 install -m 0644 "$REPO_ROOT/THIRD_PARTY_LICENSES.md" \
   "$STAGE/usr/share/doc/$PKG_NAME/THIRD_PARTY_LICENSES.md"
 install -m 0644 "$TUI_DIR/README.md" "$STAGE/usr/share/doc/$PKG_NAME/README.md"
+install -m 0644 "$REPO_ROOT/gui/README.md" "$STAGE/usr/share/doc/$PKG_NAME/GUI.md"
 
 printf '%s\n' "$VERSION" > "$BUILD_DIR/VERSION"
 log "staged tree ready ($(du -sh "$STAGE" | cut -f1))"
-
-# The GTK frontend is staged separately so it can ship as its own package and
-# leave the core install free of GTK dependencies.
-GUI_STAGE="${CMUX_GUI_STAGE:-$BUILD_DIR/stage-gui}"
-rm -rf "$GUI_STAGE"
-if [ -x "$BUILD_DIR/bin/cmux-gtk" ]; then
-  log "staging cmux-gtk into $GUI_STAGE"
-  install -D -m 0755 "$BUILD_DIR/bin/cmux-gtk" "$GUI_STAGE/usr/bin/cmux-gtk"
-  install -D -m 0644 "$PKG_DIR/common/cmux-gtk.desktop" \
-    "$GUI_STAGE/usr/share/applications/cmux-gtk.desktop"
-  install -D -m 0644 "$REPO_ROOT/LICENSE" \
-    "$GUI_STAGE/usr/share/doc/$PKG_NAME-gtk/copyright"
-  install -D -m 0644 "$REPO_ROOT/LICENSE" \
-    "$GUI_STAGE/usr/share/licenses/$PKG_NAME-gtk/LICENSE"
-  install -D -m 0644 "$REPO_ROOT/gui/README.md" \
-    "$GUI_STAGE/usr/share/doc/$PKG_NAME-gtk/README.md"
-  log "gui tree ready ($(du -sh "$GUI_STAGE" | cut -f1))"
-else
-  log "no cmux-gtk binary; skipping the gui package tree"
-fi

@@ -1,8 +1,8 @@
 # Native Linux packaging
 
-This directory turns the Rust `cmux-tui` workspace into native Linux packages.
-Upstream cmux ships the same binaries only through npm and PyPI; nothing here
-modifies upstream code.
+This directory turns the Rust `cmux-tui` workspace and the GTK4 frontend into
+one full native Linux `cmux` package. Upstream cmux ships the TUI binaries only
+through npm and PyPI; nothing here modifies upstream code.
 
 ## What gets packaged
 
@@ -10,25 +10,18 @@ modifies upstream code.
 | --- | --- |
 | `/usr/bin/cmux-tui` | the TUI multiplexer and public CLI |
 | `/usr/bin/cmux-relay` | stdio↔socket transport primitive |
+| `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session when needed |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching the upstream npm command name |
-| `/usr/share/applications/cmux.desktop` | desktop entry (`Terminal=true`) |
+| `/usr/share/applications/cmux.desktop` | TUI desktop entry (`Terminal=true`) |
+| `/usr/share/applications/cmux-gtk.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons from `common/icons/` |
 | `/usr/share/man/man1/cmux.1.gz` | man page generated from `common/cmux.1.in` |
 | `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
-| `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | README, third-party notices, GPL-3.0 text |
+| `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | TUI and GUI READMEs, third-party notices, GPL-3.0 text |
 
-A second package, **`cmux-gtk`**, ships the GTK4 frontend:
-
-| Path | Contents |
-| --- | --- |
-| `/usr/bin/cmux-gtk` | GTK4 window onto a running cmux session |
-| `/usr/share/applications/cmux-gtk.desktop` | desktop entry (`Terminal=false`) |
-
-It is deliberately separate: the core package depends only on `libc`, `libm`
-and `libgcc_s`, so a headless server is never dragged into GTK4. CI asserts
-that the core package has no GTK dependency. `build-binaries.sh` builds the
-frontend only when gtk4 development files are present; `CMUX_WITH_GUI=1`
-turns a missing toolchain into an error, `CMUX_WITH_GUI=0` skips it.
+Every format consumes this full payload. The Debian package conflicts with,
+replaces and provides `cmux-gtk`, and the RPM obsoletes and provides it, so the
+old split package is removed during an upgrade.
 
 ## Build requirements
 
@@ -43,7 +36,7 @@ turns a missing toolchain into an error, `CMUX_WITH_GUI=0` skips it.
 - `docker` for `.rpm` (a Fedora container supplies `rpmbuild`), or a local
   `rpmbuild` with `CMUX_RPM_NATIVE=1`
 - network access on the first AppImage build, to fetch `appimagetool`
-- `libgtk-4-dev` for the optional `cmux-gtk` package
+- `libgtk-4-dev` to build the required `cmux-gtk` frontend
 
 ## Usage
 
@@ -65,7 +58,7 @@ Artifacts land in `build/linux/dist/`, each with a `.sha256` next to it.
 ```
 packaging/linux/
 ├── build-all.sh          orchestrator
-├── build-binaries.sh     cargo build -p cmux-tui -p cmux-relay, then strip
+├── build-binaries.sh     builds the TUI, relay and GTK4 frontend, then strips
 ├── stage-tree.sh         the one FHS tree every format installs
 ├── build-tarball.sh      portable .tar.gz + install.sh
 ├── build-deb.sh          dpkg-deb
@@ -78,8 +71,9 @@ packaging/linux/
 └── aur/PKGBUILD          cmux-bin
 ```
 
-Every format consumes the same staged tree, so the installed layout is
-identical across them and only packaging metadata differs.
+Every format consumes the same full staged tree, so the installed layout is
+identical across them and only packaging metadata differs. The AppImage opens
+the TUI from a shell and the GUI from its desktop entry.
 
 ## Versioning
 
@@ -111,5 +105,5 @@ rejects `-` in `pkgver`, and `+` becomes `%2B` in download URLs.
 - The AUR `PKGBUILD` is a `-bin` package pointing at GitHub release tarballs.
   A from-source PKGBUILD would need Zig 0.16 and a vendored Cargo registry
   inside the makepkg sandbox.
-- `lintian` and `rpmlint` are advisory here; neither package has been through a
+- `lintian` and `rpmlint` are advisory here; the package has not been through a
   distro archive review.

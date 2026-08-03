@@ -10,44 +10,25 @@ source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 
 detect_arch
 need dpkg-deb
-# Package identity is parameterised so the same script builds the core package
-# and the separate GTK frontend package.
-DEB_PKG_NAME="${CMUX_PKG_NAME:-$PKG_NAME}"
+DEB_PKG_NAME="$PKG_NAME"
 STAGE="${CMUX_STAGE:-$BUILD_DIR/stage}"
 VERSION="$(resolve_version)"
 OUT_DIR="$BUILD_DIR/dist"
 DEB_VERSION="${VERSION}-1"
 
-# Per-package metadata. The GTK frontend is its own package so a headless
-# install never pulls GTK4 in.
-if [ "$DEB_PKG_NAME" = "$PKG_NAME-gtk" ]; then
-  DEB_SUMMARY="GTK4 frontend for the cmux terminal multiplexer"
-  DEB_EXTRA_FIELDS="Recommends: $PKG_NAME
-"
-  DEB_DESCRIPTION=" A GTK4 window onto a running cmux session: it lists the session's
- workspaces, renders a terminal from the server's styled render stream, and
- sends input back.
- .
- It contains no terminal emulator. The cmux server is the only VT
- implementation; this package draws the styled runs it sends.
- .
- It needs a cmux session to attach to, which the cmux package provides."
-else
-  DEB_SUMMARY="$PKG_SUMMARY"
-  DEB_EXTRA_FIELDS="Suggests: python3-nautilus
-"
-  DEB_DESCRIPTION=" cmux keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
+DEB_SUMMARY="$PKG_SUMMARY"
+DEB_DESCRIPTION=" cmux keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
  terminals and browsers, and exposes them through a noun-first CLI and a
  terminal UI. Terminal emulation is handled by libghostty-vt.
  .
  This package is built from the cmux for linux fork and ships the
- cmux-tui multiplexer, the cmux-relay transport primitive, a man page, shell
- completions, a desktop entry, and \"New cmux window here\" / \"New cmux
- workspace here\" context-menu entries for Nautilus, Nemo, Dolphin and Caja.
+ cmux-tui multiplexer, the cmux-relay transport primitive, the cmux-gtk GTK4
+ frontend, a man page, shell completions, TUI and GUI desktop entries, and
+ \"New cmux window here\" / \"New cmux workspace here\" context-menu entries
+ for Nautilus, Nemo, Dolphin and Caja.
  .
  The Nautilus entries need python3-nautilus; without it the extension file is
  simply never loaded."
-fi
 
 [ -d "$STAGE/usr/bin" ] || die "no staged tree at $STAGE — run packaging/linux/stage-tree.sh first"
 
@@ -63,13 +44,13 @@ mkdir -p "$work/DEBIAN"
 rm -rf "$work/usr/share/licenses"
 
 # Resolve the runtime dependency line.
-depends="libc6 (>= 2.34)"
+depends="libc6 (>= 2.34), libgtk-4-1"
 if command -v dpkg-shlibdeps >/dev/null 2>&1; then
   log "resolving shared library dependencies with dpkg-shlibdeps"
   mkdir -p "$work/debian"
   : > "$work/debian/control"
   if resolved="$(cd "$work" && dpkg-shlibdeps -O --ignore-missing-info \
-      $(cd "$work" && find usr/bin -type f -perm -u+x | tr '\n' ' ') 2>/dev/null)"; then
+      usr/bin/cmux-tui usr/bin/cmux-relay usr/bin/cmux-gtk 2>/dev/null)"; then
     resolved="${resolved#shlibs:Depends=}"
     [ -n "$resolved" ] && depends="$resolved"
   else
@@ -88,9 +69,13 @@ Architecture: $DEB_ARCH
 Maintainer: $PKG_MAINTAINER
 Installed-Size: $installed_size
 Depends: $depends
+Conflicts: cmux-gtk
+Replaces: cmux-gtk
+Provides: cmux-gtk
 Section: utils
 Priority: optional
-${DEB_EXTRA_FIELDS}Homepage: $PKG_HOMEPAGE
+Suggests: python3-nautilus
+Homepage: $PKG_HOMEPAGE
 Description: ${DEB_SUMMARY}
 ${DEB_DESCRIPTION}
 EOF

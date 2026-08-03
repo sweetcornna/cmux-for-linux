@@ -7,7 +7,7 @@ PKG_NAME="cmux"
 PKG_MAINTAINER="cmux for linux <travon_evenietyku@sanfranmail.com>"
 PKG_HOMEPAGE="https://github.com/sweetcornna/cmux-for-linux"
 PKG_LICENSE="GPL-3.0-or-later"
-PKG_SUMMARY="Terminal multiplexer TUI for AI coding agents, backed by libghostty-vt"
+PKG_SUMMARY="Terminal multiplexer with TUI and GTK4 frontends for AI coding agents"
 
 # Repo root: packaging/linux/lib/common.sh -> ../../..
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
