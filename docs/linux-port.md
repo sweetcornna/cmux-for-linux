@@ -124,7 +124,7 @@ paths this fork builds from:
 
 ```bash
 packaging/linux/sync-upstream.sh              # from upstream/main
-packaging/linux/sync-upstream.sh cmux-tui-v1.0.0
+packaging/linux/sync-upstream.sh cmux-tui-v1.0.0   # any upstream revision
 packaging/linux/build-all.sh                  # re-verify before committing
 ```
 

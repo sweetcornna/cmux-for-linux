@@ -3,7 +3,7 @@
 # Upstream `main` ships the cmux TUI only through npm and PyPI. This workflow
 # builds the distro-native formats — .deb, .rpm, AUR directory, AppImage and a
 # portable tarball — for x86_64 and aarch64, and publishes them on
-# `cmux-tui-v*` tags.
+# `linux-v*` tags.
 #
 # This workflow belongs to the fork only. Upstream's own macOS and iOS
 # workflows were removed along with the code they built.
@@ -13,7 +13,7 @@ name: linux-packages
 on:
   push:
     branches: [linux]
-    tags: ['cmux-tui-v*']
+    tags: ['linux-v*']
     paths:
       - 'cmux-tui/**'
       - 'packaging/linux/**'
@@ -28,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Override the package version (default: derive from the nearest cmux-tui-v* tag)'
+        description: 'Override the package version (default: derive from the nearest linux-v* tag)'
         required: false
         type: string
 
@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # ghostty supplies libghostty-vt; fetch-depth 0 lets resolve_version
-          # see the nearest cmux-tui-v* tag.
+          # see the nearest linux-v* tag.
           submodules: false
           fetch-depth: 0
 
@@ -117,38 +117,69 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cmux-linux-${{ matrix.arch }}
-          path: |
-            build/linux/dist/*
-            build/linux/aur/PKGBUILD
+          # The AUR PKGBUILD is deliberately not uploaded here. build-aur.sh
+          # can only fill in the sha256 of tarballs present on the machine, so
+          # a per-arch PKGBUILD would carry 'SKIP' for the other architecture.
+          # The release job renders it once, after both tarballs exist.
+          path: build/linux/dist/*
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Publish release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/cmux-tui-v')
+    if: startsWith(github.ref, 'refs/tags/linux-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      # The packaging scripts are needed to render the AUR PKGBUILD; the
+      # binaries themselves come from the build jobs.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
+      - name: Collect artifacts
+        run: |
+          mkdir -p build/linux/dist
+          # upload-artifact preserved the build/linux/dist prefix inside each
+          # artifact; flatten both architectures into one directory.
+          find artifacts -type f -exec cp -n {} build/linux/dist/ \;
+          ls -la build/linux/dist
+
+      - name: Render the AUR PKGBUILD with both architectures' digests
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          CMUX_VERSION="${TAG_NAME#linux-v}" packaging/linux/build-aur.sh
+          cp build/linux/aur/PKGBUILD build/linux/dist/PKGBUILD
+          grep '^sha256sums' build/linux/dist/PKGBUILD
+          # A digest left as SKIP means a tarball was missing; that PKGBUILD
+          # would silently skip integrity checking for that architecture.
+          if grep -q "^sha256sums.*'SKIP'" build/linux/dist/PKGBUILD; then
+            echo "::error::PKGBUILD still contains a SKIP digest" >&2
+            exit 1
+          fi
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          find artifacts -type f -print
-          gh release create "$tag" \
+          find build/linux/dist -type f -print
+          gh release create "$TAG_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "cmux Linux packages $tag" \
+            --title "cmux for linux $TAG_NAME" \
             --notes "Native Linux packages built from the cmux for linux fork.
 
           Formats: \`.deb\`, \`.rpm\`, AppImage, portable tarball, and the AUR \`PKGBUILD\`.
           Every artifact has a matching \`.sha256\`.
 
           These packages ship the Rust \`cmux-tui\` multiplexer and \`cmux-relay\`. The macOS
-          Swift application is not part of them." \
-            $(find artifacts -type f | sort)
+          Swift application is not part of this fork." \
+            $(find build/linux/dist -type f | sort)

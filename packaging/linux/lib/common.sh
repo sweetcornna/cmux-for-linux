@@ -24,20 +24,24 @@ need() {
 
 # Resolve the version for this build.
 #   CMUX_VERSION=... overrides everything.
-#   Otherwise derive from the most recent cmux-tui-vX.Y.Z tag, plus a commit
+#   Otherwise derive from the most recent linux-vX.Y.Z tag, plus a commit
 #   suffix when HEAD is not exactly on that tag.
+#
+# The fork versions its packaging independently and owns the linux-v* tag
+# namespace. Upstream's cmux-tui-v* and v* tags are deliberately not matched:
+# sync-upstream.sh fetches upstream tags, so a shared namespace would collide.
 resolve_version() {
   if [ -n "${CMUX_VERSION:-}" ]; then
     printf '%s' "$CMUX_VERSION"
     return
   fi
   local desc
-  if desc="$(git -C "$REPO_ROOT" describe --tags --match 'cmux-tui-v*' --always 2>/dev/null)"; then
+  if desc="$(git -C "$REPO_ROOT" describe --tags --match 'linux-v*' --always 2>/dev/null)"; then
     case "$desc" in
-      cmux-tui-v*)
-        # cmux-tui-v1.2.3           -> 1.2.3
-        # cmux-tui-v1.2.3-4-gabcdef -> 1.2.3+4.gabcdef
-        printf '%s' "${desc#cmux-tui-v}" | sed -E 's/-([0-9]+)-g([0-9a-f]+)$/+\1.g\2/'
+      linux-v*)
+        # linux-v1.2.3           -> 1.2.3
+        # linux-v1.2.3-4-gabcdef -> 1.2.3+4.gabcdef
+        printf '%s' "${desc#linux-v}" | sed -E 's/-([0-9]+)-g([0-9a-f]+)$/+\1.g\2/'
         return
         ;;
     esac

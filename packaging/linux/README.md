@@ -42,7 +42,7 @@ packaging/linux/build-all.sh
 # one format, reusing binaries already built
 CMUX_SKIP_BUILD=1 packaging/linux/build-all.sh deb
 
-# pin the version instead of deriving it from the nearest cmux-tui-v* tag
+# pin the version instead of deriving it from the nearest linux-v* tag
 CMUX_VERSION=0.64.21 packaging/linux/build-all.sh
 ```
 
@@ -71,15 +71,25 @@ identical across them and only packaging metadata differs.
 
 ## Versioning
 
-`resolve_version` in `lib/common.sh` derives the version from the nearest
-`cmux-tui-v*` tag:
+This fork versions its packaging independently of upstream, in its own
+`linux-v*` tag namespace. Upstream's `cmux-tui-v*` and `v*` tags are left
+alone: `sync-upstream.sh` fetches upstream tags, so a shared namespace would
+eventually collide.
 
-- exactly on `cmux-tui-v1.2.3` → `1.2.3`
+`resolve_version` in `lib/common.sh` derives the version from the nearest
+`linux-v*` tag:
+
+- exactly on `linux-v1.2.3` → `1.2.3`
 - three commits past it → `1.2.3+3.gabc1234`
 - no tag reachable → `0.0.0+g<sha>`
 
 `CMUX_VERSION` overrides it. The `.deb` appends `-1` as the Debian revision;
 the `.rpm` replaces any `-` with `.` because RPM forbids it in `Version`.
+
+Pushing a `linux-v*` tag is what publishes a release: CI builds both
+architectures, renders the AUR `PKGBUILD` with the real digests for each, and
+creates the GitHub Release. Keep tag versions free of `-` and `+` — Arch
+rejects `-` in `pkgver`, and `+` becomes `%2B` in download URLs.
 
 ## Known gaps
 

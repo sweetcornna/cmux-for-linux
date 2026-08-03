@@ -20,8 +20,8 @@ provides=('cmux' 'cmux-tui')
 conflicts=('cmux' 'cmux-tui')
 options=('!strip' '!debug')
 
-source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/cmux-tui-v$pkgver/$_pkgname-$pkgver-linux-x86_64.tar.gz")
-source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/cmux-tui-v$pkgver/$_pkgname-$pkgver-linux-aarch64.tar.gz")
+source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/linux-v$pkgver/$_pkgname-$pkgver-linux-x86_64.tar.gz")
+source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/linux-v$pkgver/$_pkgname-$pkgver-linux-aarch64.tar.gz")
 
 # Replaced by packaging/linux/build-aur.sh with the real digests at release time.
 sha256sums_x86_64=('SKIP')
