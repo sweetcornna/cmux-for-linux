@@ -3732,6 +3732,45 @@ final class NewBrowserWorkspaceCreationTests: XCTestCase {
     }
 }
 
+@MainActor
+final class CodeWorkspaceCreationTests: XCTestCase {
+    func testCodeInitialSurfaceBootsCodePane() throws {
+        let manager = TabManager()
+
+        let workspace = manager.addWorkspace(initialSurface: .code)
+        let browserPanel = try XCTUnwrap(workspace.panels.values.first as? BrowserPanel)
+
+        XCTAssertEqual(workspace.panels.count, 1)
+        XCTAssertEqual(browserPanel.purpose, .code)
+        XCTAssertEqual(browserPanel.currentURL, CodeSidecarService.launcherURL())
+        XCTAssertFalse(browserPanel.isOmnibarVisible)
+        XCTAssertEqual(workspace.contextualSurfaceCreationKind, .code)
+        XCTAssertEqual(workspace.title, String(localized: "workspace.code.defaultTitle", defaultValue: "Code"))
+    }
+
+    func testContextualTabAndSplitCreationPreserveCodeKind() throws {
+        let manager = TabManager(initialSurface: .code)
+        let workspace = try XCTUnwrap(manager.selectedWorkspace)
+
+        manager.newSurface()
+        let tabPanel = try XCTUnwrap(workspace.focusedPanelId.flatMap { workspace.panels[$0] } as? BrowserPanel)
+        XCTAssertEqual(tabPanel.purpose, .code)
+
+        let splitID = try XCTUnwrap(manager.createSplit(direction: .right))
+        let splitPanel = try XCTUnwrap(workspace.panels[splitID] as? BrowserPanel)
+        XCTAssertEqual(splitPanel.purpose, .code)
+        let browserPanels = workspace.panels.values.compactMap { $0 as? BrowserPanel }
+        XCTAssertEqual(browserPanels.count, 3)
+        XCTAssertTrue(browserPanels.allSatisfy { $0.purpose == .code })
+
+        let appDelegate = AppDelegate.shared ?? AppDelegate()
+        XCTAssertTrue(appDelegate.performContextualNewWorkspaceAction(tabManager: manager))
+        let newWorkspace = try XCTUnwrap(manager.selectedWorkspace)
+        let workspacePanel = try XCTUnwrap(newWorkspace.panels.values.first as? BrowserPanel)
+        XCTAssertEqual(workspacePanel.purpose, .code)
+    }
+}
+
 
 final class WorkspaceTabColorSettingsTests: XCTestCase {
     func testNormalizedHexAcceptsAndNormalizesValidInput() {

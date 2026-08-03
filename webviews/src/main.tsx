@@ -1,6 +1,12 @@
-type WebviewKind = "agent-session" | "diff";
+type WebviewKind = "agent-session" | "code" | "diff";
 
 function resolveWebviewKind(): WebviewKind {
+  if (
+    document.documentElement.dataset.cmuxWebviewKind === "code" ||
+    document.body.dataset.cmuxWebviewKind === "code"
+  ) {
+    return "code";
+  }
   if (
     document.documentElement.dataset.cmuxWebviewKind === "agent-session" ||
     document.body.dataset.cmuxWebviewKind === "agent-session" ||
@@ -20,7 +26,12 @@ if (!rootElement) {
 // viewer pulls in `@pierre/diffs`, the agent session pulls in its editor UI,
 // and neither pays for the other. Shared vendor code (React, the router) is
 // hoisted by Rollup into chunks both surfaces reuse.
-if (resolveWebviewKind() === "agent-session") {
+const webviewKind = resolveWebviewKind();
+if (webviewKind === "code") {
+  void import("./surfaces/codeSurface").then((surface) => {
+    surface.mountCodeSurface(rootElement);
+  });
+} else if (webviewKind === "agent-session") {
   void import("./surfaces/agentSessionSurface").then((surface) => {
     surface.mountAgentSessionSurface(rootElement);
   });

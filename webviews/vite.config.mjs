@@ -22,11 +22,11 @@ export default defineConfig({
     minify: "esbuild",
     outDir,
     // The macOS app supplies its own host HTML (the CLI builds the diff viewer
-    // page; build-webviews-app.sh writes agent-session.html) and loads
+    // page; build-webviews-app.sh writes agent-session.html and code.html) and loads
     // `main.mjs` as the module entry, so there is no Vite HTML entry. We drive
     // the build from a single JS entry via `rollupOptions.input` instead of
     // library mode. Dropping `build.lib` + `inlineDynamicImports` lets Rollup
-    // split each surface (diff viewer vs agent session) and shared vendor code
+    // split each surface (diff viewer, agent session, and code launcher) and shared vendor code
     // into separate chunks that load on demand via relative `import()`. Both
     // serving paths already handle sibling chunks: the diff viewer custom
     // scheme registers every emitted `.js`/`.mjs`, and the agent-session file
