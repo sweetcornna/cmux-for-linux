@@ -1,0 +1,9 @@
+[Nemo Action]
+Name=New cmux window here
+Comment=Open a terminal running cmux in this folder
+Exec=cmux-open-here window %F
+Icon-Name=utilities-terminal
+Selection=none
+Extensions=dir;
+EscapeSpaces=true
+Quote=double

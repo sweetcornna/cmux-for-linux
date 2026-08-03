@@ -21,6 +21,9 @@ Source0:        %{cmux_stage_tar}
 
 BuildRequires:  tar
 Requires:       glibc
+# The Nautilus context-menu entries need nautilus-python; the extension file
+# is inert without it, so this stays a weak dependency.
+Suggests:       nautilus-python
 
 %description
 cmux keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
@@ -54,6 +57,21 @@ test -x %{buildroot}%{_bindir}/cmux-relay
 %{_bindir}/cmux
 %{_bindir}/cmux-tui
 %{_bindir}/cmux-relay
+%{_bindir}/cmux-open-here
+# File-manager context menus. The parent directories are co-owned so the
+# package is installable whether or not the matching file manager is present.
+%dir %{_datadir}/nautilus-python
+%dir %{_datadir}/nautilus-python/extensions
+%{_datadir}/nautilus-python/extensions/cmux.py
+%dir %{_datadir}/kio/servicemenus
+%{_datadir}/kio/servicemenus/cmux-open-here.desktop
+%dir %{_datadir}/file-manager
+%dir %{_datadir}/file-manager/actions
+%{_datadir}/file-manager/actions/cmux-open-here.desktop
+%dir %{_datadir}/nemo
+%dir %{_datadir}/nemo/actions
+%{_datadir}/nemo/actions/cmux-window.nemo_action
+%{_datadir}/nemo/actions/cmux-workspace.nemo_action
 %{_datadir}/applications/cmux.desktop
 %{_datadir}/icons/hicolor/*/apps/cmux.png
 %{_mandir}/man1/cmux.1*

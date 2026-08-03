@@ -29,12 +29,17 @@ fi
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
-FILES="bin/cmux bin/cmux-tui bin/cmux-relay
+FILES="bin/cmux bin/cmux-tui bin/cmux-relay bin/cmux-open-here
 share/applications/cmux.desktop
 share/man/man1/cmux.1.gz
 share/bash-completion/completions/cmux
 share/zsh/site-functions/_cmux
-share/fish/vendor_completions.d/cmux.fish"
+share/fish/vendor_completions.d/cmux.fish
+share/nautilus-python/extensions/cmux.py
+share/kio/servicemenus/cmux-open-here.desktop
+share/file-manager/actions/cmux-open-here.desktop
+share/nemo/actions/cmux-window.nemo_action
+share/nemo/actions/cmux-workspace.nemo_action"
 
 if [ "$UNINSTALL" = 1 ]; then
   echo "removing cmux from $PREFIX"

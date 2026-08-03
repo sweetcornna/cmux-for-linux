@@ -16,6 +16,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/sweetcornna/cmux-for-linux"
 license=('GPL-3.0-or-later')
 depends=('glibc')
+optdepends=('python-nautilus: "New cmux window/workspace here" in Nautilus')
 provides=('cmux' 'cmux-tui')
 conflicts=('cmux' 'cmux-tui')
 options=('!strip' '!debug')
@@ -30,9 +31,23 @@ sha256sums_aarch64=('SKIP')
 package() {
   local src="$srcdir/$_pkgname-$pkgver-linux-$CARCH"
 
-  install -Dm0755 "$src/bin/cmux-tui"   "$pkgdir/usr/bin/cmux-tui"
-  install -Dm0755 "$src/bin/cmux-relay" "$pkgdir/usr/bin/cmux-relay"
+  install -Dm0755 "$src/bin/cmux-tui"       "$pkgdir/usr/bin/cmux-tui"
+  install -Dm0755 "$src/bin/cmux-relay"     "$pkgdir/usr/bin/cmux-relay"
+  install -Dm0755 "$src/bin/cmux-open-here" "$pkgdir/usr/bin/cmux-open-here"
   ln -sf cmux-tui "$pkgdir/usr/bin/cmux"
+
+  # File-manager context menus.
+  install -Dm0644 "$src/share/nautilus-python/extensions/cmux.py" \
+    "$pkgdir/usr/share/nautilus-python/extensions/cmux.py"
+  install -Dm0644 "$src/share/kio/servicemenus/cmux-open-here.desktop" \
+    "$pkgdir/usr/share/kio/servicemenus/cmux-open-here.desktop"
+  install -Dm0644 "$src/share/file-manager/actions/cmux-open-here.desktop" \
+    "$pkgdir/usr/share/file-manager/actions/cmux-open-here.desktop"
+  local action
+  for action in cmux-window cmux-workspace; do
+    install -Dm0644 "$src/share/nemo/actions/$action.nemo_action" \
+      "$pkgdir/usr/share/nemo/actions/$action.nemo_action"
+  done
 
   install -Dm0644 "$src/share/applications/cmux.desktop" \
     "$pkgdir/usr/share/applications/cmux.desktop"

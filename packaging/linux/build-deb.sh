@@ -56,6 +56,7 @@ Installed-Size: $installed_size
 Depends: $depends
 Section: utils
 Priority: optional
+Suggests: python3-nautilus
 Homepage: $PKG_HOMEPAGE
 Description: $PKG_SUMMARY
  cmux keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
@@ -64,7 +65,11 @@ Description: $PKG_SUMMARY
  .
  This package is built from the cmux for linux fork and ships the
  cmux-tui multiplexer, the cmux-relay transport primitive, a man page, shell
- completions and a desktop entry.
+ completions, a desktop entry, and "New cmux window here" / "New cmux
+ workspace here" context-menu entries for Nautilus, Nemo, Dolphin and Caja.
+ .
+ The Nautilus entries need python3-nautilus; without it the extension file is
+ simply never loaded.
 EOF
 
 # md5sums over every regular file outside DEBIAN, in a stable order.

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# Open a folder in cmux, from a file manager's context menu.
+#
+#   cmux-open-here window <path>      new terminal window running cmux there
+#   cmux-open-here workspace <path>   new workspace in the running session
+#
+# Every file-manager integration this package ships calls this script, so the
+# behaviour stays identical across Nautilus, Nemo, Dolphin and Caja.
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: cmux-open-here <window|workspace> <directory>
+
+  window     Launch a terminal in <directory> running cmux.
+  workspace  Create a workspace in the running cmux session, with its terminal
+             in <directory>. Falls back to `window` when no session is running.
+
+Environment:
+  CMUX_SESSION            session name (default: main)
+  CMUX_TERMINAL           terminal command to use instead of autodetection
+EOF
+  exit 2
+}
+
+[ $# -eq 2 ] || usage
+mode="$1"
+dir="$2"
+session="${CMUX_SESSION:-main}"
+
+[ -d "$dir" ] || { echo "not a directory: $dir" >&2; exit 1; }
+
+cmux_bin="$(command -v cmux || true)"
+[ -n "$cmux_bin" ] || { echo "cmux is not on PATH" >&2; exit 1; }
+
+# Launch a terminal emulator in $dir. xdg-terminal-exec is the freedesktop
+# spec tool that resolves the user's preferred terminal, so it is tried first;
+# the rest is a fallback chain for systems that do not ship it.
+# Detach the terminal so the file manager's spawned helper exits immediately
+# instead of living as long as the window it opened.
+spawn() {
+  local target_dir="$1"
+  shift
+  ( cd "$target_dir" && setsid "$@" >/dev/null 2>&1 < /dev/null & )
+}
+
+open_terminal() {
+  local target_dir="$1"
+  shift
+
+  if [ -n "${CMUX_TERMINAL:-}" ]; then
+    # Deliberately unquoted: CMUX_TERMINAL may carry its own arguments.
+    # shellcheck disable=SC2086
+    spawn "$target_dir" $CMUX_TERMINAL "$@"
+    return
+  fi
+
+  if command -v xdg-terminal-exec >/dev/null 2>&1; then
+    spawn "$target_dir" xdg-terminal-exec "$@"
+    return
+  fi
+
+  local term
+  for term in x-terminal-emulator ghostty kgx ptyxis gnome-terminal konsole \
+              alacritty kitty wezterm foot xfce4-terminal tilix xterm; do
+    command -v "$term" >/dev/null 2>&1 || continue
+    case "$term" in
+      # gnome-terminal takes the command after --; the rest use -e.
+      gnome-terminal) spawn "$target_dir" gnome-terminal -- "$@" ;;
+      *)              spawn "$target_dir" "$term" -e "$@" ;;
+    esac
+    return
+  done
+
+  echo "no terminal emulator found; set CMUX_TERMINAL" >&2
+  exit 1
+}
+
+open_window() {
+  open_terminal "$dir" "$cmux_bin" --session "$session"
+}
+
+# True when the session's control socket answers.
+session_is_running() {
+  cmux --session "$session" session current show >/dev/null 2>&1
+}
+
+# True when some client other than this CLI invocation is attached. A workspace
+# created in a session nobody is looking at would be invisible, so the caller
+# opens a window in that case.
+session_has_viewer() {
+  cmux --session "$session" client list --json 2>/dev/null \
+    | grep -q '"self":false'
+}
+
+open_workspace() {
+  if ! session_is_running; then
+    open_window
+    return
+  fi
+
+  local name created terminal_id
+  name="$(basename -- "$dir")"
+
+  # `workspace create` has no --cwd flag, so the workspace is created first and
+  # its terminal is then moved into the folder. Using the shell's own cd keeps
+  # this working for any login shell without assuming one.
+  created="$(cmux --session "$session" workspace create --name "$name" --json)" || {
+    echo "could not create workspace in session '$session'" >&2
+    exit 1
+  }
+
+  terminal_id="$(printf '%s' "$created" \
+    | sed -n 's/.*"terminal_id":"\([^"]*\)".*/\1/p')"
+
+  if [ -n "$terminal_id" ]; then
+    # Single-quote the path for the shell, escaping any embedded single quote.
+    local quoted
+    quoted="'$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")'"
+    cmux --session "$session" terminal "$terminal_id" write \
+      --text "cd $quoted"$'\n' >/dev/null 2>&1 || true
+  fi
+
+  session_has_viewer || open_window
+}
+
+case "$mode" in
+  window)    open_window ;;
+  workspace) open_workspace ;;
+  *)         usage ;;
+esac

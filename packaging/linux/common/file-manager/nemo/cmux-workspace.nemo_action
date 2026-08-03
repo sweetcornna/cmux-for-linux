@@ -1,0 +1,9 @@
+[Nemo Action]
+Name=New cmux workspace here
+Comment=Create a cmux workspace for this folder in the running session
+Exec=cmux-open-here workspace %F
+Icon-Name=tab-new
+Selection=none
+Extensions=dir;
+EscapeSpaces=true
+Quote=double

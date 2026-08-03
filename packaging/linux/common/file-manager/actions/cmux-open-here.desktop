@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Action
+Name=cmux
+Icon=cmux
+Profiles=cmux-window;cmux-workspace;
+# DES-EMA (file-manager/actions) is read by Caja, and by Nautilus/Nemo builds
+# with the actions extension. Desktops that ignore it simply skip this file.
+
+[X-Action-Profile cmux-window]
+Name=New cmux window here
+Icon=utilities-terminal
+Exec=cmux-open-here window %d/%b
+MimeTypes=inode/directory;
+
+[X-Action-Profile cmux-workspace]
+Name=New cmux workspace here
+Icon=tab-new
+Exec=cmux-open-here workspace %d/%b
+MimeTypes=inode/directory;

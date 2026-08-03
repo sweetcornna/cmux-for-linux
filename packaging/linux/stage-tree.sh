@@ -37,6 +37,24 @@ install -m 0755 "$BUILD_DIR/bin/cmux-tui" "$STAGE/usr/bin/cmux-tui"
 install -m 0755 "$BUILD_DIR/bin/cmux-relay" "$STAGE/usr/bin/cmux-relay"
 ln -sf cmux-tui "$STAGE/usr/bin/cmux"
 
+# Helper behind every file-manager context-menu entry.
+install -m 0755 "$PKG_DIR/common/cmux-open-here" "$STAGE/usr/bin/cmux-open-here"
+
+# File-manager integration. Each desktop reads a different location and
+# ignores the others, so all four ship unconditionally; none of them costs
+# more than a few hundred bytes and none of them is loaded by a file manager
+# that does not understand it.
+install -D -m 0644 "$PKG_DIR/common/file-manager/nautilus/cmux.py" \
+  "$STAGE/usr/share/nautilus-python/extensions/cmux.py"
+install -D -m 0644 "$PKG_DIR/common/file-manager/kde/cmux-open-here.desktop" \
+  "$STAGE/usr/share/kio/servicemenus/cmux-open-here.desktop"
+install -D -m 0644 "$PKG_DIR/common/file-manager/actions/cmux-open-here.desktop" \
+  "$STAGE/usr/share/file-manager/actions/cmux-open-here.desktop"
+for action in cmux-window cmux-workspace; do
+  install -D -m 0644 "$PKG_DIR/common/file-manager/nemo/$action.nemo_action" \
+    "$STAGE/usr/share/nemo/actions/$action.nemo_action"
+done
+
 # Desktop entry + icons.
 install -m 0644 "$PKG_DIR/common/cmux.desktop" "$STAGE/usr/share/applications/cmux.desktop"
 for size in 16 32 128 256 512; do

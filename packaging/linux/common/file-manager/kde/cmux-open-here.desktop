@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin,inode/directory
+MimeType=inode/directory;
+Actions=cmuxWindow;cmuxWorkspace;
+X-KDE-Priority=TopLevel
+X-KDE-Submenu=cmux
+Icon=cmux
+
+[Desktop Action cmuxWindow]
+Name=New cmux window here
+Icon=utilities-terminal
+Exec=cmux-open-here window %f
+
+[Desktop Action cmuxWorkspace]
+Name=New cmux workspace here
+Icon=tab-new
+Exec=cmux-open-here workspace %f
