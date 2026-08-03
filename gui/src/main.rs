@@ -8,6 +8,7 @@
 //! and forwards input; it contains no VT parser and links no terminal
 //! emulation library.
 
+mod config;
 mod screen;
 mod session;
 mod view;
@@ -16,12 +17,14 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use cmux::{InputModifier, MouseButton, TerminalId, TerminalMouseKind, TerminalMouseOptions};
 use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, DrawingArea, EventControllerKey,
-    EventControllerScroll, EventControllerScrollFlags, GestureClick, GestureDrag, HeaderBar, Label,
-    ListBox, ListBoxRow, Orientation, Paned, ScrolledWindow, SelectionMode,
+    EventControllerMotion, EventControllerScroll, EventControllerScrollFlags, GestureClick,
+    GestureDrag, HeaderBar, Label, ListBox, ListBoxRow, Orientation, Paned, ScrolledWindow,
+    SelectionMode,
 };
 
 use screen::ScreenSet;
@@ -29,6 +32,13 @@ use session::{AttachmentSpec, Control, Input, Update, Worker};
 
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
+
+struct MouseTarget {
+    terminal: TerminalId,
+    row: u16,
+    column: u16,
+    can_scroll_locally: bool,
+}
 
 struct Args {
     session: String,
@@ -134,8 +144,13 @@ fn main() -> gtk4::glib::ExitCode {
     application.run_with_args::<&str>(&[])
 }
 
-fn sync_attachments(worker: &Worker, screens: &ScreenSet, terminal: &DrawingArea) {
-    let metrics = view::cell_metrics(terminal);
+fn sync_attachments(
+    worker: &Worker,
+    screens: &ScreenSet,
+    terminal: &DrawingArea,
+    theme: &view::Theme,
+) {
+    let metrics = view::cell_metrics(terminal, theme);
     let specs = view::visible_terminal_sizes(screens, metrics, terminal.width(), terminal.height())
         .into_iter()
         .map(|(terminal, size)| AttachmentSpec { terminal, size })
@@ -143,8 +158,68 @@ fn sync_attachments(worker: &Worker, screens: &ScreenSet, terminal: &DrawingArea
     let _ = worker.control.send(Control::SyncAttachments(specs));
 }
 
+fn mouse_target(
+    screens: &ScreenSet,
+    terminal: &DrawingArea,
+    metrics: view::CellMetrics,
+    x: f64,
+    y: f64,
+) -> Option<MouseTarget> {
+    let pane = view::pane_geometries(screens, metrics, terminal.width(), terminal.height())
+        .into_iter()
+        .find(|pane| pane.content.contains(x, y) && pane.terminal.is_some())?;
+    let terminal_id = pane.terminal?;
+    let screen = screens.grids.get(&terminal_id)?;
+    let (row, column) = view::cell_at(metrics, screen.size, x - pane.content.x, y - pane.content.y);
+    Some(MouseTarget {
+        terminal: terminal_id,
+        row,
+        column: column.min(screen.size.cols.saturating_sub(1)),
+        can_scroll_locally: screen.scrollback_rows > 0 || !screen.at_bottom,
+    })
+}
+
+fn input_modifiers(state: gdk::ModifierType) -> Vec<InputModifier> {
+    let mut modifiers = Vec::new();
+    if state.contains(gdk::ModifierType::SHIFT_MASK) {
+        modifiers.push(InputModifier::Shift);
+    }
+    if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        modifiers.push(InputModifier::Control);
+    }
+    if state.contains(gdk::ModifierType::ALT_MASK) {
+        modifiers.push(InputModifier::Alt);
+    }
+    if state.intersects(
+        gdk::ModifierType::META_MASK
+            | gdk::ModifierType::SUPER_MASK
+            | gdk::ModifierType::HYPER_MASK,
+    ) {
+        modifiers.push(InputModifier::Meta);
+    }
+    modifiers
+}
+
+fn mouse_button(button: u32) -> Option<MouseButton> {
+    match button {
+        1 => Some(MouseButton::Left),
+        2 => Some(MouseButton::Middle),
+        3 => Some(MouseButton::Right),
+        _ => None,
+    }
+}
+
+fn mouse_button_held(state: gdk::ModifierType) -> bool {
+    state.intersects(
+        gdk::ModifierType::BUTTON1_MASK
+            | gdk::ModifierType::BUTTON2_MASK
+            | gdk::ModifierType::BUTTON3_MASK,
+    )
+}
+
 fn build_ui(application: &Application) {
     let args = parse_args();
+    let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let (update_tx, update_rx) = async_channel::unbounded::<Update>();
     let worker = Rc::new(session::spawn(
@@ -164,7 +239,7 @@ fn build_ui(application: &Application) {
         .child(&workspaces)
         .width_request(200)
         .build();
-    let terminal = view::build(Rc::clone(&screens));
+    let terminal = view::build(Rc::clone(&screens), Rc::clone(&theme));
 
     let status = Label::new(Some("connecting…"));
     status.set_xalign(0.0);
@@ -198,12 +273,13 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
+        let theme = Rc::clone(&theme);
         let last = Cell::new((0i32, 0i32));
         terminal.connect_resize(move |area, width, height| {
             if last.replace((width, height)) == (width, height) {
                 return;
             }
-            sync_attachments(&worker, &screens.borrow(), area);
+            sync_attachments(&worker, &screens.borrow(), area, &theme);
         });
     }
 
@@ -244,16 +320,90 @@ fn build_ui(application: &Application) {
     }
     terminal.add_controller(key_controller);
 
-    // --- scrollback -------------------------------------------------------
+    let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
+
+    // --- pointer motion ---------------------------------------------------
     {
         let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let theme = Rc::clone(&theme);
+        let pointer_for_enter = Rc::clone(&pointer);
+        let pointer_for_motion = Rc::clone(&pointer);
+        let pointer_for_leave = Rc::clone(&pointer);
+        let terminal_for_motion = terminal.clone();
+        let motion = EventControllerMotion::new();
+        motion.connect_enter(move |_, x, y| pointer_for_enter.set(Some((x, y))));
+        motion.connect_motion(move |controller, x, y| {
+            pointer_for_motion.set(Some((x, y)));
+            let state = controller.current_event_state();
+            if !mouse_button_held(state) || state.contains(gdk::ModifierType::SHIFT_MASK) {
+                return;
+            }
+            let metrics = view::cell_metrics(&terminal_for_motion, &theme);
+            let Some(target) = mouse_target(&screens.borrow(), &terminal_for_motion, metrics, x, y)
+            else {
+                return;
+            };
+            let _ = worker.input.send(Input::Mouse {
+                terminal: target.terminal,
+                options: TerminalMouseOptions {
+                    kind: TerminalMouseKind::Move,
+                    row: target.row,
+                    column: target.column,
+                    button: None,
+                    delta_rows: None,
+                    modifiers: input_modifiers(state),
+                },
+            });
+        });
+        motion.connect_leave(move |_| pointer_for_leave.set(None));
+        terminal.add_controller(motion);
+    }
+
+    // --- scrollback and application wheel input --------------------------
+    {
+        let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let theme = Rc::clone(&theme);
+        let pointer = Rc::clone(&pointer);
+        let terminal_for_scroll = terminal.clone();
         let scroll = EventControllerScroll::new(EventControllerScrollFlags::VERTICAL);
-        scroll.connect_scroll(move |_, _, delta_y| {
-            // The protocol uses positive rows for moving back into history,
-            // opposite to GDK's positive-down wheel coordinate.
-            let rows = -(delta_y.round() as i32) * SCROLL_ROWS;
-            if rows != 0 {
-                let _ = worker.input.send(Input::Scroll(rows));
+        scroll.connect_scroll(move |controller, _, delta_y| {
+            let delta_rows = (delta_y.round() as i32) * SCROLL_ROWS;
+            let Some((x, y)) = pointer.get() else {
+                return gtk4::glib::Propagation::Stop;
+            };
+            let metrics = view::cell_metrics(&terminal_for_scroll, &theme);
+            let Some(target) = mouse_target(&screens.borrow(), &terminal_for_scroll, metrics, x, y)
+            else {
+                return gtk4::glib::Propagation::Stop;
+            };
+            if delta_rows == 0 {
+                return gtk4::glib::Propagation::Stop;
+            }
+            if target.can_scroll_locally {
+                // Viewport scrolling uses positive rows for history, opposite
+                // to GDK's positive-down wheel direction.
+                let _ = worker.input.send(Input::Scroll {
+                    terminal: target.terminal,
+                    delta_rows: -delta_rows,
+                });
+            } else {
+                // The TUI can inspect its VT directly and synthesize arrows
+                // when mouse tracking is off. This client receives opaque VT
+                // state, so matching that fallback would require forbidden VT
+                // parsing; the server safely drops untracked wheel input.
+                let _ = worker.input.send(Input::Mouse {
+                    terminal: target.terminal,
+                    options: TerminalMouseOptions {
+                        kind: TerminalMouseKind::Wheel,
+                        row: target.row,
+                        column: target.column,
+                        button: None,
+                        delta_rows: Some(delta_rows),
+                        modifiers: input_modifiers(controller.current_event_state()),
+                    },
+                });
             }
             gtk4::glib::Propagation::Stop
         });
@@ -264,9 +414,15 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
+        let theme = Rc::clone(&theme);
+        let worker_for_release = Rc::clone(&worker);
+        let screens_for_release = Rc::clone(&screens);
+        let theme_for_release = Rc::clone(&theme);
         let terminal_for_click = terminal.clone();
+        let terminal_for_release = terminal.clone();
         let click = GestureClick::new();
-        click.connect_pressed(move |_, _, x, y| {
+        click.set_button(0);
+        click.connect_pressed(move |gesture, _, x, y| {
             terminal_for_click.grab_focus();
             let screens = screens.borrow();
             let Some(workspace) = screens.workspace.as_ref() else {
@@ -274,7 +430,7 @@ fn build_ui(application: &Application) {
             };
             let geometries = view::pane_geometries(
                 &screens,
-                view::cell_metrics(&terminal_for_click),
+                view::cell_metrics(&terminal_for_click, &theme),
                 terminal_for_click.width(),
                 terminal_for_click.height(),
             );
@@ -301,6 +457,60 @@ fn build_ui(application: &Application) {
                 pane: pane.pane.clone(),
                 target,
             });
+            let state = gesture.current_event_state();
+            if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                return;
+            }
+            let button_number = gesture.current_button();
+            let Some(button) = mouse_button(button_number) else {
+                return;
+            };
+            let metrics = view::cell_metrics(&terminal_for_click, &theme);
+            let Some(target) = mouse_target(&screens, &terminal_for_click, metrics, x, y) else {
+                return;
+            };
+            let _ = worker.input.send(Input::Mouse {
+                terminal: target.terminal,
+                options: TerminalMouseOptions {
+                    kind: TerminalMouseKind::Down,
+                    row: target.row,
+                    column: target.column,
+                    button: Some(button),
+                    delta_rows: None,
+                    modifiers: input_modifiers(state),
+                },
+            });
+        });
+        click.connect_released(move |gesture, _, x, y| {
+            let button_number = gesture.current_button();
+            let state = gesture.current_event_state();
+            if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                return;
+            }
+            let Some(button) = mouse_button(button_number) else {
+                return;
+            };
+            let metrics = view::cell_metrics(&terminal_for_release, &theme_for_release);
+            let Some(target) = mouse_target(
+                &screens_for_release.borrow(),
+                &terminal_for_release,
+                metrics,
+                x,
+                y,
+            ) else {
+                return;
+            };
+            let _ = worker_for_release.input.send(Input::Mouse {
+                terminal: target.terminal,
+                options: TerminalMouseOptions {
+                    kind: TerminalMouseKind::Up,
+                    row: target.row,
+                    column: target.column,
+                    button: Some(button),
+                    delta_rows: None,
+                    modifiers: input_modifiers(state),
+                },
+            });
         });
         terminal.add_controller(click);
     }
@@ -315,9 +525,10 @@ fn build_ui(application: &Application) {
         let terminal_for_begin = terminal.clone();
         let screens_for_begin = Rc::clone(&screens);
         let anchor_for_begin = Rc::clone(&anchor);
+        let theme_for_begin = Rc::clone(&theme);
         drag.connect_drag_begin(move |_, x, y| {
             terminal_for_begin.grab_focus();
-            let metrics = view::cell_metrics(&terminal_for_begin);
+            let metrics = view::cell_metrics(&terminal_for_begin, &theme_for_begin);
             let geometries = view::pane_geometries(
                 &screens_for_begin.borrow(),
                 metrics,
@@ -345,6 +556,7 @@ fn build_ui(application: &Application) {
 
         let terminal_for_update = terminal.clone();
         let anchor_for_update = Rc::clone(&anchor);
+        let theme_for_update = Rc::clone(&theme);
         drag.connect_drag_update(move |gesture, dx, dy| {
             let Some((start_x, start_y)) = gesture.start_point() else {
                 return;
@@ -352,7 +564,7 @@ fn build_ui(application: &Application) {
             let Some((terminal_id, start, content)) = anchor_for_update.borrow().clone() else {
                 return;
             };
-            let metrics = view::cell_metrics(&terminal_for_update);
+            let metrics = view::cell_metrics(&terminal_for_update, &theme_for_update);
             let mut screens = screens.borrow_mut();
             let Some(screen) = screens.grids.get_mut(&terminal_id) else {
                 return;
@@ -376,6 +588,7 @@ fn build_ui(application: &Application) {
         let entries = Rc::clone(&entries);
         let screens = Rc::clone(&screens);
         let terminal = terminal.clone();
+        let theme = Rc::clone(&theme);
         let status = status.clone();
         workspaces.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
@@ -391,7 +604,7 @@ fn build_ui(application: &Application) {
                 .and_then(|view| view.active_terminal())
                 .cloned();
             screens.borrow_mut().set_workspace(entry.view.clone());
-            sync_attachments(&worker, &screens.borrow(), &terminal);
+            sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
             terminal.queue_draw();
             let _ = worker.input.send(Input::FocusWorkspace {
                 workspace: entry.id,
@@ -411,6 +624,7 @@ fn build_ui(application: &Application) {
         let workspaces = workspaces.clone();
         let entries = Rc::clone(&entries);
         let worker = Rc::clone(&worker);
+        let theme = Rc::clone(&theme);
         gtk4::glib::spawn_future_local(async move {
             while let Ok(update) = update_rx.recv().await {
                 match update {
@@ -459,7 +673,7 @@ fn build_ui(application: &Application) {
                                 .cloned();
                             screens.borrow_mut().set_workspace(entry.view.clone());
                             let _ = worker.input.send(Input::SetTarget(target));
-                            sync_attachments(&worker, &screens.borrow(), &terminal);
+                            sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
                             if changed {
                                 let index = entries
                                     .borrow()
@@ -473,7 +687,7 @@ fn build_ui(application: &Application) {
                             }
                         } else {
                             screens.borrow_mut().set_workspace(None);
-                            sync_attachments(&worker, &screens.borrow(), &terminal);
+                            sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
                         }
                         terminal.queue_draw();
                     }

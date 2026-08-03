@@ -16,10 +16,30 @@ use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{gdk, DrawingArea};
 
+use crate::config::{Rgb, Settings};
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 
-pub const FONT: &str = "monospace 11";
 const TAB_PAD: f64 = 4.0;
+
+pub struct Theme {
+    font: pango::FontDescription,
+    border_active: Rgb,
+    border_inactive: Rgb,
+    selection_background: Rgb,
+    selection_foreground: Option<Rgb>,
+}
+
+impl Theme {
+    pub fn new(settings: Settings) -> Self {
+        Self {
+            font: pango::FontDescription::from_string(&settings.font),
+            border_active: settings.border_active,
+            border_inactive: settings.border_inactive,
+            selection_background: settings.selection_background,
+            selection_foreground: settings.selection_foreground,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CellMetrics {
@@ -70,11 +90,10 @@ pub struct PaneGeometry {
 
 /// Measures one cell from the font itself rather than assuming a size, so the
 /// grid lines up with whatever monospace face the desktop resolves.
-pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>) -> CellMetrics {
+pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetrics {
     let context = widget.as_ref().pango_context();
-    let description = pango::FontDescription::from_string(FONT);
-    context.set_font_description(Some(&description));
-    let metrics = context.metrics(Some(&description), None);
+    context.set_font_description(Some(&theme.font));
+    let metrics = context.metrics(Some(&theme.font), None);
     let width = f64::from(metrics.approximate_digit_width()) / f64::from(pango::SCALE);
     let ascent = f64::from(metrics.ascent()) / f64::from(pango::SCALE);
     let descent = f64::from(metrics.descent()) / f64::from(pango::SCALE);
@@ -440,7 +459,7 @@ fn run_colors(
     (fg, bg)
 }
 
-pub fn build(screens: Rc<RefCell<ScreenSet>>) -> DrawingArea {
+pub fn build(screens: Rc<RefCell<ScreenSet>>, theme: Rc<Theme>) -> DrawingArea {
     let area = DrawingArea::new();
     area.set_focusable(true);
     area.set_hexpand(true);
@@ -451,7 +470,7 @@ pub fn build(screens: Rc<RefCell<ScreenSet>>) -> DrawingArea {
         let _ = cr.paint();
 
         let screens = screens.borrow();
-        let metrics = cell_metrics(area);
+        let metrics = cell_metrics(area, &theme);
         let geometries = pane_geometries(&screens, metrics, width, height);
         let Some(workspace) = screens.workspace.as_ref() else {
             return;
@@ -470,7 +489,13 @@ pub fn build(screens: Rc<RefCell<ScreenSet>>) -> DrawingArea {
             cr.clip();
 
             if geometry.stack_header {
-                draw_stack_header(area, cr, workspace.pane(&geometry.pane), geometry.rect);
+                draw_stack_header(
+                    area,
+                    cr,
+                    workspace.pane(&geometry.pane),
+                    geometry.rect,
+                    &theme,
+                );
             } else if let Some(terminal) = geometry.terminal.as_ref() {
                 if let Some(screen) = screens.grids.get(terminal) {
                     let (r, g, b) = parse_color(screen.default_bg.as_str());
@@ -498,21 +523,23 @@ pub fn build(screens: Rc<RefCell<ScreenSet>>) -> DrawingArea {
                         metrics,
                         geometry.content.height,
                         geometry.pane == workspace.layout.active_pane_id,
+                        &theme,
                     );
                     let _ = cr.restore();
                 }
             } else {
-                draw_browser_placeholder(area, cr, geometry.content);
+                draw_browser_placeholder(area, cr, geometry.content, &theme);
             }
 
             if !geometry.tabs.is_empty() {
-                draw_tabs(area, cr, workspace.pane(&geometry.pane), geometry);
+                draw_tabs(area, cr, workspace.pane(&geometry.pane), geometry, &theme);
             }
             let _ = cr.restore();
             draw_border(
                 cr,
                 geometry.rect,
                 geometry.pane == workspace.layout.active_pane_id,
+                &theme,
             );
         }
     });
@@ -526,12 +553,62 @@ fn draw_grid(
     metrics: CellMetrics,
     height: f64,
     draw_selection: bool,
+    theme: &Theme,
 ) {
     if !screen.is_initialized() {
         return;
     }
-    let layout = area.create_pango_layout(None);
-    let mut description = pango::FontDescription::from_string(FONT);
+    draw_grid_backgrounds(cr, screen, metrics, height);
+    if draw_selection && screen.selection.is_some() {
+        let (r, g, b) = theme.selection_background.cairo();
+        cr.set_source_rgb(r, g, b);
+        selection_path(cr, screen, metrics);
+        let _ = cr.fill();
+    }
+    draw_grid_text(area, cr, screen, metrics, height, &theme.font, None);
+    if draw_selection && screen.selection.is_some() {
+        if let Some(foreground) = theme.selection_foreground {
+            let _ = cr.save();
+            selection_path(cr, screen, metrics);
+            cr.clip();
+            draw_grid_text(
+                area,
+                cr,
+                screen,
+                metrics,
+                height,
+                &theme.font,
+                Some(foreground),
+            );
+            let _ = cr.restore();
+        }
+    }
+
+    if let Some(cursor) = &screen.cursor {
+        if !cursor.visible {
+            return;
+        }
+        let x = f64::from(cursor.x) * metrics.width;
+        let y = f64::from(cursor.y) * metrics.height;
+        let (r, g, b) = parse_color(cursor.color.as_ref().unwrap_or(&screen.default_fg).as_str());
+        cr.set_source_rgba(r, g, b, 0.75);
+        match cursor.style {
+            RenderCursorStyle::Block => cr.rectangle(x, y, metrics.width, metrics.height),
+            RenderCursorStyle::Underline => {
+                cr.rectangle(x, y + metrics.height - 2.0, metrics.width, 2.0);
+            }
+            RenderCursorStyle::Bar => cr.rectangle(x, y, 2.0, metrics.height),
+        }
+        let _ = cr.fill();
+    }
+}
+
+fn draw_grid_backgrounds(
+    cr: &gtk4::cairo::Context,
+    screen: &Screen,
+    metrics: CellMetrics,
+    height: f64,
+) {
     for (index, row) in screen.rows.iter().enumerate() {
         let Some(row) = row else { continue };
         let y = index as f64 * metrics.height;
@@ -548,11 +625,38 @@ fn draw_grid(
                 .unwrap_or_else(|| run.text.chars().count() as u32);
             let x = f64::from(column) * metrics.width;
             let run_width = f64::from(cells) * metrics.width;
-            let (fg, bg) = run_colors(run, &screen.default_fg, &screen.default_bg);
+            let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg);
             cr.set_source_rgb(bg.0, bg.1, bg.2);
             cr.rectangle(x, y, run_width, metrics.height);
             let _ = cr.fill();
+            column += cells;
+        }
+    }
+}
 
+fn draw_grid_text(
+    area: &DrawingArea,
+    cr: &gtk4::cairo::Context,
+    screen: &Screen,
+    metrics: CellMetrics,
+    height: f64,
+    font: &pango::FontDescription,
+    foreground: Option<Rgb>,
+) {
+    let layout = area.create_pango_layout(None);
+    let mut description = font.clone();
+    for (index, row) in screen.rows.iter().enumerate() {
+        let Some(row) = row else { continue };
+        let y = index as f64 * metrics.height;
+        if y >= height {
+            break;
+        }
+        let mut column = 0u32;
+        for run in &row.runs {
+            let cells = run
+                .width_hint
+                .map(u32::from)
+                .unwrap_or_else(|| run.text.chars().count() as u32);
             if !run.has_attr(RenderRun::ATTR_INVISIBLE) && !run.text.trim().is_empty() {
                 description.set_weight(if run.has_attr(RenderRun::ATTR_BOLD) {
                     pango::Weight::Bold
@@ -578,56 +682,40 @@ fn draw_grid(
                 }
                 layout.set_attributes(Some(&attributes));
                 layout.set_text(&run.text);
-                cr.set_source_rgb(fg.0, fg.1, fg.2);
-                cr.move_to(x, y);
+                let color = foreground
+                    .map(Rgb::cairo)
+                    .unwrap_or_else(|| run_colors(run, &screen.default_fg, &screen.default_bg).0);
+                cr.set_source_rgb(color.0, color.1, color.2);
+                cr.move_to(f64::from(column) * metrics.width, y);
                 pangocairo::functions::show_layout(cr, &layout);
             }
             column += cells;
         }
     }
+}
 
-    if draw_selection && screen.selection.is_some() {
-        cr.set_source_rgba(0.35, 0.55, 0.9, 0.35);
-        for row_index in 0..screen.rows.len() {
-            let row = row_index as u16;
-            let y = row_index as f64 * metrics.height;
-            let mut run_start: Option<u16> = None;
-            for column in 0..=screen.size.cols {
-                let selected = column < screen.size.cols && screen.is_selected(row, column);
-                match (selected, run_start) {
-                    (true, None) => run_start = Some(column),
-                    (false, Some(start)) => {
-                        cr.rectangle(
-                            f64::from(start) * metrics.width,
-                            y,
-                            f64::from(column - start) * metrics.width,
-                            metrics.height,
-                        );
-                        run_start = None;
-                    }
-                    _ => {}
+fn selection_path(cr: &gtk4::cairo::Context, screen: &Screen, metrics: CellMetrics) {
+    cr.new_path();
+    for row_index in 0..screen.rows.len() {
+        let row = row_index as u16;
+        let y = row_index as f64 * metrics.height;
+        let mut run_start: Option<u16> = None;
+        for column in 0..=screen.size.cols {
+            let selected = column < screen.size.cols && screen.is_selected(row, column);
+            match (selected, run_start) {
+                (true, None) => run_start = Some(column),
+                (false, Some(start)) => {
+                    cr.rectangle(
+                        f64::from(start) * metrics.width,
+                        y,
+                        f64::from(column - start) * metrics.width,
+                        metrics.height,
+                    );
+                    run_start = None;
                 }
+                _ => {}
             }
         }
-        let _ = cr.fill();
-    }
-
-    if let Some(cursor) = &screen.cursor {
-        if !cursor.visible {
-            return;
-        }
-        let x = f64::from(cursor.x) * metrics.width;
-        let y = f64::from(cursor.y) * metrics.height;
-        let (r, g, b) = parse_color(cursor.color.as_ref().unwrap_or(&screen.default_fg).as_str());
-        cr.set_source_rgba(r, g, b, 0.75);
-        match cursor.style {
-            RenderCursorStyle::Block => cr.rectangle(x, y, metrics.width, metrics.height),
-            RenderCursorStyle::Underline => {
-                cr.rectangle(x, y + metrics.height - 2.0, metrics.width, 2.0);
-            }
-            RenderCursorStyle::Bar => cr.rectangle(x, y, 2.0, metrics.height),
-        }
-        let _ = cr.fill();
     }
 }
 
@@ -636,11 +724,11 @@ fn draw_tabs(
     cr: &gtk4::cairo::Context,
     pane: Option<&PaneView>,
     geometry: &PaneGeometry,
+    theme: &Theme,
 ) {
     let Some(pane) = pane else { return };
     let layout = area.create_pango_layout(None);
-    let description = pango::FontDescription::from_string(FONT);
-    layout.set_font_description(Some(&description));
+    layout.set_font_description(Some(&theme.font));
     layout.set_ellipsize(pango::EllipsizeMode::End);
     for (tab, hit) in pane.tabs.iter().zip(&geometry.tabs) {
         let active = pane.active_tab().is_some_and(|active| active.id == tab.id);
@@ -682,12 +770,13 @@ fn draw_stack_header(
     cr: &gtk4::cairo::Context,
     pane: Option<&PaneView>,
     rect: Rect,
+    theme: &Theme,
 ) {
     cr.set_source_rgb(0.10, 0.11, 0.13);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     let _ = cr.fill();
     let layout = area.create_pango_layout(None);
-    layout.set_font_description(Some(&pango::FontDescription::from_string(FONT)));
+    layout.set_font_description(Some(&theme.font));
     layout.set_ellipsize(pango::EllipsizeMode::End);
     layout.set_width(((rect.width - 12.0).max(1.0) * f64::from(pango::SCALE)) as i32);
     layout.set_text(pane.and_then(|pane| pane.name.as_deref()).unwrap_or("pane"));
@@ -696,24 +785,31 @@ fn draw_stack_header(
     pangocairo::functions::show_layout(cr, &layout);
 }
 
-fn draw_browser_placeholder(area: &DrawingArea, cr: &gtk4::cairo::Context, rect: Rect) {
+fn draw_browser_placeholder(
+    area: &DrawingArea,
+    cr: &gtk4::cairo::Context,
+    rect: Rect,
+    theme: &Theme,
+) {
     cr.set_source_rgb(0.075, 0.08, 0.09);
     cr.rectangle(rect.x, rect.y, rect.width, rect.height);
     let _ = cr.fill();
     let layout = area.create_pango_layout(Some("browser tab - not supported"));
-    layout.set_font_description(Some(&pango::FontDescription::from_string(FONT)));
+    layout.set_font_description(Some(&theme.font));
     cr.set_source_rgb(0.62, 0.64, 0.67);
     cr.move_to(rect.x + 12.0, rect.y + 12.0);
     pangocairo::functions::show_layout(cr, &layout);
 }
 
-fn draw_border(cr: &gtk4::cairo::Context, rect: Rect, focused: bool) {
+fn draw_border(cr: &gtk4::cairo::Context, rect: Rect, focused: bool, theme: &Theme) {
     let inset = if focused { 1.0 } else { 0.5 };
     if focused {
-        cr.set_source_rgb(0.30, 0.67, 0.86);
+        let (r, g, b) = theme.border_active.cairo();
+        cr.set_source_rgb(r, g, b);
         cr.set_line_width(2.0);
     } else {
-        cr.set_source_rgb(0.31, 0.33, 0.36);
+        let (r, g, b) = theme.border_inactive.cairo();
+        cr.set_source_rgb(r, g, b);
         cr.set_line_width(1.0);
     }
     cr.rectangle(

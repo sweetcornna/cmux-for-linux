@@ -18,7 +18,7 @@ use std::time::Duration;
 use cmux::{
     Client, Config, LayoutNode, PaneId, RenderPatch, RenderSnapshot, ScreenId, ScrollOptions,
     Selector, Size, StreamPoll, TabContentId, TabId, TerminalAttachOptions, TerminalAttachmentItem,
-    TerminalId, WorkspaceId,
+    TerminalId, TerminalMouseOptions, WorkspaceId,
 };
 
 use crate::screen::{PaneView, TabContent, TabView, WorkspaceView};
@@ -58,7 +58,14 @@ pub enum Update {
 #[derive(Debug)]
 pub enum Input {
     Bytes(Vec<u8>),
-    Scroll(i32),
+    Scroll {
+        terminal: TerminalId,
+        delta_rows: i32,
+    },
+    Mouse {
+        terminal: TerminalId,
+        options: TerminalMouseOptions,
+    },
     FocusWorkspace {
         workspace: WorkspaceId,
         target: Option<TerminalId>,
@@ -422,15 +429,21 @@ fn control_loop(
                     let _ = updates.send_blocking(Update::Error(format!("write failed: {error}")));
                 }
             }
-            Input::Scroll(delta_rows) => {
-                let Some(terminal) = target.clone() else {
-                    continue;
-                };
+            Input::Scroll {
+                terminal,
+                delta_rows,
+            } => {
                 if let Err(error) = session
                     .terminal(Selector::id(terminal))
                     .scroll(ScrollOptions { delta_rows })
                 {
                     let _ = updates.send_blocking(Update::Error(format!("scroll failed: {error}")));
+                }
+            }
+            Input::Mouse { terminal, options } => {
+                if let Err(error) = session.terminal(Selector::id(terminal)).mouse(options) {
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("mouse input failed: {error}")));
                 }
             }
             Input::FocusWorkspace {

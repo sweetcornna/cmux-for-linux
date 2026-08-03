@@ -90,6 +90,7 @@ dependencies = [
  "cmux-client",
  "gtk4",
  "pangocairo",
+ "serde_json",
 ]
 
 [[package]]
