@@ -9798,6 +9798,14 @@
               "name": "base64"
             }
           },
+          "paste": {
+            "required": false,
+            "type": {
+              "kind": "primitive",
+              "name": "boolean"
+            },
+            "description": "When true, conditionally wrap the payload for DEC private mode 2004."
+          },
           "expected_revision": {
             "required": false,
             "type": {

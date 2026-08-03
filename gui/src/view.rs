@@ -4,7 +4,7 @@
 //! overrides and inverse-video source colours. This module only places the
 //! server's layout rectangles and stamps its styled runs inside them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -20,6 +20,104 @@ use crate::config::{Rgb, Settings};
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 
 const TAB_PAD: f64 = 4.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlinkState {
+    window_active: bool,
+    phase_visible: bool,
+}
+
+impl BlinkState {
+    pub fn new(window_active: bool) -> Self {
+        Self {
+            window_active,
+            phase_visible: true,
+        }
+    }
+
+    pub fn set_window_active(&mut self, active: bool) -> bool {
+        let changed = self.window_active != active || !self.phase_visible;
+        self.window_active = active;
+        self.phase_visible = true;
+        changed
+    }
+
+    pub fn tick(&mut self, has_blinking_content: bool) -> bool {
+        if self.window_active && has_blinking_content {
+            self.phase_visible = !self.phase_visible;
+            true
+        } else if !self.phase_visible {
+            self.phase_visible = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorPresentation {
+    Hidden,
+    Solid,
+    Hollow,
+}
+
+fn cursor_presentation(
+    style: RenderCursorStyle,
+    cursor_blinks: bool,
+    blink: BlinkState,
+) -> CursorPresentation {
+    if !blink.window_active {
+        return if style == RenderCursorStyle::Block {
+            CursorPresentation::Hollow
+        } else {
+            CursorPresentation::Solid
+        };
+    }
+    if cursor_blinks && !blink.phase_visible {
+        CursorPresentation::Hidden
+    } else {
+        CursorPresentation::Solid
+    }
+}
+
+fn blinking_content_visible(blinks: bool, blink: BlinkState) -> bool {
+    !blinks || !blink.window_active || blink.phase_visible
+}
+
+pub fn needs_blink(screens: &ScreenSet) -> bool {
+    screens.grids.values().any(|screen| {
+        screen
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.visible && cursor.blink)
+            || screen.rows.iter().flatten().any(|row| {
+                row.runs.iter().any(|run| {
+                    run.has_attr(RenderRun::ATTR_BLINK) && !run.has_attr(RenderRun::ATTR_INVISIBLE)
+                })
+            })
+    })
+}
+
+#[derive(Debug, Default)]
+pub struct MouseMoveThrottle {
+    last: Option<(TerminalId, u16, u16)>,
+}
+
+impl MouseMoveThrottle {
+    pub fn should_report(&mut self, terminal: &TerminalId, row: u16, column: u16) -> bool {
+        let next = (terminal.clone(), row, column);
+        if self.last.as_ref() == Some(&next) {
+            return false;
+        }
+        self.last = Some(next);
+        true
+    }
+
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
 
 pub struct Theme {
     font: pango::FontDescription,
@@ -459,7 +557,11 @@ fn run_colors(
     (fg, bg)
 }
 
-pub fn build(screens: Rc<RefCell<ScreenSet>>, theme: Rc<Theme>) -> DrawingArea {
+pub fn build(
+    screens: Rc<RefCell<ScreenSet>>,
+    theme: Rc<Theme>,
+    blink: Rc<Cell<BlinkState>>,
+) -> DrawingArea {
     let area = DrawingArea::new();
     area.set_focusable(true);
     area.set_hexpand(true);
@@ -524,6 +626,7 @@ pub fn build(screens: Rc<RefCell<ScreenSet>>, theme: Rc<Theme>) -> DrawingArea {
                         geometry.content.height,
                         geometry.pane == workspace.layout.active_pane_id,
                         &theme,
+                        blink.get(),
                     );
                     let _ = cr.restore();
                 }
@@ -554,6 +657,7 @@ fn draw_grid(
     height: f64,
     draw_selection: bool,
     theme: &Theme,
+    blink: BlinkState,
 ) {
     if !screen.is_initialized() {
         return;
@@ -565,7 +669,7 @@ fn draw_grid(
         selection_path(cr, screen, metrics);
         let _ = cr.fill();
     }
-    draw_grid_text(area, cr, screen, metrics, height, &theme.font, None);
+    draw_grid_text(area, cr, screen, metrics, height, &theme.font, None, blink);
     if draw_selection && screen.selection.is_some() {
         if let Some(foreground) = theme.selection_foreground {
             let _ = cr.save();
@@ -579,6 +683,7 @@ fn draw_grid(
                 height,
                 &theme.font,
                 Some(foreground),
+                blink,
             );
             let _ = cr.restore();
         }
@@ -588,10 +693,20 @@ fn draw_grid(
         if !cursor.visible {
             return;
         }
+        let presentation = cursor_presentation(cursor.style, cursor.blink, blink);
+        if presentation == CursorPresentation::Hidden {
+            return;
+        }
         let x = f64::from(cursor.x) * metrics.width;
         let y = f64::from(cursor.y) * metrics.height;
         let (r, g, b) = parse_color(cursor.color.as_ref().unwrap_or(&screen.default_fg).as_str());
-        cr.set_source_rgba(r, g, b, 0.75);
+        cr.set_source_rgba(r, g, b, if blink.window_active { 0.75 } else { 0.5 });
+        if presentation == CursorPresentation::Hollow {
+            cr.set_line_width(1.0);
+            cr.rectangle(x + 0.5, y + 0.5, metrics.width - 1.0, metrics.height - 1.0);
+            let _ = cr.stroke();
+            return;
+        }
         match cursor.style {
             RenderCursorStyle::Block => cr.rectangle(x, y, metrics.width, metrics.height),
             RenderCursorStyle::Underline => {
@@ -642,6 +757,7 @@ fn draw_grid_text(
     height: f64,
     font: &pango::FontDescription,
     foreground: Option<Rgb>,
+    blink: BlinkState,
 ) {
     let layout = area.create_pango_layout(None);
     let mut description = font.clone();
@@ -657,7 +773,10 @@ fn draw_grid_text(
                 .width_hint
                 .map(u32::from)
                 .unwrap_or_else(|| run.text.chars().count() as u32);
-            if !run.has_attr(RenderRun::ATTR_INVISIBLE) && !run.text.trim().is_empty() {
+            if !run.has_attr(RenderRun::ATTR_INVISIBLE)
+                && blinking_content_visible(run.has_attr(RenderRun::ATTR_BLINK), blink)
+                && !run.text.trim().is_empty()
+            {
                 description.set_weight(if run.has_attr(RenderRun::ATTR_BOLD) {
                     pango::Weight::Bold
                 } else {
@@ -839,6 +958,22 @@ pub fn viewport_size(metrics: CellMetrics, width: f64, height: f64) -> Size {
         cols: cols.min(u32::from(u16::MAX)) as u16,
         rows: rows.min(u32::from(u16::MAX)) as u16,
     }
+}
+
+pub fn is_copy_shortcut(key: gdk::Key, state: gdk::ModifierType) -> bool {
+    state.contains(gdk::ModifierType::CONTROL_MASK)
+        && state.contains(gdk::ModifierType::SHIFT_MASK)
+        && matches!(key, gdk::Key::C | gdk::Key::c)
+}
+
+pub fn is_paste_shortcut(key: gdk::Key, state: gdk::ModifierType) -> bool {
+    state.contains(gdk::ModifierType::CONTROL_MASK)
+        && state.contains(gdk::ModifierType::SHIFT_MASK)
+        && matches!(key, gdk::Key::V | gdk::Key::v)
+}
+
+pub fn paste_payload(text: &str) -> Option<&str> {
+    (!text.is_empty()).then_some(text)
 }
 
 /// Translates a GDK key press into the bytes a PTY expects.
@@ -1039,5 +1174,66 @@ mod tests {
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
         assert_eq!(sizes[0].1, Size { cols: 50, rows: 28 });
         assert_eq!(sizes[1].1, Size { cols: 50, rows: 30 });
+    }
+
+    #[test]
+    fn clipboard_shortcuts_require_control_and_shift() {
+        let control_shift = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+        assert!(is_copy_shortcut(gdk::Key::c, control_shift));
+        assert!(is_paste_shortcut(gdk::Key::V, control_shift));
+        assert!(!is_paste_shortcut(
+            gdk::Key::v,
+            gdk::ModifierType::CONTROL_MASK
+        ));
+        assert!(!is_copy_shortcut(gdk::Key::v, control_shift));
+    }
+
+    #[test]
+    fn paste_payload_preserves_tui_input_bytes() {
+        let text = "line one\r\n\x1b[200~line two\x1b[201~";
+        assert_eq!(paste_payload(text), Some(text));
+        assert_eq!(paste_payload(""), None);
+    }
+
+    #[test]
+    fn mouse_move_throttle_reports_only_cell_changes() {
+        let first = terminal(1);
+        let second = terminal(2);
+        let mut throttle = MouseMoveThrottle::default();
+
+        assert!(throttle.should_report(&first, 2, 3));
+        assert!(!throttle.should_report(&first, 2, 3));
+        assert!(throttle.should_report(&first, 2, 4));
+        assert!(throttle.should_report(&second, 2, 4));
+        throttle.reset();
+        assert!(throttle.should_report(&second, 2, 4));
+    }
+
+    #[test]
+    fn blink_phase_and_unfocused_cursor_are_stable() {
+        let mut blink = BlinkState::new(true);
+        assert_eq!(
+            cursor_presentation(RenderCursorStyle::Block, true, blink),
+            CursorPresentation::Solid
+        );
+        assert!(blink.tick(true));
+        assert_eq!(
+            cursor_presentation(RenderCursorStyle::Block, true, blink),
+            CursorPresentation::Hidden
+        );
+        assert!(!blinking_content_visible(true, blink));
+        assert!(blinking_content_visible(false, blink));
+
+        assert!(blink.set_window_active(false));
+        assert_eq!(
+            cursor_presentation(RenderCursorStyle::Block, true, blink),
+            CursorPresentation::Hollow
+        );
+        assert_eq!(
+            cursor_presentation(RenderCursorStyle::Bar, true, blink),
+            CursorPresentation::Solid
+        );
+        assert!(blinking_content_visible(true, blink));
+        assert!(!blink.tick(true));
     }
 }

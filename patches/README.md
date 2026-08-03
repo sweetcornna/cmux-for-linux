@@ -67,3 +67,25 @@ through 80x24 → 98x36 → 54x19 → 126x45. Without it the PTY stays at whatev
 size it was created with.
 
 Like 0001, this affects any Rust SDK consumer, not just this fork.
+
+## 0003 — route a `paste` flag through `terminal.input.write`
+
+`cmux.protocol/1` had no paste operation. `Terminal::write_text` writes raw
+bytes, and `TextInputOptions` fed only the browser surface's insert-text path,
+so a protocol client could not reach the server's bracketed-paste logic. The
+server already owns that logic — `Surface::write_paste` snapshots DEC private
+mode 2004 and conditionally wraps the payload — but nothing routed to it.
+
+The patch adds an optional boolean `paste` field to the existing
+`terminal.input.write` operation (spec, catalog fingerprints, and the Rust
+SDK's `Terminal::paste`/`paste_with`), and routes `paste: true` to
+`Surface::write_paste` in the resource router. Old clients are unaffected;
+the field is optional and defaults to false.
+
+This is what `cmux-gtk` uses for `Ctrl+Shift+V`. The payload is passed
+through verbatim, matching the native TUI's own terminal paste behavior
+(`app.rs` `paste()`), which delegates all mode-2004 decisions to the server
+side of the same code path.
+
+Like 0001 and 0002, the missing paste route affects any protocol client, not
+just this fork, and is worth reporting upstream.

@@ -41,6 +41,7 @@ pub(crate) mod field {
     pub(crate) const SHELL: &str = "shell";
     pub(crate) const CWD: &str = "cwd";
     pub(crate) const TEXT: &str = "text";
+    pub(crate) const PASTE: &str = "paste";
     pub(crate) const BYTES_BASE64: &str = "bytes_base64";
     pub(crate) const DATA_BASE64: &str = "data_base64";
     pub(crate) const KEYS: &str = "keys";

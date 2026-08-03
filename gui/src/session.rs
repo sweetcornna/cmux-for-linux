@@ -18,7 +18,7 @@ use std::time::Duration;
 use cmux::{
     Client, Config, LayoutNode, PaneId, RenderPatch, RenderSnapshot, ScreenId, ScrollOptions,
     Selector, Size, StreamPoll, TabContentId, TabId, TerminalAttachOptions, TerminalAttachmentItem,
-    TerminalId, TerminalMouseOptions, WorkspaceId,
+    TerminalId, TerminalMouseOptions, TextInputOptions, WorkspaceId,
 };
 
 use crate::screen::{PaneView, TabContent, TabView, WorkspaceView};
@@ -58,6 +58,7 @@ pub enum Update {
 #[derive(Debug)]
 pub enum Input {
     Bytes(Vec<u8>),
+    Paste(String),
     Scroll {
         terminal: TerminalId,
         delta_rows: i32,
@@ -427,6 +428,17 @@ fn control_loop(
                 };
                 if let Err(error) = session.terminal(Selector::id(terminal)).write_bytes(&bytes) {
                     let _ = updates.send_blocking(Update::Error(format!("write failed: {error}")));
+                }
+            }
+            Input::Paste(text) => {
+                let Some(terminal) = target.clone() else {
+                    continue;
+                };
+                if let Err(error) = session
+                    .terminal(Selector::id(terminal))
+                    .paste(TextInputOptions { text })
+                {
+                    let _ = updates.send_blocking(Update::Error(format!("paste failed: {error}")));
                 }
             }
             Input::Scroll {

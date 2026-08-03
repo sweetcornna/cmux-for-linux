@@ -1426,6 +1426,24 @@ impl Terminal {
         )?)
     }
 
+    pub fn paste(&self, options: TextInputOptions) -> Result<MutationReceipt> {
+        self.paste_with(options, MutationOptions::unique()?)
+    }
+
+    pub fn paste_with(
+        &self,
+        options: TextInputOptions,
+        mutation: MutationOptions,
+    ) -> Result<MutationReceipt> {
+        mutation_empty(self.session.client.mutate(
+            ops::TERMINAL_INPUT_WRITE,
+            self.params()
+                .string(field::TEXT, options.text)
+                .boolean(field::PASTE, true),
+            mutation,
+        )?)
+    }
+
     pub fn write_bytes(&self, bytes: &[u8]) -> Result<MutationReceipt> {
         self.write_bytes_with(bytes, MutationOptions::unique()?)
     }

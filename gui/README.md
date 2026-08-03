@@ -50,11 +50,12 @@ cargo run --release -- --probe --session main
 | --- | --- |
 | Panes | split layouts with per-pane PTY sizing and click-to-focus |
 | Tabs | a tab strip for the session's tabs |
-| Input | keyboard input, including Ctrl and Alt sequences; mouse input to applications |
+| Input | keyboard input, including Ctrl and Alt sequences; `Ctrl+Shift+V` paste with server-side bracketed-paste handling; mouse input to applications |
 | Workspaces | sidebar switching with a topology refresh every 3 seconds |
 | Resize | dynamic window resize updates the pane PTY sizes |
 | Scrollback | the mouse wheel scrolls the viewport |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
+| Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
 | Theme | border colours from `cmux-tui.json`; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT` |
 
 ## Configuration
@@ -93,7 +94,7 @@ CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 | Shift+drag | Selects text locally | No |
 | Wheel over an alternate-screen application using mouse input | No local scrollback | Yes |
 | Wheel otherwise | Scrolls local history | No |
-| Pointer move with no button held | No | No |
+| Pointer move with no button held | No | Once per cell change; the server forwards it only when the application has enabled mode 1003 |
 
 ## Verified
 
@@ -117,6 +118,3 @@ The following were checked against live sessions:
 - Inline images are not implemented. The work was assessed at roughly 450-650
   lines and deferred.
 - No pane create, close or resize from the GUI itself.
-- No mouse `Move` reporting without a held button.
-- No blink animation.
-- No bracketed-paste guard.

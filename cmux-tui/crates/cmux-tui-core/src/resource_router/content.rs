@@ -715,7 +715,12 @@ fn terminal_write(surface: &Surface, fields: &Map<String, Value>) -> Result<(), 
             )));
         }
     };
-    surface.write_bytes(&bytes).map_err(|error| ActionFailure::Indeterminate(error.to_string()))
+    let result = if fields.get("paste").and_then(Value::as_bool).unwrap_or(false) {
+        surface.write_paste(&bytes)
+    } else {
+        surface.write_bytes(&bytes)
+    };
+    result.map_err(|error| ActionFailure::Indeterminate(error.to_string()))
 }
 
 fn terminal_scroll_viewport(

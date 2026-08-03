@@ -16,6 +16,7 @@ mod view;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use cmux::{InputModifier, MouseButton, TerminalId, TerminalMouseKind, TerminalMouseOptions};
 use gtk4::gdk;
@@ -32,6 +33,7 @@ use session::{AttachmentSpec, Control, Input, Update, Worker};
 
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
+const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
 struct MouseTarget {
     terminal: TerminalId,
@@ -227,6 +229,7 @@ fn build_ui(application: &Application) {
         args.socket.clone(),
         update_tx,
     ));
+    let blink = Rc::new(Cell::new(view::BlinkState::new(false)));
 
     let header = HeaderBar::new();
     let title = Label::new(Some(&format!("cmux — {}", args.session)));
@@ -239,7 +242,7 @@ fn build_ui(application: &Application) {
         .child(&workspaces)
         .width_request(200)
         .build();
-    let terminal = view::build(Rc::clone(&screens), Rc::clone(&theme));
+    let terminal = view::build(Rc::clone(&screens), Rc::clone(&theme), Rc::clone(&blink));
 
     let status = Label::new(Some("connecting…"));
     status.set_xalign(0.0);
@@ -269,6 +272,35 @@ fn build_ui(application: &Application) {
         .build();
     window.set_titlebar(Some(&header));
 
+    // --- focus and blink phase -------------------------------------------
+    {
+        let blink = Rc::clone(&blink);
+        let terminal = terminal.clone();
+        window.connect_is_active_notify(move |window| {
+            let mut state = blink.get();
+            if state.set_window_active(window.is_active()) {
+                blink.set(state);
+                terminal.queue_draw();
+            }
+        });
+    }
+    {
+        let blink = Rc::clone(&blink);
+        let screens = Rc::clone(&screens);
+        let terminal = terminal.downgrade();
+        gtk4::glib::timeout_add_local(BLINK_INTERVAL, move || {
+            let Some(terminal) = terminal.upgrade() else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            let mut state = blink.get();
+            if state.tick(view::needs_blink(&screens.borrow())) {
+                blink.set(state);
+                terminal.queue_draw();
+            }
+            gtk4::glib::ControlFlow::Continue
+        });
+    }
+
     // --- resize -----------------------------------------------------------
     {
         let worker = Rc::clone(&worker);
@@ -290,12 +322,30 @@ fn build_ui(application: &Application) {
         let screens = Rc::clone(&screens);
         let terminal_for_keys = terminal.clone();
         key_controller.connect_key_pressed(move |_, key, _, state| {
-            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-            if ctrl && shift && matches!(key, gdk::Key::C | gdk::Key::c) {
+            if view::is_copy_shortcut(key, state) {
                 if let Some(text) = screens.borrow().selected_text() {
                     terminal_for_keys.clipboard().set_text(&text);
                 }
+                return gtk4::glib::Propagation::Stop;
+            }
+            if view::is_paste_shortcut(key, state) {
+                let clipboard = terminal_for_keys.clipboard();
+                let worker = Rc::clone(&worker);
+                let screens = Rc::clone(&screens);
+                let terminal = terminal_for_keys.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let Ok(Some(text)) = clipboard.read_text_future().await else {
+                        return;
+                    };
+                    let Some(text) = view::paste_payload(text.as_str()) else {
+                        return;
+                    };
+                    if let Some(screen) = screens.borrow_mut().focused_screen_mut() {
+                        screen.clear_selection();
+                    }
+                    terminal.queue_draw();
+                    let _ = worker.input.send(Input::Paste(text.to_string()));
+                });
                 return gtk4::glib::Propagation::Stop;
             }
 
@@ -321,6 +371,7 @@ fn build_ui(application: &Application) {
     terminal.add_controller(key_controller);
 
     let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
+    let move_throttle = Rc::new(RefCell::new(view::MouseMoveThrottle::default()));
 
     // --- pointer motion ---------------------------------------------------
     {
@@ -330,20 +381,39 @@ fn build_ui(application: &Application) {
         let pointer_for_enter = Rc::clone(&pointer);
         let pointer_for_motion = Rc::clone(&pointer);
         let pointer_for_leave = Rc::clone(&pointer);
+        let throttle_for_enter = Rc::clone(&move_throttle);
+        let throttle_for_motion = Rc::clone(&move_throttle);
+        let throttle_for_leave = Rc::clone(&move_throttle);
         let terminal_for_motion = terminal.clone();
         let motion = EventControllerMotion::new();
-        motion.connect_enter(move |_, x, y| pointer_for_enter.set(Some((x, y))));
+        motion.connect_enter(move |_, x, y| {
+            pointer_for_enter.set(Some((x, y)));
+            throttle_for_enter.borrow_mut().reset();
+        });
         motion.connect_motion(move |controller, x, y| {
             pointer_for_motion.set(Some((x, y)));
             let state = controller.current_event_state();
-            if !mouse_button_held(state) || state.contains(gdk::ModifierType::SHIFT_MASK) {
+            let held = mouse_button_held(state);
+            if held && state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
             }
             let metrics = view::cell_metrics(&terminal_for_motion, &theme);
             let Some(target) = mouse_target(&screens.borrow(), &terminal_for_motion, metrics, x, y)
             else {
+                if !held {
+                    throttle_for_motion.borrow_mut().reset();
+                }
                 return;
             };
+            if !held
+                && !throttle_for_motion.borrow_mut().should_report(
+                    &target.terminal,
+                    target.row,
+                    target.column,
+                )
+            {
+                return;
+            }
             let _ = worker.input.send(Input::Mouse {
                 terminal: target.terminal,
                 options: TerminalMouseOptions {
@@ -356,7 +426,10 @@ fn build_ui(application: &Application) {
                 },
             });
         });
-        motion.connect_leave(move |_| pointer_for_leave.set(None));
+        motion.connect_leave(move |_| {
+            pointer_for_leave.set(None);
+            throttle_for_leave.borrow_mut().reset();
+        });
         terminal.add_controller(motion);
     }
 
