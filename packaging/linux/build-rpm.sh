@@ -7,6 +7,11 @@
 source "$(dirname "$(readlink -f "$0")")/lib/common.sh"
 
 detect_arch
+# Each package has its own spec: the file lists, dependencies and %check
+# assertions differ, so one spec with conditionals would be worse.
+RPM_PKG_NAME="${CMUX_PKG_NAME:-$PKG_NAME}"
+SPEC="$PKG_DIR/rpm/$RPM_PKG_NAME.spec"
+[ -f "$SPEC" ] || die "no spec for package '$RPM_PKG_NAME' at $SPEC"
 STAGE="${CMUX_STAGE:-$BUILD_DIR/stage}"
 VERSION="$(resolve_version)"
 OUT_DIR="$BUILD_DIR/dist"
@@ -18,15 +23,15 @@ CONTAINER_IMAGE="${CMUX_RPM_IMAGE:-fedora:42}"
 # separators for untagged builds, but guard anyway.
 RPM_VERSION="${VERSION//-/.}"
 
-work="$BUILD_DIR/rpm"
-log "building $PKG_NAME $RPM_VERSION ($RPM_ARCH) .rpm"
+work="$BUILD_DIR/rpm/$RPM_PKG_NAME"
+log "building $RPM_PKG_NAME $RPM_VERSION ($RPM_ARCH) .rpm"
 rm -rf "$work"
 mkdir -p "$work/SOURCES" "$work/SPECS" "$OUT_DIR"
 
 tar --numeric-owner --owner=0 --group=0 --sort=name \
     --mtime="@${SOURCE_DATE_EPOCH:-0}" \
     -czf "$work/SOURCES/cmux-stage.tar.gz" -C "$STAGE" usr
-cp "$PKG_DIR/rpm/cmux.spec" "$work/SPECS/cmux.spec"
+cp "$SPEC" "$work/SPECS/package.spec"
 
 if [ "${CMUX_RPM_NATIVE:-0}" = 1 ]; then
   need rpmbuild
@@ -35,7 +40,7 @@ if [ "${CMUX_RPM_NATIVE:-0}" = 1 ]; then
     --define "cmux_version $RPM_VERSION" \
     --define "cmux_stage_tar cmux-stage.tar.gz" \
     --target "$RPM_ARCH" \
-    "$work/SPECS/cmux.spec"
+    "$work/SPECS/package.spec"
 else
   need docker
   log "using container image $CONTAINER_IMAGE (set CMUX_RPM_NATIVE=1 for a local rpmbuild)"
@@ -56,7 +61,7 @@ rpmbuild -bb \
   --define "cmux_version $CMUX_RPM_VERSION" \
   --define "cmux_stage_tar cmux-stage.tar.gz" \
   --target "$CMUX_RPM_ARCH" \
-  /work/SPECS/cmux.spec
+  /work/SPECS/package.spec
 chown -R "$CMUX_HOST_UID:$CMUX_HOST_GID" /work
 CONTAINER
 fi
