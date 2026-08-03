@@ -10,11 +10,14 @@
 //! 50ms poll timeout to every other pane's latency.
 
 use std::collections::HashMap;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use cmux::{
     Client, Config, CreateScreenOptions, Direction, LayoutNode, PaneId, ReadHistoryOptions,
@@ -33,6 +36,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Debug)]
 struct RetrySchedule {
@@ -70,7 +74,19 @@ impl Iterator for RetrySchedule {
 #[derive(Debug)]
 pub enum Update {
     Connected {
+        session: SessionEntry,
+    },
+    Switching {
         session_name: String,
+    },
+    Disconnected {
+        session_name: String,
+        message: String,
+    },
+    Sessions(Vec<SessionEntry>),
+    SwitchFailed {
+        session_name: String,
+        message: String,
     },
     Workspaces(Vec<WorkspaceEntry>),
     Attached {
@@ -96,6 +112,12 @@ pub enum Update {
         terminal: TerminalId,
     },
     Error(String),
+}
+
+#[derive(Debug)]
+pub struct StampedUpdate {
+    pub generation: u64,
+    pub update: Update,
 }
 
 #[derive(Debug)]
@@ -221,15 +243,65 @@ pub struct WorkspaceEntry {
     pub view: Option<WorkspaceView>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEntry {
+    pub name: String,
+    pub socket_path: PathBuf,
+}
+
+pub struct RoutedSender<T> {
+    sender: Arc<Mutex<Option<mpsc::Sender<T>>>>,
+}
+
+impl<T> RoutedSender<T> {
+    fn new() -> Self {
+        Self {
+            sender: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn send(&self, value: T) -> Result<(), mpsc::SendError<T>> {
+        let sender = self.sender.lock().ok().and_then(|sender| sender.clone());
+        match sender {
+            Some(sender) => sender.send(value),
+            None => Err(mpsc::SendError(value)),
+        }
+    }
+
+    fn bind(&self, sender: mpsc::Sender<T>) {
+        if let Ok(mut current) = self.sender.lock() {
+            *current = Some(sender);
+        }
+    }
+
+    fn clear(&self) {
+        if let Ok(mut current) = self.sender.lock() {
+            current.take();
+        }
+    }
+}
+
 pub struct Worker {
-    pub input: mpsc::Sender<Input>,
-    pub control: mpsc::Sender<Control>,
+    pub input: RoutedSender<Input>,
+    pub control: RoutedSender<Control>,
+    supervisor: mpsc::Sender<SupervisorCommand>,
 }
 
 impl Worker {
+    pub fn refresh_sessions(&self) {
+        let _ = self.supervisor.send(SupervisorCommand::RefreshSessions);
+    }
+
+    pub fn switch_session(&self, session: SessionEntry) {
+        let _ = self.supervisor.send(SupervisorCommand::Switch(session));
+    }
+
+    pub fn new_session(&self, name: String) {
+        let _ = self.supervisor.send(SupervisorCommand::NewSession(name));
+    }
+
     pub fn stop(&self) {
-        let _ = self.input.send(Input::Stop);
-        let _ = self.control.send(Control::Stop);
+        let _ = self.supervisor.send(SupervisorCommand::Stop);
     }
 }
 
@@ -237,48 +309,507 @@ pub fn spawn(
     session_name: String,
     socket: Option<PathBuf>,
     auto_start: bool,
-    updates: async_channel::Sender<Update>,
+    updates: async_channel::Sender<StampedUpdate>,
 ) -> Worker {
-    let (input_tx, input_rx) = mpsc::channel::<Input>();
-    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let socket_path =
+        socket.unwrap_or_else(|| Config::from_env_or_default_session(&session_name).socket_path);
+    let initial = SessionEntry {
+        name: session_name,
+        socket_path,
+    };
+    let input = RoutedSender::new();
+    let control = RoutedSender::new();
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
 
+    let supervisor_input = RoutedSender {
+        sender: Arc::clone(&input.sender),
+    };
+    let supervisor_control = RoutedSender {
+        sender: Arc::clone(&control.sender),
+    };
+    let runtime_events = supervisor_tx.clone();
     thread::spawn(move || {
-        let config = match socket {
-            Some(path) => Config::from_socket_path(path),
-            None => Config::from_env_or_default_session(&session_name),
-        };
-
-        let client = match connect(&session_name, config, auto_start, &updates) {
-            Ok(client) => client,
-            Err(message) => {
-                let _ = updates.send_blocking(Update::Error(message));
-                return;
-            }
-        };
-
-        let _ = updates.send_blocking(Update::Connected { session_name });
-        if let Err(error) = publish_workspaces(&client, &updates) {
-            let _ = updates.send_blocking(Update::Error(error));
-        }
-
-        let control_client = client.clone();
-        let control_updates = updates.clone();
-        thread::spawn(move || control_loop(control_client, control_updates, input_rx));
-
-        attachment_manager_loop(client, updates, control_rx);
+        supervisor_loop(
+            initial,
+            auto_start,
+            updates,
+            supervisor_rx,
+            runtime_events,
+            supervisor_input,
+            supervisor_control,
+        )
     });
 
     Worker {
+        input,
+        control,
+        supervisor: supervisor_tx,
+    }
+}
+
+#[derive(Debug)]
+enum SupervisorCommand {
+    RefreshSessions,
+    Switch(SessionEntry),
+    NewSession(String),
+    RuntimeDisconnected { generation: u64, message: String },
+    Stop,
+}
+
+#[derive(Clone)]
+struct UpdateSink {
+    generation: u64,
+    sender: async_channel::Sender<StampedUpdate>,
+}
+
+impl UpdateSink {
+    fn send_blocking(&self, update: Update) -> Result<(), async_channel::SendError<StampedUpdate>> {
+        self.sender.send_blocking(StampedUpdate {
+            generation: self.generation,
+            update,
+        })
+    }
+}
+
+fn send_update(updates: &async_channel::Sender<StampedUpdate>, generation: u64, update: Update) {
+    let _ = updates.send_blocking(StampedUpdate { generation, update });
+}
+
+struct Runtime {
+    input: mpsc::Sender<Input>,
+    control: mpsc::Sender<Control>,
+    control_join: JoinHandle<()>,
+    attachment_join: JoinHandle<()>,
+}
+
+impl Runtime {
+    fn stop(self) {
+        let _ = self.input.send(Input::Stop);
+        let _ = self.control.send(Control::Stop);
+        let _ = self.control_join.join();
+        let _ = self.attachment_join.join();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RebuildPlan {
+    previous: SessionEntry,
+    target: SessionEntry,
+}
+
+impl RebuildPlan {
+    fn new(previous: &SessionEntry, target: SessionEntry) -> Option<Self> {
+        (previous != &target).then(|| Self {
+            previous: previous.clone(),
+            target,
+        })
+    }
+
+    fn commit(self, connected: SessionEntry) -> SessionEntry {
+        debug_assert_eq!(self.target.socket_path, connected.socket_path);
+        connected
+    }
+
+    fn rollback(self) -> SessionEntry {
+        self.previous
+    }
+}
+
+fn supervisor_loop(
+    initial: SessionEntry,
+    initial_auto_start: bool,
+    updates: async_channel::Sender<StampedUpdate>,
+    commands: mpsc::Receiver<SupervisorCommand>,
+    runtime_events: mpsc::Sender<SupervisorCommand>,
+    input: RoutedSender<Input>,
+    control: RoutedSender<Control>,
+) {
+    let mut generation = 0;
+    let mut current = initial;
+    let mut runtime = match start_runtime(
+        &current,
+        initial_auto_start,
+        generation,
+        &updates,
+        &runtime_events,
+        &input,
+        &control,
+    ) {
+        Ok((connected, runtime)) => {
+            current = connected;
+            Some(runtime)
+        }
+        Err(message) => {
+            send_update(&updates, generation, Update::Error(message));
+            None
+        }
+    };
+    let mut reconnect_at: Option<Instant> = None;
+
+    loop {
+        let command = match reconnect_at {
+            Some(deadline) => {
+                match commands.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(command) => command,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        match start_runtime(
+                            &current,
+                            false,
+                            generation,
+                            &updates,
+                            &runtime_events,
+                            &input,
+                            &control,
+                        ) {
+                            Ok((connected, next_runtime)) => {
+                                current = connected;
+                                runtime = Some(next_runtime);
+                                reconnect_at = None;
+                            }
+                            Err(message) => {
+                                send_update(&updates, generation, Update::Error(message));
+                                reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
+                            }
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match commands.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
+
+        match command {
+            SupervisorCommand::RefreshSessions => match enumerate_sessions(&current) {
+                Ok(sessions) => send_update(&updates, generation, Update::Sessions(sessions)),
+                Err(message) => send_update(&updates, generation, Update::Error(message)),
+            },
+            SupervisorCommand::Switch(target) => {
+                switch_runtime(
+                    target,
+                    false,
+                    &mut current,
+                    &mut runtime,
+                    &mut reconnect_at,
+                    &mut generation,
+                    &updates,
+                    &runtime_events,
+                    &input,
+                    &control,
+                );
+            }
+            SupervisorCommand::NewSession(name) => {
+                let existing = enumerate_sessions(&current)
+                    .ok()
+                    .and_then(|sessions| sessions.into_iter().find(|session| session.name == name));
+                let (target, auto_start) = existing.map_or_else(
+                    || {
+                        (
+                            SessionEntry {
+                                socket_path: session_socket_path(&current.socket_path, &name),
+                                name,
+                            },
+                            true,
+                        )
+                    },
+                    |session| (session, false),
+                );
+                switch_runtime(
+                    target,
+                    auto_start,
+                    &mut current,
+                    &mut runtime,
+                    &mut reconnect_at,
+                    &mut generation,
+                    &updates,
+                    &runtime_events,
+                    &input,
+                    &control,
+                );
+            }
+            SupervisorCommand::RuntimeDisconnected {
+                generation: disconnected_generation,
+                message,
+            } => {
+                if disconnected_generation != generation || runtime.is_none() {
+                    continue;
+                }
+                generation = generation.wrapping_add(1);
+                send_update(
+                    &updates,
+                    generation,
+                    Update::Disconnected {
+                        session_name: current.name.clone(),
+                        message,
+                    },
+                );
+                input.clear();
+                control.clear();
+                if let Some(runtime) = runtime.take() {
+                    runtime.stop();
+                }
+                reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
+            }
+            SupervisorCommand::Stop => break,
+        }
+    }
+
+    input.clear();
+    control.clear();
+    if let Some(runtime) = runtime {
+        runtime.stop();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn switch_runtime(
+    target: SessionEntry,
+    auto_start: bool,
+    current: &mut SessionEntry,
+    runtime: &mut Option<Runtime>,
+    reconnect_at: &mut Option<Instant>,
+    generation: &mut u64,
+    updates: &async_channel::Sender<StampedUpdate>,
+    runtime_events: &mpsc::Sender<SupervisorCommand>,
+    input: &RoutedSender<Input>,
+    control: &RoutedSender<Control>,
+) {
+    let Some(plan) = RebuildPlan::new(current, target) else {
+        return;
+    };
+    *generation = generation.wrapping_add(1);
+    send_update(
+        updates,
+        *generation,
+        Update::Switching {
+            session_name: plan.target.name.clone(),
+        },
+    );
+    input.clear();
+    control.clear();
+    if let Some(previous_runtime) = runtime.take() {
+        previous_runtime.stop();
+    }
+    *reconnect_at = None;
+
+    match start_runtime(
+        &plan.target,
+        auto_start,
+        *generation,
+        updates,
+        runtime_events,
+        input,
+        control,
+    ) {
+        Ok((connected, next_runtime)) => {
+            *current = plan.commit(connected);
+            *runtime = Some(next_runtime);
+        }
+        Err(message) => {
+            let failed_name = plan.target.name.clone();
+            let rollback = plan.rollback();
+            *current = rollback.clone();
+            *generation = generation.wrapping_add(1);
+            match start_runtime(
+                &rollback,
+                true,
+                *generation,
+                updates,
+                runtime_events,
+                input,
+                control,
+            ) {
+                Ok((connected, previous_runtime)) => {
+                    *current = connected;
+                    *runtime = Some(previous_runtime);
+                    send_update(
+                        updates,
+                        *generation,
+                        Update::SwitchFailed {
+                            session_name: failed_name,
+                            message,
+                        },
+                    );
+                }
+                Err(rollback_error) => {
+                    send_update(
+                        updates,
+                        *generation,
+                        Update::SwitchFailed {
+                            session_name: failed_name,
+                            message: format!(
+                                "{message}; could not restore session '{}': {rollback_error}",
+                                rollback.name
+                            ),
+                        },
+                    );
+                    *reconnect_at = Some(Instant::now() + RECONNECT_INTERVAL);
+                }
+            }
+        }
+    }
+}
+
+fn start_runtime(
+    requested: &SessionEntry,
+    auto_start: bool,
+    generation: u64,
+    updates: &async_channel::Sender<StampedUpdate>,
+    runtime_events: &mpsc::Sender<SupervisorCommand>,
+    input_route: &RoutedSender<Input>,
+    control_route: &RoutedSender<Control>,
+) -> Result<(SessionEntry, Runtime), String> {
+    let sink = UpdateSink {
+        generation,
+        sender: updates.clone(),
+    };
+    let config = Config::from_socket_path(&requested.socket_path);
+    let client = connect(&requested.name, config, auto_start, &sink)?;
+    let name = connected_session_name(&client).unwrap_or_else(|| requested.name.clone());
+    let connected = SessionEntry {
+        name,
+        socket_path: requested.socket_path.clone(),
+    };
+    let (input_tx, input_rx) = mpsc::channel::<Input>();
+    let (control_tx, control_rx) = mpsc::channel::<Control>();
+    let publish_client = client.clone();
+    let control_client = client.clone();
+    let control_updates = sink.clone();
+    let control_join =
+        thread::spawn(move || control_loop(control_client, control_updates, input_rx));
+    let attachment_updates = sink.clone();
+    let attachment_events = runtime_events.clone();
+    let attachment_join = thread::spawn(move || {
+        attachment_manager_loop(
+            client,
+            attachment_updates,
+            control_rx,
+            generation,
+            attachment_events,
+        )
+    });
+    input_route.bind(input_tx.clone());
+    control_route.bind(control_tx.clone());
+    let runtime = Runtime {
         input: input_tx,
         control: control_tx,
+        control_join,
+        attachment_join,
+    };
+    if let Err(error) = publish_workspaces(&publish_client, &sink) {
+        input_route.clear();
+        control_route.clear();
+        runtime.stop();
+        return Err(error);
     }
+    let _ = sink.send_blocking(Update::Connected {
+        session: connected.clone(),
+    });
+
+    Ok((connected, runtime))
+}
+
+fn connected_session_name(client: &Client) -> Option<String> {
+    client
+        .current_session()
+        .refresh()
+        .ok()
+        .and_then(|snapshot| snapshot.name)
+        .filter(|name| !name.is_empty())
+}
+
+fn session_socket_path(current_socket: &Path, session_name: &str) -> PathBuf {
+    current_socket.with_file_name(format!("{session_name}.sock"))
+}
+
+fn socket_candidates(directory: &Path, active_socket: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(directory).map_err(|error| {
+        format!(
+            "Could not read cmux session directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        #[cfg(unix)]
+        let is_socket = entry
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_socket());
+        #[cfg(not(unix))]
+        let is_socket = false;
+        candidates.push((entry.path(), is_socket));
+    }
+    Ok(parse_socket_candidates(
+        candidates,
+        directory,
+        active_socket,
+    ))
+}
+
+fn parse_socket_candidates(
+    candidates: impl IntoIterator<Item = (PathBuf, bool)>,
+    directory: &Path,
+    active_socket: &Path,
+) -> Vec<PathBuf> {
+    let mut paths = candidates
+        .into_iter()
+        .filter(|(path, is_socket)| {
+            *is_socket && path.extension().and_then(|extension| extension.to_str()) == Some("sock")
+        })
+        .map(|(path, _)| path)
+        .collect::<Vec<_>>();
+    if active_socket.parent() == Some(directory) && !paths.iter().any(|path| path == active_socket)
+    {
+        paths.push(active_socket.to_path_buf());
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn enumerate_sessions(active: &SessionEntry) -> Result<Vec<SessionEntry>, String> {
+    let directory = active.socket_path.parent().ok_or_else(|| {
+        format!(
+            "Session socket '{}' has no parent directory",
+            active.socket_path.display()
+        )
+    })?;
+    let mut sessions = Vec::new();
+    for socket_path in socket_candidates(directory, &active.socket_path)? {
+        let config = Config::from_socket_path(&socket_path).with_timeout(SESSION_PROBE_TIMEOUT);
+        let Ok(client) = Client::connect(config) else {
+            continue;
+        };
+        let fallback = socket_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unnamed")
+            .to_string();
+        sessions.push(SessionEntry {
+            name: connected_session_name(&client).unwrap_or(fallback),
+            socket_path,
+        });
+    }
+    sessions.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.socket_path.cmp(&right.socket_path))
+    });
+    Ok(sessions)
 }
 
 fn connect(
     session_name: &str,
     config: Config,
     auto_start: bool,
-    updates: &async_channel::Sender<Update>,
+    updates: &UpdateSink,
 ) -> Result<Client, String> {
     let first_error = match Client::connect(config.clone()) {
         Ok(client) => return Ok(client),
@@ -349,6 +880,7 @@ fn start_headless_session(session_name: &str, socket_path: &Path) -> Result<(), 
 
 struct AttachmentWorker {
     commands: mpsc::Sender<AttachmentCommand>,
+    join: JoinHandle<()>,
 }
 
 enum AttachmentCommand {
@@ -358,8 +890,10 @@ enum AttachmentCommand {
 
 fn attachment_manager_loop(
     client: Client,
-    updates: async_channel::Sender<Update>,
+    updates: UpdateSink,
     controls: mpsc::Receiver<Control>,
+    generation: u64,
+    runtime_events: mpsc::Sender<SupervisorCommand>,
 ) {
     let session = client.session(Selector::current());
     let mut workers: HashMap<TerminalId, AttachmentWorker> = HashMap::new();
@@ -369,6 +903,7 @@ fn attachment_manager_loop(
             Control::Stop => {
                 for worker in workers.into_values() {
                     let _ = worker.commands.send(AttachmentCommand::Stop);
+                    let _ = worker.join.join();
                 }
                 return;
             }
@@ -385,6 +920,7 @@ fn attachment_manager_loop(
                 for terminal in removed {
                     if let Some(worker) = workers.remove(&terminal) {
                         let _ = worker.commands.send(AttachmentCommand::Stop);
+                        let _ = worker.join.join();
                     }
                 }
 
@@ -397,19 +933,23 @@ fn attachment_manager_loop(
                     let attachment_session = session.clone();
                     let attachment_updates = updates.clone();
                     let attachment_terminal = terminal.clone();
-                    thread::spawn(move || {
+                    let attachment_events = runtime_events.clone();
+                    let join = thread::spawn(move || {
                         attachment_loop(
                             attachment_session,
                             attachment_terminal,
                             size,
                             attachment_updates,
                             command_rx,
+                            generation,
+                            attachment_events,
                         );
                     });
                     workers.insert(
                         terminal,
                         AttachmentWorker {
                             commands: command_tx,
+                            join,
                         },
                     );
                 }
@@ -419,6 +959,7 @@ fn attachment_manager_loop(
 
     for worker in workers.into_values() {
         let _ = worker.commands.send(AttachmentCommand::Stop);
+        let _ = worker.join.join();
     }
 }
 
@@ -426,91 +967,97 @@ fn attachment_loop(
     session: cmux::Session,
     terminal: TerminalId,
     initial_size: Size,
-    updates: async_channel::Sender<Update>,
+    updates: UpdateSink,
     commands: mpsc::Receiver<AttachmentCommand>,
+    generation: u64,
+    runtime_events: mpsc::Sender<SupervisorCommand>,
 ) {
     let mut size = initial_size;
+    match drain_attachment_commands(&commands, &mut size, None, &terminal, &updates) {
+        AttachmentAction::Continue => {}
+        AttachmentAction::Stop => return,
+    }
+
+    let mut stream = match open_attachment(&session, &terminal, size) {
+        Ok(stream) => stream,
+        Err(error) => {
+            let message = format!("{terminal:?}: {error}");
+            let _ = updates.send_blocking(Update::Error(message.clone()));
+            let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                generation,
+                message,
+            });
+            return;
+        }
+    };
+    let _ = updates.send_blocking(Update::Attached {
+        terminal: terminal.clone(),
+    });
+
     loop {
-        match drain_attachment_commands(&commands, &mut size, None, &terminal, &updates) {
+        match drain_attachment_commands(
+            &commands,
+            &mut size,
+            Some(&mut stream),
+            &terminal,
+            &updates,
+        ) {
             AttachmentAction::Continue => {}
             AttachmentAction::Stop => return,
         }
 
-        let mut stream = match open_attachment(&session, &terminal, size) {
-            Ok(stream) => stream,
-            Err(error) => {
-                let _ = updates.send_blocking(Update::Error(format!("{terminal:?}: {error}")));
-                match commands.recv_timeout(RECONNECT_INTERVAL) {
-                    Ok(AttachmentCommand::Resize(next)) => size = next,
-                    Ok(AttachmentCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        return;
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                }
-                continue;
-            }
-        };
-        let _ = updates.send_blocking(Update::Attached {
-            terminal: terminal.clone(),
-        });
-
-        loop {
-            match drain_attachment_commands(
-                &commands,
-                &mut size,
-                Some(&mut stream),
-                &terminal,
-                &updates,
-            ) {
-                AttachmentAction::Continue => {}
-                AttachmentAction::Stop => return,
-            }
-
-            match stream.next_timeout(POLL_INTERVAL) {
-                Ok(StreamPoll::Item(item)) => match item.value {
-                    TerminalAttachmentItem::Snapshot {
-                        terminal_id,
-                        render,
-                    } => {
-                        let _ = updates.send_blocking(Update::Snapshot {
-                            terminal: terminal_id,
-                            render: Box::new(render),
-                        });
-                    }
-                    TerminalAttachmentItem::Patch {
-                        terminal_id,
-                        render,
-                    } => {
-                        let _ = updates.send_blocking(Update::Patch {
-                            terminal: terminal_id,
-                            render: Box::new(render),
-                        });
-                    }
-                    TerminalAttachmentItem::Scroll {
-                        terminal_id,
-                        scroll,
-                    } => {
-                        let _ = updates.send_blocking(Update::Scroll {
-                            terminal: terminal_id,
-                            offset: scroll.offset,
-                            at_bottom: scroll.at_bottom,
-                        });
-                    }
-                    TerminalAttachmentItem::Unknown { .. } => {}
-                },
-                Ok(StreamPoll::TimedOut) => {}
-                Ok(StreamPoll::End) => {
-                    let _ = updates.send_blocking(Update::Detached {
-                        terminal: terminal.clone(),
+        match stream.next_timeout(POLL_INTERVAL) {
+            Ok(StreamPoll::Item(item)) => match item.value {
+                TerminalAttachmentItem::Snapshot {
+                    terminal_id,
+                    render,
+                } => {
+                    let _ = updates.send_blocking(Update::Snapshot {
+                        terminal: terminal_id,
+                        render: Box::new(render),
                     });
-                    break;
                 }
-                Err(error) => {
-                    let _ = updates.send_blocking(Update::Error(format!(
-                        "stream error for {terminal:?}: {error}"
-                    )));
-                    break;
+                TerminalAttachmentItem::Patch {
+                    terminal_id,
+                    render,
+                } => {
+                    let _ = updates.send_blocking(Update::Patch {
+                        terminal: terminal_id,
+                        render: Box::new(render),
+                    });
                 }
+                TerminalAttachmentItem::Scroll {
+                    terminal_id,
+                    scroll,
+                } => {
+                    let _ = updates.send_blocking(Update::Scroll {
+                        terminal: terminal_id,
+                        offset: scroll.offset,
+                        at_bottom: scroll.at_bottom,
+                    });
+                }
+                TerminalAttachmentItem::Unknown { .. } => {}
+            },
+            Ok(StreamPoll::TimedOut) => {}
+            Ok(StreamPoll::End) => {
+                let message = format!("attachment stream ended for {terminal:?}");
+                let _ = updates.send_blocking(Update::Detached {
+                    terminal: terminal.clone(),
+                });
+                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                    generation,
+                    message,
+                });
+                return;
+            }
+            Err(error) => {
+                let message = format!("stream error for {terminal:?}: {error}");
+                let _ = updates.send_blocking(Update::Error(message.clone()));
+                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                    generation,
+                    message,
+                });
+                return;
             }
         }
     }
@@ -526,7 +1073,7 @@ fn drain_attachment_commands(
     size: &mut Size,
     mut stream: Option<&mut cmux::TerminalAttachment>,
     terminal: &TerminalId,
-    updates: &async_channel::Sender<Update>,
+    updates: &UpdateSink,
 ) -> AttachmentAction {
     loop {
         match commands.try_recv() {
@@ -592,11 +1139,7 @@ fn open_attachment(
     Ok(stream)
 }
 
-fn control_loop(
-    client: Client,
-    updates: async_channel::Sender<Update>,
-    inputs: mpsc::Receiver<Input>,
-) {
+fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Input>) {
     let session = client.session(Selector::current());
     let mut target: Option<TerminalId> = None;
     let mut history_cache: HashMap<TerminalId, Vec<String>> = HashMap::new();
@@ -927,7 +1470,7 @@ fn control_loop(
     }
 }
 
-fn refresh_after_focus(client: &Client, updates: &async_channel::Sender<Update>) {
+fn refresh_after_focus(client: &Client, updates: &UpdateSink) {
     if let Err(error) = publish_workspaces(client, updates) {
         let _ = updates.send_blocking(Update::Error(error));
     }
@@ -991,10 +1534,7 @@ fn search_terminal(
 /// Publishes workspace catalog data and the focused screen's complete layout.
 /// The tab snapshot already contains a typed content ID, so no terminal-to-tab
 /// reconstruction or private protocol identity is needed.
-fn publish_workspaces(
-    client: &Client,
-    updates: &async_channel::Sender<Update>,
-) -> Result<(), String> {
+fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), String> {
     let session = client.session(Selector::current());
     let workspaces = session
         .workspaces()
@@ -1126,7 +1666,12 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
 
 #[cfg(test)]
 mod tests {
-    use super::RetrySchedule;
+    use super::{
+        parse_socket_candidates, session_socket_path, RebuildPlan, RetrySchedule, RoutedSender,
+        SessionEntry,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     #[test]
@@ -1154,5 +1699,66 @@ mod tests {
         let delays = RetrySchedule::new(Duration::ZERO, Duration::from_secs(5)).collect::<Vec<_>>();
 
         assert!(delays.is_empty());
+    }
+
+    #[test]
+    fn rebuild_plan_commits_target_and_rolls_back_previous() {
+        let previous = SessionEntry {
+            name: "main".into(),
+            socket_path: "/run/cmux/main.sock".into(),
+        };
+        let target = SessionEntry {
+            name: "logs".into(),
+            socket_path: "/run/cmux/logs.sock".into(),
+        };
+        let plan = RebuildPlan::new(&previous, target.clone()).unwrap();
+
+        assert_eq!(plan.clone().commit(target.clone()), target);
+        assert_eq!(plan.rollback(), previous);
+        assert!(RebuildPlan::new(&previous, previous.clone()).is_none());
+    }
+
+    #[test]
+    fn routed_sender_drops_commands_while_unbound_and_rebinds_cleanly() {
+        let route = RoutedSender::new();
+        assert_eq!(route.send(1), Err(mpsc::SendError(1)));
+
+        let (first_tx, first_rx) = mpsc::channel();
+        route.bind(first_tx);
+        route.send(2).unwrap();
+        assert_eq!(first_rx.recv().unwrap(), 2);
+
+        route.clear();
+        assert_eq!(route.send(3), Err(mpsc::SendError(3)));
+        let (second_tx, second_rx) = mpsc::channel();
+        route.bind(second_tx);
+        route.send(4).unwrap();
+        assert_eq!(second_rx.recv().unwrap(), 4);
+    }
+
+    #[test]
+    fn socket_candidate_parser_keeps_only_sockets_and_includes_custom_active_path() {
+        let directory = Path::new("/run/user/1000/cmux-tui-1000");
+        let alpha = directory.join("alpha.sock");
+        let active = directory.join("current.custom");
+        let candidates = vec![
+            (alpha.clone(), true),
+            (directory.join("ignored.txt"), true),
+            (directory.join("regular.sock"), false),
+        ];
+        let mut expected = vec![alpha, active.clone()];
+        expected.sort();
+        assert_eq!(
+            parse_socket_candidates(candidates, directory, &active),
+            expected
+        );
+    }
+
+    #[test]
+    fn new_session_socket_is_a_sibling_of_the_active_socket() {
+        assert_eq!(
+            session_socket_path(Path::new("/run/user/1000/cmux-tui-1000/main.sock"), "logs"),
+            PathBuf::from("/run/user/1000/cmux-tui-1000/logs.sock")
+        );
     }
 }

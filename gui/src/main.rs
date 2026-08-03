@@ -34,7 +34,7 @@ use gtk4::{
 };
 
 use screen::ScreenSet;
-use session::{AttachmentSpec, Control, Input, Update, Worker};
+use session::{AttachmentSpec, Control, Input, SessionEntry, StampedUpdate, Update, Worker};
 
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
@@ -82,6 +82,11 @@ struct RenamePrompt {
     popover: Popover,
     entry: Entry,
     target: Rc<RefCell<Option<RenameTarget>>>,
+}
+
+struct NewSessionPrompt {
+    popover: Popover,
+    entry: Entry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,12 +157,12 @@ fn parse_args() -> Args {
 
 fn probe() -> gtk4::glib::ExitCode {
     let args = parse_args();
-    let (tx, rx) = async_channel::unbounded::<Update>();
+    let (tx, rx) = async_channel::unbounded::<StampedUpdate>();
     let worker = session::spawn(args.session.clone(), args.socket.clone(), false, tx);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        match rx.recv_blocking() {
+        match rx.recv_blocking().map(|update| update.update) {
             Ok(Update::Snapshot { terminal, render }) => {
                 let (images, placements) = render.graphics.as_ref().map_or((0, 0), |graphics| {
                     (
@@ -498,6 +503,156 @@ fn open_rename_prompt(
     *prompt.target.borrow_mut() = Some(target);
     prompt.popover.popup();
     prompt.entry.grab_focus();
+}
+
+fn build_new_session_prompt(worker: Rc<Worker>, toast: Label) -> NewSessionPrompt {
+    let entry = Entry::new();
+    entry.set_max_length(120);
+    entry.set_width_chars(24);
+    entry.set_placeholder_text(Some("Session name"));
+    entry.add_css_class("rename-entry");
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.append(&entry);
+    let popover = Popover::new();
+    popover.add_css_class("cmux-menu");
+    popover.add_css_class("rename-prompt");
+    popover.set_autohide(true);
+    popover.set_has_arrow(true);
+    popover.set_child(Some(&content));
+
+    {
+        let worker = Rc::clone(&worker);
+        let popover = popover.clone();
+        entry.connect_activate(move |entry| {
+            let Some(name) = rename_submission(entry.text().as_str()) else {
+                set_toast(&toast, "Name cannot be empty");
+                return;
+            };
+            worker.new_session(name);
+            popover.popdown();
+        });
+    }
+    {
+        let popover = popover.clone();
+        let keys = EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Escape {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            popover.popdown();
+            gtk4::glib::Propagation::Stop
+        });
+        entry.add_controller(keys);
+    }
+
+    NewSessionPrompt { popover, entry }
+}
+
+fn open_new_session_prompt(prompt: &NewSessionPrompt, parent: &impl IsA<Widget>) {
+    prompt.popover.popdown();
+    if prompt.popover.parent().is_some() {
+        prompt.popover.unparent();
+    }
+    prompt.popover.set_parent(parent);
+    prompt.entry.set_text("");
+    prompt.popover.popup();
+    prompt.entry.grab_focus();
+}
+
+fn session_menu_item(
+    entry: &SessionEntry,
+    current: Option<&SessionEntry>,
+    worker: Rc<Worker>,
+    popover: Popover,
+) -> Button {
+    let is_current = current.is_some_and(|current| current.socket_path == entry.socket_path);
+    let check = gtk4::Image::from_icon_name("object-select-symbolic");
+    check.add_css_class("session-check");
+    check.set_opacity(if is_current { 1.0 } else { 0.0 });
+    let label = Label::new(Some(&entry.name));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    label.set_single_line_mode(true);
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.append(&check);
+    content.append(&label);
+    let button = Button::new();
+    button.add_css_class("session-item");
+    if is_current {
+        button.add_css_class("current");
+    }
+    button.set_child(Some(&content));
+
+    let target = entry.clone();
+    button.connect_clicked(move |_| {
+        popover.popdown();
+        if !is_current {
+            worker.switch_session(target.clone());
+        }
+    });
+    button
+}
+
+fn populate_session_menu(
+    container: &GtkBox,
+    sessions: &[SessionEntry],
+    current: Option<&SessionEntry>,
+    worker: Rc<Worker>,
+    popover: &Popover,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    if sessions.is_empty() {
+        let empty = Label::new(Some("No sessions found"));
+        empty.add_css_class("session-empty");
+        container.append(&empty);
+        return;
+    }
+    for session in sessions {
+        container.append(&session_menu_item(
+            session,
+            current,
+            Rc::clone(&worker),
+            popover.clone(),
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reset_session_view(
+    screens: &RefCell<ScreenSet>,
+    entries: &RefCell<Vec<session::WorkspaceEntry>>,
+    workspaces: &ListBox,
+    drop_indicators: &RefCell<Vec<GtkBox>>,
+    search_state: &RefCell<search::SearchUiState>,
+    search_bar: &GtkBox,
+    search_entry: &Entry,
+    search_count: &Label,
+    tab_strip: &view::TabStripState,
+    scrollbar: &view::ScrollbarState,
+    rename_prompt: &RenamePrompt,
+    terminal: &DrawingArea,
+) {
+    *screens.borrow_mut() = ScreenSet::default();
+    entries.borrow_mut().clear();
+    drop_indicators.borrow_mut().clear();
+    workspaces.unselect_all();
+    while let Some(child) = workspaces.first_child() {
+        workspaces.remove(&child);
+    }
+    search_state.borrow_mut().close();
+    search_entry.set_text("");
+    search_count.set_text("0/0");
+    search_bar.set_visible(false);
+    tab_strip.set_hovered_screen(None);
+    tab_strip.set_hovered_tab(None);
+    scrollbar.set_hovered(None);
+    scrollbar.set_dragging(None);
+    rename_prompt.target.borrow_mut().take();
+    rename_prompt.popover.popdown();
+    terminal.queue_draw();
 }
 
 fn send_split_ratio(
@@ -882,7 +1037,7 @@ fn build_ui(application: &Application) {
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
-    let (update_tx, update_rx) = async_channel::unbounded::<Update>();
+    let (update_tx, update_rx) = async_channel::unbounded::<StampedUpdate>();
     let worker = Rc::new(session::spawn(
         args.session.clone(),
         args.socket.clone(),
@@ -893,6 +1048,8 @@ fn build_ui(application: &Application) {
     let tab_strip = Rc::new(view::TabStripState::default());
     let scrollbar = Rc::new(view::ScrollbarState::default());
     let search_state = Rc::new(RefCell::new(search::SearchUiState::default()));
+    let update_generation = Rc::new(Cell::new(0_u64));
+    let current_session = Rc::new(RefCell::new(None::<SessionEntry>));
 
     let css_provider = CssProvider::new();
     css_provider.load_from_data(&theme.css());
@@ -911,6 +1068,39 @@ fn build_ui(application: &Application) {
     titlebar.set_center_widget(Some(&title));
     let controls_start = WindowControls::new(PackType::Start);
     let controls_end = WindowControls::new(PackType::End);
+    let session_button = Button::from_icon_name("view-list-symbolic");
+    session_button.add_css_class("titlebar-action");
+    session_button.set_tooltip_text(Some("Sessions"));
+    let session_list = GtkBox::new(Orientation::Vertical, 0);
+    session_list.add_css_class("session-list");
+    let new_session_action = Button::with_label("New session...");
+    new_session_action.add_css_class("session-new");
+    let session_menu_content = GtkBox::new(Orientation::Vertical, 0);
+    session_menu_content.append(&session_list);
+    session_menu_content.append(&gtk4::Separator::new(Orientation::Horizontal));
+    session_menu_content.append(&new_session_action);
+    let session_popover = Popover::new();
+    session_popover.add_css_class("cmux-menu");
+    session_popover.add_css_class("session-menu");
+    session_popover.set_autohide(true);
+    session_popover.set_has_arrow(true);
+    session_popover.set_child(Some(&session_menu_content));
+    session_popover.set_parent(&session_button);
+    {
+        let worker = Rc::clone(&worker);
+        let session_list = session_list.clone();
+        let session_popover = session_popover.clone();
+        session_button.connect_clicked(move |_| {
+            while let Some(child) = session_list.first_child() {
+                session_list.remove(&child);
+            }
+            let loading = Label::new(Some("Loading..."));
+            loading.add_css_class("session-empty");
+            session_list.append(&loading);
+            session_popover.popup();
+            worker.refresh_sessions();
+        });
+    }
     let new_workspace = Button::from_icon_name("list-add-symbolic");
     new_workspace.add_css_class("titlebar-action");
     new_workspace.set_tooltip_text(Some("New workspace"));
@@ -922,6 +1112,7 @@ fn build_ui(application: &Application) {
     }
     let titlebar_actions = GtkBox::new(Orientation::Horizontal, 0);
     titlebar_actions.add_css_class("titlebar-actions");
+    titlebar_actions.append(&session_button);
     titlebar_actions.append(&new_workspace);
     titlebar_actions.append(&controls_end);
     titlebar.set_start_widget(Some(&controls_start));
@@ -995,7 +1186,7 @@ fn build_ui(application: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(application)
-        .title("cmux")
+        .title(format!("cmux — {}", args.session))
         .default_width(1000)
         .default_height(700)
         .child(&paned)
@@ -1004,6 +1195,16 @@ fn build_ui(application: &Application) {
     window.set_size_request(300, 200);
     window.set_titlebar(Some(&titlebar));
     let rename_prompt = Rc::new(build_rename_prompt(Rc::clone(&worker), toast.clone()));
+    let new_session_prompt = Rc::new(build_new_session_prompt(Rc::clone(&worker), toast.clone()));
+    {
+        let prompt = Rc::clone(&new_session_prompt);
+        let session_button = session_button.clone();
+        let session_popover = session_popover.clone();
+        new_session_action.connect_clicked(move |_| {
+            session_popover.popdown();
+            open_new_session_prompt(&prompt, &session_button);
+        });
+    }
 
     let context_target = Rc::new(RefCell::new(None::<PaneTarget>));
     let pane_menu_model = gio::Menu::new();
@@ -2209,13 +2410,91 @@ fn build_ui(application: &Application) {
         let drop_indicators = Rc::clone(&drop_indicators);
         let search_state = Rc::clone(&search_state);
         let search_count = search_count.clone();
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
+        let tab_strip = Rc::clone(&tab_strip);
+        let scrollbar = Rc::clone(&scrollbar);
+        let update_generation = Rc::clone(&update_generation);
+        let current_session = Rc::clone(&current_session);
+        let session_list = session_list.clone();
+        let session_popover = session_popover.clone();
+        let title = title.clone();
+        let window = window.clone();
         gtk4::glib::spawn_future_local(async move {
-            while let Ok(update) = update_rx.recv().await {
-                match update {
-                    Update::Connected { session_name } => {
-                        eprintln!("connected to session '{session_name}'");
+            while let Ok(stamped) = update_rx.recv().await {
+                if stamped.generation < update_generation.get() {
+                    continue;
+                }
+                if stamped.generation > update_generation.get() {
+                    update_generation.set(stamped.generation);
+                }
+                match stamped.update {
+                    Update::Connected { session } => {
+                        eprintln!("connected to session '{}'", session.name);
+                        let window_title = format!("cmux — {}", session.name);
+                        title.set_text(&window_title);
+                        window.set_title(Some(&window_title));
+                        *current_session.borrow_mut() = Some(session);
                         clear_toast(&toast);
                     }
+                    Update::Switching { session_name } => {
+                        reset_session_view(
+                            &screens,
+                            &entries,
+                            &workspaces,
+                            &drop_indicators,
+                            &search_state,
+                            &search_bar,
+                            &search_entry,
+                            &search_count,
+                            &tab_strip,
+                            &scrollbar,
+                            &rename_prompt,
+                            &terminal,
+                        );
+                        set_toast(&toast, &format!("Switching to session '{session_name}'..."));
+                    }
+                    Update::Disconnected {
+                        session_name,
+                        message,
+                    } => {
+                        reset_session_view(
+                            &screens,
+                            &entries,
+                            &workspaces,
+                            &drop_indicators,
+                            &search_state,
+                            &search_bar,
+                            &search_entry,
+                            &search_count,
+                            &tab_strip,
+                            &scrollbar,
+                            &rename_prompt,
+                            &terminal,
+                        );
+                        set_toast(
+                            &toast,
+                            &format!(
+                                "Session '{session_name}' disconnected; reconnecting: {message}"
+                            ),
+                        );
+                    }
+                    Update::Sessions(sessions) => {
+                        populate_session_menu(
+                            &session_list,
+                            &sessions,
+                            current_session.borrow().as_ref(),
+                            Rc::clone(&worker),
+                            &session_popover,
+                        );
+                    }
+                    Update::SwitchFailed {
+                        session_name,
+                        message,
+                    } => set_toast(
+                        &toast,
+                        &format!("Could not switch to session '{session_name}': {message}"),
+                    ),
                     Update::Workspaces(list) => {
                         let empty = list.is_empty();
                         let focused = list

@@ -17,9 +17,17 @@ seconds and then attaches. `--session <name>` applies the same behavior to a
 named session. From a source checkout, use
 `cargo run --release -- --session main` in this directory.
 
+The titlebar session button lists live cmux sockets in the current session's
+runtime directory. The list refreshes when the menu opens. Selecting another
+session switches the same window to it; **New session...** accepts a non-empty
+name, connects to an existing session with that name, or starts a new headless
+session beside the current socket. A failed switch restores the previous
+session and reports the failure in a toast.
+
 ## What it does
 
 - connects to a cmux session over `cmux.protocol/1`, starting it when needed
+- lists, switches and creates local sessions without opening another window
 - lists the session's workspaces in a sidebar
 - renders pane splits and tabs from the server's styled render stream
 - creates, closes and resizes panes through server-owned layout mutations
@@ -41,7 +49,7 @@ normally be terminal-emulation complexity stays server-side.
 | `src/main.rs` | GTK application, window, sidebar, wiring |
 | `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
 | `src/search.rs` | case-insensitive scrollback matching, result navigation and pure search geometry |
-| `src/session.rs` | protocol worker threads; render text and image payloads reach the UI without blocking it on a socket |
+| `src/session.rs` | protocol worker supervisor, session socket enumeration and joined control/attachment runtimes; render payloads reach GTK without blocking it on a socket |
 | `src/screen.rs` | cell and image state, with snapshot/patch merge semantics |
 | `src/view.rs` | cairo/Pango/Pixbuf drawing and key-to-bytes translation |
 
@@ -62,6 +70,7 @@ cargo run --release -- --probe --session main
 | | |
 | --- | --- |
 | Window chrome | custom 28px titlebar, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
+| Sessions | titlebar selector for live sibling sockets, current-session highlighting, in-place switching with rollback, and prompt-based headless session creation |
 | Panes | server-owned split layouts with per-pane PTY sizing, click-to-focus, split-right/split-down creation and pane close from the keyboard or context menu |
 | Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |
 | Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |

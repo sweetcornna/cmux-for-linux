@@ -462,6 +462,35 @@ popover.cmux-menu modelbutton {{
 popover.cmux-menu modelbutton:hover {{
   background-color: @selection_bg;
 }}
+popover.session-menu > contents {{
+  min-width: 210px;
+  padding: 4px;
+  background-color: @menu_bg;
+  color: @menu_fg;
+}}
+.session-list {{ border-spacing: 1px; }}
+.session-item,
+.session-new {{
+  min-height: 28px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background-color: transparent;
+  color: @menu_fg;
+}}
+.session-item:hover,
+.session-new:hover {{ background-color: @selection_bg; }}
+.session-item.current {{ background-color: @selection_bg; }}
+.session-check {{ min-width: 14px; min-height: 14px; }}
+.session-empty {{
+  min-height: 28px;
+  padding: 2px 8px;
+  color: @menu_fg;
+  opacity: 0.7;
+}}
+popover.session-menu separator {{
+  margin: 4px 2px;
+  background-color: @chrome_separator;
+}}
 popover.rename-prompt > contents {{
   padding: 6px;
   background-color: @menu_bg;

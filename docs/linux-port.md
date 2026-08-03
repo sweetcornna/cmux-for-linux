@@ -115,6 +115,14 @@ its socket is missing or refuses the connection, the frontend starts a
 headless `cmux` child and retries for up to five seconds; `--probe` remains a
 connection-only diagnostic and never starts a session.
 
+Each local cmux session is a separate mux backend and Unix control socket. The
+GTK titlebar session selector therefore scans the active socket's runtime
+directory for sibling Unix `*.sock` files and probes each socket, rather than
+using the connected backend's `Client::sessions()` result as a machine-wide
+catalog. The scan runs only when the menu opens. The same window can switch to
+a live result or create a named headless session; failed switches rebuild the
+previous connection and surface the error through the existing toast path.
+
 | Stage | Deliverable | State |
 | --- | --- | --- |
 | 0 | Fork, Linux-only tree, toolchain, native packages | **done** |
@@ -155,12 +163,22 @@ NewTab, CloseTab, tab-navigation, RenameScreen, RenameWorkspace and CloseScreen
 semantics.
 
 Workspace rows now expose hover close and double-click rename controls. A
-20x20 titlebar button creates workspaces, while row drag gestures compute a
-server index for `Workspace::move_to` and render the existing accent drop
-indicator. Closing the last workspace or last tab is never preflighted or
-blocked by GTK: the request reaches the server, and any rejection is displayed
-through the existing toast path. Pure tests cover screen/pane tab hit geometry,
-tab wrapping, rename input validation and workspace drag-index calculation.
+20x20 titlebar button creates workspaces, and an adjacent 20x20 button opens the
+session selector. Row drag gestures compute a server index for
+`Workspace::move_to` and render the existing accent drop indicator. Closing the
+last workspace or last tab is never preflighted or blocked by GTK: the request
+reaches the server, and any rejection is displayed through the existing toast
+path. Pure tests cover screen/pane tab hit geometry, tab wrapping, rename input
+validation, workspace drag-index calculation, worker rebuild decisions and
+session socket candidate parsing.
+
+Session switching and transport recovery share one protocol-worker supervisor.
+It unbinds GTK command routes, stops and joins the control thread, attachment
+manager and every attachment thread, then connects and publishes a fresh
+topology. Updates carry a connection generation so late events from the old
+runtime are ignored. An attachment disconnect enters the same teardown and
+rebuild path after the one-second reconnect interval; it no longer maintains a
+competing per-attachment reconnect loop.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
