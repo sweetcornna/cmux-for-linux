@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use cmux::{
     ColorHex, LayoutDirection, LayoutNode, LayoutViewport, PaneId, RenderCursorStyle,
-    RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline, Size, SplitId, TabId,
-    TerminalId,
+    RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline, ScreenId, Size,
+    SplitId, TabId, TerminalId,
 };
 use gtk4::pango;
 use gtk4::prelude::*;
@@ -26,6 +26,8 @@ use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 
 const TAB_HEIGHT: f64 = 28.0;
 const TAB_FADE_WIDTH: f64 = 100.0;
+const SCREEN_ACTION_WIDTH: f64 = 28.0;
+const SCREEN_CLOSE_SIZE: f64 = 20.0;
 const SIDEBAR_SCRIM_HEIGHT: f64 = 50.0;
 const UNFOCUSED_PANE_OPACITY: f64 = 0.70;
 const DIVIDER_HIT_SIZE: f64 = 6.0;
@@ -116,6 +118,38 @@ pub fn needs_blink(screens: &ScreenSet) -> bool {
 #[derive(Debug, Default)]
 pub struct MouseMoveThrottle {
     last: Option<(TerminalId, u16, u16)>,
+}
+
+#[derive(Debug, Default)]
+pub struct TabStripState {
+    hovered_screen: RefCell<Option<ScreenId>>,
+    hovered_tab: RefCell<Option<(PaneId, TabId)>>,
+}
+
+impl TabStripState {
+    pub fn hovered_screen(&self) -> Option<ScreenId> {
+        self.hovered_screen.borrow().clone()
+    }
+
+    pub fn set_hovered_screen(&self, screen: Option<ScreenId>) -> bool {
+        if *self.hovered_screen.borrow() == screen {
+            return false;
+        }
+        *self.hovered_screen.borrow_mut() = screen;
+        true
+    }
+
+    pub fn hovered_tab(&self) -> Option<(PaneId, TabId)> {
+        self.hovered_tab.borrow().clone()
+    }
+
+    pub fn set_hovered_tab(&self, tab: Option<(PaneId, TabId)>) -> bool {
+        if *self.hovered_tab.borrow() == tab {
+            return false;
+        }
+        *self.hovered_tab.borrow_mut() = tab;
+        true
+    }
 }
 
 impl MouseMoveThrottle {
@@ -218,7 +252,29 @@ type ImageCache = HashMap<(TerminalId, u32, u64), Option<gdk_pixbuf::Pixbuf>>;
 pub struct TabHit {
     pub id: TabId,
     pub rect: Rect,
+    pub close_rect: Rect,
     pub terminal: Option<TerminalId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenTabHit {
+    pub id: ScreenId,
+    pub rect: Rect,
+    pub close_rect: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScreenBarGeometry {
+    pub rect: Rect,
+    pub tabs: Vec<ScreenTabHit>,
+    pub new_button: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScreenBarHit {
+    Tab(ScreenId),
+    Close(ScreenId),
+    New,
 }
 
 #[derive(Clone, Debug)]
@@ -228,7 +284,15 @@ pub struct PaneGeometry {
     pub content: Rect,
     pub terminal: Option<TerminalId>,
     pub tabs: Vec<TabHit>,
+    pub new_tab_button: Option<Rect>,
     pub stack_header: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaneBarHit {
+    Tab(TabId),
+    Close(TabId),
+    New,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -316,12 +380,7 @@ pub fn pane_geometries(
     let Some(workspace) = screens.workspace.as_ref() else {
         return Vec::new();
     };
-    let area = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: f64::from(width.max(0)),
-        height: f64::from(height.max(0)),
-    };
+    let area = workspace_content_rect(width, height);
     let mut panes = Vec::new();
     if let Some(zoomed) = workspace.layout.zoomed_pane_id.as_ref() {
         push_pane(workspace, zoomed, area, false, metrics, &mut panes);
@@ -331,6 +390,15 @@ pub fn pane_geometries(
     panes
 }
 
+fn workspace_content_rect(width: i32, height: i32) -> Rect {
+    Rect {
+        x: 0.0,
+        y: TAB_HEIGHT.min(f64::from(height.max(0))),
+        width: f64::from(width.max(0)),
+        height: (f64::from(height.max(0)) - TAB_HEIGHT).max(0.0),
+    }
+}
+
 pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<SplitDivider> {
     let Some(workspace) = screens.workspace.as_ref() else {
         return Vec::new();
@@ -338,12 +406,7 @@ pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<Split
     if workspace.layout.zoomed_pane_id.is_some() {
         return Vec::new();
     }
-    let area = Rect {
-        x: 0.0,
-        y: 0.0,
-        width: f64::from(width.max(0)),
-        height: f64::from(height.max(0)),
-    };
+    let area = workspace_content_rect(width, height);
     let mut dividers = Vec::new();
     walk_dividers(
         &workspace.layout.root,
@@ -352,6 +415,112 @@ pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<Split
         &mut dividers,
     );
     dividers
+}
+
+pub fn screen_bar_geometry(
+    screens: &ScreenSet,
+    width: i32,
+    height: i32,
+) -> Option<ScreenBarGeometry> {
+    let workspace = screens.workspace.as_ref()?;
+    let bar_height = TAB_HEIGHT.min(f64::from(height.max(0)));
+    let width = f64::from(width.max(0));
+    let action_width = SCREEN_ACTION_WIDTH.min(width);
+    let tabs_width = (width - action_width).max(0.0);
+    let tab_width = if workspace.screen_tabs.is_empty() {
+        0.0
+    } else {
+        tabs_width / workspace.screen_tabs.len() as f64
+    };
+    let tabs = workspace
+        .screen_tabs
+        .iter()
+        .enumerate()
+        .map(|(index, screen)| {
+            let rect = Rect {
+                x: index as f64 * tab_width,
+                y: 0.0,
+                width: tab_width,
+                height: bar_height,
+            };
+            let close_width = SCREEN_CLOSE_SIZE.min(rect.width);
+            ScreenTabHit {
+                id: screen.id.clone(),
+                rect,
+                close_rect: Rect {
+                    x: rect.x + rect.width - close_width,
+                    y: rect.y + (rect.height - SCREEN_CLOSE_SIZE).max(0.0) / 2.0,
+                    width: close_width,
+                    height: SCREEN_CLOSE_SIZE.min(rect.height),
+                },
+            }
+        })
+        .collect();
+    Some(ScreenBarGeometry {
+        rect: Rect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: bar_height,
+        },
+        tabs,
+        new_button: Rect {
+            x: tabs_width,
+            y: 0.0,
+            width: action_width,
+            height: bar_height,
+        },
+    })
+}
+
+pub fn screen_bar_hit(geometry: &ScreenBarGeometry, x: f64, y: f64) -> Option<ScreenBarHit> {
+    if geometry.new_button.contains(x, y) {
+        return Some(ScreenBarHit::New);
+    }
+    geometry.tabs.iter().find_map(|tab| {
+        if tab.close_rect.contains(x, y) {
+            Some(ScreenBarHit::Close(tab.id.clone()))
+        } else if tab.rect.contains(x, y) {
+            Some(ScreenBarHit::Tab(tab.id.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+pub fn hovered_screen(geometry: &ScreenBarGeometry, x: f64, y: f64) -> Option<ScreenId> {
+    geometry
+        .tabs
+        .iter()
+        .find(|tab| tab.rect.contains(x, y))
+        .map(|tab| tab.id.clone())
+}
+
+pub fn pane_bar_hit(geometry: &PaneGeometry, x: f64, y: f64) -> Option<PaneBarHit> {
+    if geometry
+        .new_tab_button
+        .is_some_and(|button| button.contains(x, y))
+    {
+        return Some(PaneBarHit::New);
+    }
+    geometry.tabs.iter().find_map(|tab| {
+        if tab.close_rect.contains(x, y) {
+            Some(PaneBarHit::Close(tab.id.clone()))
+        } else if tab.rect.contains(x, y) {
+            Some(PaneBarHit::Tab(tab.id.clone()))
+        } else {
+            None
+        }
+    })
+}
+
+pub fn hovered_pane_tab(geometries: &[PaneGeometry], x: f64, y: f64) -> Option<(PaneId, TabId)> {
+    geometries.iter().find_map(|pane| {
+        pane.tabs
+            .iter()
+            .find(|tab| tab.rect.contains(x, y))
+            .map(|tab| (pane.pane.clone(), tab.id.clone()))
+    })
 }
 
 pub fn split_divider_at(dividers: &[SplitDivider], x: f64, y: f64) -> Option<&SplitDivider> {
@@ -675,10 +844,11 @@ fn push_pane(
             height: (rect.height - tab_height).max(0.0),
         }
     };
+    let tabs_width = (rect.width - SCREEN_ACTION_WIDTH).max(0.0);
     let tab_width = if pane.tabs.is_empty() {
         0.0
     } else {
-        rect.width / pane.tabs.len() as f64
+        tabs_width / pane.tabs.len() as f64
     };
     let tabs = if tab_height > 0.0 {
         pane.tabs
@@ -691,6 +861,12 @@ fn push_pane(
                     y: rect.y,
                     width: tab_width,
                     height: tab_height,
+                },
+                close_rect: Rect {
+                    x: rect.x + (index + 1) as f64 * tab_width - SCREEN_CLOSE_SIZE.min(tab_width),
+                    y: rect.y + (tab_height - SCREEN_CLOSE_SIZE).max(0.0) / 2.0,
+                    width: SCREEN_CLOSE_SIZE.min(tab_width),
+                    height: SCREEN_CLOSE_SIZE.min(tab_height),
                 },
                 terminal: match &tab.content {
                     TabContent::Terminal(terminal) => Some(terminal.clone()),
@@ -707,6 +883,12 @@ fn push_pane(
         content,
         terminal: pane.active_terminal().cloned(),
         tabs,
+        new_tab_button: (tab_height > 0.0).then_some(Rect {
+            x: rect.x + tabs_width,
+            y: rect.y,
+            width: SCREEN_ACTION_WIDTH.min(rect.width),
+            height: tab_height,
+        }),
         stack_header,
     });
 }
@@ -772,6 +954,7 @@ pub fn build(
     screens: Rc<RefCell<ScreenSet>>,
     theme: Rc<Theme>,
     blink: Rc<Cell<BlinkState>>,
+    tab_strip: Rc<TabStripState>,
 ) -> DrawingArea {
     let area = DrawingArea::new();
     area.set_focusable(true);
@@ -866,6 +1049,7 @@ pub fn build(
                     geometry,
                     &chrome,
                     blink.get().window_active(),
+                    tab_strip.hovered_tab().as_ref(),
                 );
             }
             let focused = geometry.pane == workspace.layout.active_pane_id;
@@ -883,8 +1067,133 @@ pub fn build(
             let _ = cr.restore();
             draw_border(cr, geometry.rect, focused, &chrome);
         }
+        if let Some(geometry) = screen_bar_geometry(&screens, width, height) {
+            draw_screen_bar(
+                area,
+                cr,
+                workspace,
+                &geometry,
+                tab_strip.hovered_screen().as_ref(),
+                &chrome,
+                blink.get().window_active(),
+            );
+        }
     });
     area
+}
+
+fn draw_screen_bar(
+    area: &DrawingArea,
+    cr: &gtk4::cairo::Context,
+    workspace: &WorkspaceView,
+    geometry: &ScreenBarGeometry,
+    hovered: Option<&ScreenId>,
+    colors: &ChromeColors,
+    window_active: bool,
+) {
+    let background = if colors.tab_bar_is_opaque {
+        colors.tab_bar_background
+    } else {
+        colors.background
+    };
+    let (red, green, blue) = background.cairo();
+    cr.set_source_rgb(red, green, blue);
+    cr.rectangle(
+        geometry.rect.x,
+        geometry.rect.y,
+        geometry.rect.width,
+        geometry.rect.height,
+    );
+    let _ = cr.fill();
+
+    let layout = area.create_pango_layout(None);
+    let mut font = pango::FontDescription::from_string("Sans");
+    font.set_absolute_size(11.0 * f64::from(pango::SCALE));
+    layout.set_font_description(Some(&font));
+    layout.set_ellipsize(pango::EllipsizeMode::End);
+
+    for (screen, hit) in workspace.screen_tabs.iter().zip(&geometry.tabs) {
+        if screen.focused {
+            let active_background = if window_active {
+                colors.tab_active_background
+            } else {
+                colors.tab_active_unfocused_background
+            };
+            let (red, green, blue) = active_background.cairo();
+            cr.set_source_rgb(red, green, blue);
+            cr.rectangle(hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height);
+            let _ = cr.fill();
+        }
+
+        let close_visible = hovered == Some(&screen.id);
+        let trailing = if close_visible {
+            SCREEN_CLOSE_SIZE + 6.0
+        } else {
+            8.0
+        };
+        layout.set_width(
+            ((hit.rect.width - trailing - 8.0).max(1.0) * f64::from(pango::SCALE)) as i32,
+        );
+        let fallback = format!("screen {}", screen.index + 1);
+        layout.set_text(
+            screen
+                .name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&fallback),
+        );
+        let foreground = if screen.focused && window_active {
+            colors.tab_active_foreground
+        } else if screen.focused {
+            colors.tab_active_unfocused_foreground
+        } else {
+            colors.tab_foreground
+        };
+        let (red, green, blue) = foreground.cairo();
+        cr.set_source_rgb(red, green, blue);
+        let (_, logical) = layout.pixel_extents();
+        let text_y = hit.rect.y + (hit.rect.height - f64::from(logical.height())) / 2.0
+            - f64::from(logical.y());
+        cr.move_to(hit.rect.x + 8.0, text_y);
+        pangocairo::functions::show_layout(cr, &layout);
+
+        if close_visible {
+            let center_x = hit.close_rect.x + hit.close_rect.width / 2.0;
+            let center_y = hit.close_rect.y + hit.close_rect.height / 2.0;
+            cr.set_line_width(1.25);
+            cr.move_to(center_x - 3.0, center_y - 3.0);
+            cr.line_to(center_x + 3.0, center_y + 3.0);
+            cr.move_to(center_x + 3.0, center_y - 3.0);
+            cr.line_to(center_x - 3.0, center_y + 3.0);
+            let _ = cr.stroke();
+        }
+    }
+
+    let fade_left = (geometry.rect.width - TAB_FADE_WIDTH).max(0.0);
+    let (red, green, blue) = background.cairo();
+    let gradient = gtk4::cairo::LinearGradient::new(fade_left, 0.0, geometry.rect.width, 0.0);
+    gradient.add_color_stop_rgba(0.0, red, green, blue, 0.0);
+    gradient.add_color_stop_rgba(0.60, red, green, blue, 0.0);
+    gradient.add_color_stop_rgba(1.0, red, green, blue, 0.86);
+    let _ = cr.set_source(&gradient);
+    cr.rectangle(
+        fade_left,
+        geometry.rect.y,
+        geometry.rect.width - fade_left,
+        geometry.rect.height,
+    );
+    let _ = cr.fill();
+
+    let (red, green, blue) = colors.tab_foreground.cairo();
+    cr.set_source_rgb(red, green, blue);
+    cr.set_line_width(1.25);
+    let center_x = geometry.new_button.x + geometry.new_button.width / 2.0;
+    let center_y = geometry.new_button.y + geometry.new_button.height / 2.0;
+    cr.move_to(center_x - 4.0, center_y);
+    cr.line_to(center_x + 4.0, center_y);
+    cr.move_to(center_x, center_y - 4.0);
+    cr.line_to(center_x, center_y + 4.0);
+    let _ = cr.stroke();
 }
 
 pub fn build_sidebar_scrims(theme: Rc<Theme>) -> DrawingArea {
@@ -1357,6 +1666,7 @@ fn draw_tabs(
     geometry: &PaneGeometry,
     colors: &ChromeColors,
     window_active: bool,
+    hovered: Option<&(PaneId, TabId)>,
 ) {
     let Some(pane) = pane else { return };
     let layout = area.create_pango_layout(None);
@@ -1388,7 +1698,16 @@ fn draw_tabs(
             cr.rectangle(hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height);
             let _ = cr.fill();
         }
-        layout.set_width(((hit.rect.width - 12.0).max(1.0) * f64::from(pango::SCALE)) as i32);
+        let close_visible =
+            hovered.is_some_and(|(pane_id, tab_id)| pane_id == &geometry.pane && tab_id == &tab.id);
+        let trailing = if close_visible {
+            SCREEN_CLOSE_SIZE + 6.0
+        } else {
+            6.0
+        };
+        layout.set_width(
+            ((hit.rect.width - trailing - 6.0).max(1.0) * f64::from(pango::SCALE)) as i32,
+        );
         layout.set_text(
             tab.name
                 .as_deref()
@@ -1412,8 +1731,30 @@ fn draw_tabs(
             - f64::from(logical.y());
         cr.move_to(hit.rect.x + 6.0, text_y);
         pangocairo::functions::show_layout(cr, &layout);
+        if close_visible {
+            let center_x = hit.close_rect.x + hit.close_rect.width / 2.0;
+            let center_y = hit.close_rect.y + hit.close_rect.height / 2.0;
+            cr.set_line_width(1.25);
+            cr.move_to(center_x - 3.0, center_y - 3.0);
+            cr.line_to(center_x + 3.0, center_y + 3.0);
+            cr.move_to(center_x + 3.0, center_y - 3.0);
+            cr.line_to(center_x - 3.0, center_y + 3.0);
+            let _ = cr.stroke();
+        }
     }
     draw_tab_fade_mask(cr, geometry, colors);
+    if let Some(button) = geometry.new_tab_button {
+        let (red, green, blue) = colors.tab_foreground.cairo();
+        cr.set_source_rgb(red, green, blue);
+        cr.set_line_width(1.25);
+        let center_x = button.x + button.width / 2.0;
+        let center_y = button.y + button.height / 2.0;
+        cr.move_to(center_x - 4.0, center_y);
+        cr.line_to(center_x + 4.0, center_y);
+        cr.move_to(center_x, center_y - 4.0);
+        cr.line_to(center_x, center_y + 4.0);
+        let _ = cr.stroke();
+    }
 }
 
 fn draw_tab_fade_mask(cr: &gtk4::cairo::Context, geometry: &PaneGeometry, colors: &ChromeColors) {
@@ -1614,7 +1955,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::screen::{PaneView, ScreenSet, TabContent, TabView, WorkspaceView};
+    use crate::screen::{PaneView, ScreenSet, ScreenTabView, TabContent, TabView, WorkspaceView};
 
     fn pane(number: u8) -> PaneId {
         PaneId::parse(format!("pane_{number:032x}")).unwrap()
@@ -1707,6 +2048,12 @@ mod tests {
             workspace: Some(WorkspaceView {
                 workspace_id: WorkspaceId::parse(format!("ws_{:032x}", 1)).unwrap(),
                 screen_id: ScreenId::parse(format!("screen_{:032x}", 1)).unwrap(),
+                screen_tabs: vec![ScreenTabView {
+                    id: ScreenId::parse(format!("screen_{:032x}", 1)).unwrap(),
+                    name: Some("main".to_string()),
+                    index: 0,
+                    focused: true,
+                }],
                 layout: LayoutDocument {
                     version: 1,
                     screen_id: ScreenId::parse(format!("screen_{:032x}", 1)).unwrap(),
@@ -1754,25 +2101,25 @@ mod tests {
             panes[0].rect,
             Rect {
                 x: 0.0,
-                y: 0.0,
+                y: 28.0,
                 width: 500.0,
-                height: 600.0
+                height: 572.0
             }
         );
         assert_eq!(
             panes[1].rect,
             Rect {
                 x: 500.0,
-                y: 0.0,
+                y: 28.0,
                 width: 500.0,
-                height: 600.0
+                height: 572.0
             }
         );
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
         assert_eq!(sizes.len(), 2);
         assert!(sizes
             .iter()
-            .all(|(_, size)| *size == Size { cols: 50, rows: 28 }));
+            .all(|(_, size)| *size == Size { cols: 50, rows: 27 }));
     }
 
     #[test]
@@ -1852,12 +2199,60 @@ mod tests {
         };
         let panes = pane_geometries(&screens, metrics, 1000, 600);
         assert_eq!(panes[0].tabs.len(), 2);
-        assert_eq!(panes[0].content.y, 28.0);
+        assert_eq!(panes[0].content.y, 56.0);
         assert_eq!(panes[0].tabs[1].terminal, None);
-        assert!(panes[0].tabs[1].rect.contains(375.0, 10.0));
+        assert!(panes[0].tabs[1].rect.contains(375.0, 38.0));
+        assert_eq!(panes[0].new_tab_button.unwrap().width, 28.0);
+        assert_eq!(pane_bar_hit(&panes[0], 486.0, 38.0), Some(PaneBarHit::New));
+        let second_close = panes[0].tabs[1].close_rect;
+        assert_eq!(
+            pane_bar_hit(
+                &panes[0],
+                second_close.x + second_close.width / 2.0,
+                second_close.y + second_close.height / 2.0,
+            ),
+            Some(PaneBarHit::Close(panes[0].tabs[1].id.clone()))
+        );
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
-        assert_eq!(sizes[0].1, Size { cols: 50, rows: 28 });
-        assert_eq!(sizes[1].1, Size { cols: 50, rows: 28 });
+        assert_eq!(sizes[0].1, Size { cols: 50, rows: 27 });
+        assert_eq!(sizes[1].1, Size { cols: 50, rows: 27 });
+    }
+
+    #[test]
+    fn screen_bar_reserves_action_lane_and_prioritizes_close_hits() {
+        let mut screens = split_workspace(false);
+        let workspace = screens.workspace.as_mut().unwrap();
+        workspace.screen_tabs.push(ScreenTabView {
+            id: ScreenId::parse(format!("screen_{:032x}", 2)).unwrap(),
+            name: Some("logs".to_string()),
+            index: 1,
+            focused: false,
+        });
+
+        let geometry = screen_bar_geometry(&screens, 428, 600).unwrap();
+        assert_eq!(geometry.rect.height, 28.0);
+        assert_eq!(geometry.new_button.width, 28.0);
+        assert_eq!(geometry.tabs.len(), 2);
+        assert_eq!(geometry.tabs[0].rect.width, 200.0);
+        assert_eq!(
+            screen_bar_hit(&geometry, 414.0, 14.0),
+            Some(ScreenBarHit::New)
+        );
+
+        let first = &geometry.tabs[0];
+        let close_x = first.close_rect.x + first.close_rect.width / 2.0;
+        assert_eq!(
+            screen_bar_hit(&geometry, close_x, 14.0),
+            Some(ScreenBarHit::Close(first.id.clone()))
+        );
+        assert_eq!(
+            screen_bar_hit(&geometry, 20.0, 14.0),
+            Some(ScreenBarHit::Tab(first.id.clone()))
+        );
+        assert_eq!(
+            hovered_screen(&geometry, 220.0, 14.0),
+            Some(geometry.tabs[1].id.clone())
+        );
     }
 
     #[test]

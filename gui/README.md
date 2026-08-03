@@ -63,9 +63,10 @@ cargo run --release -- --probe --session main
 | Window chrome | custom 28px titlebar, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
 | Panes | server-owned split layouts with per-pane PTY sizing, click-to-focus, split-right/split-down creation and pane close from the keyboard or context menu |
 | Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |
-| Tabs | an always-visible 28px strip with focused/unfocused active states and the upstream action-lane fade |
-| Input | keyboard input, including Ctrl and Alt sequences; `Ctrl+B %` / `Ctrl+B "` split right/down, `Ctrl+B X` closes a pane, `Ctrl+Shift+V` pastes through server-side bracketed-paste handling, and mouse input reaches applications |
-| Workspaces | macOS-parity sidebar rows, draggable width clamped to one third of the window, switching, and a topology refresh every 3 seconds |
+| Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |
+| Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
+| Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
+| Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology refreshes every 3 seconds |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations and a final authoritative value |
 | Scrollback | the mouse wheel scrolls the viewport |
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
@@ -75,6 +76,26 @@ cargo run --release -- --probe --session main
 
 The visual metrics and color rules follow
 [`../docs/gtk-design-parity.md`](../docs/gtk-design-parity.md).
+
+## Keyboard shortcuts
+
+The GUI follows the TUI's default `Ctrl+B` prefix. Press and release the prefix,
+then press the action key:
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl+B t` | Create a terminal tab in the focused pane (`NewTab`) |
+| `Ctrl+B x` | Close the focused pane tab (`CloseTab`); the server collapses a pane when this was its last tab |
+| `Ctrl+B Tab` / `Ctrl+B Shift+Tab` | Focus the next / previous pane tab, wrapping at either end |
+| `Ctrl+B ,` | Rename the active workspace screen |
+| `Ctrl+B &` | Close the active workspace screen (`CloseScreen`), not merely its focused pane tab |
+| `Ctrl+B $` | Rename the active workspace |
+| `Ctrl+B %` / `Ctrl+B "` | Split the focused pane right / down |
+| `Ctrl+B X` | Close the focused pane |
+
+The screen strip's `+` button creates a workspace screen. The titlebar `+`
+button creates a workspace. Those operations have separate TUI actions and are
+not remapped onto `NewTab`.
 
 ## Theme
 
@@ -125,7 +146,10 @@ CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 | Input | Handled by the GTK frontend | Forwarded to the pane application |
 | --- | --- | --- |
 | Click | Focuses the pane | The button event is forwarded when the application has requested mouse input |
+| Click on screen/pane tab chrome | Focuses, creates, closes or opens the rename prompt for the selected protocol resource | No |
+| Middle-click on a screen or pane tab | Closes that exact protocol resource | No |
 | Right-click | Focuses the pane and opens its split/close `PopoverMenu` | No |
+| Drag a workspace row | Reorders it through `Workspace::move_to` and shows the accent drop indicator | No |
 | Drag from a split divider | Resizes the server-owned split through a 6px hit region and shows a row/column resize cursor | No |
 | Shift+drag | Selects text locally | No |
 | Wheel over an alternate-screen application using mouse input | No local scrollback | Yes |

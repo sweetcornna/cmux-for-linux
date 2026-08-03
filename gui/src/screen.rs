@@ -20,6 +20,14 @@ use cmux::{
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenTabView {
+    pub id: ScreenId,
+    pub name: Option<String>,
+    pub index: u32,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TabContent {
     Terminal(TerminalId),
     Browser,
@@ -57,12 +65,25 @@ impl PaneView {
             TabContent::Browser => None,
         }
     }
+
+    pub fn adjacent_tab(&self, offset: i32) -> Option<&TabView> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let current = self
+            .active_tab()
+            .and_then(|active| self.tabs.iter().position(|tab| tab.id == active.id))
+            .unwrap_or(0) as i32;
+        let index = (current + offset).rem_euclid(self.tabs.len() as i32) as usize;
+        self.tabs.get(index)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkspaceView {
     pub workspace_id: WorkspaceId,
     pub screen_id: ScreenId,
+    pub screen_tabs: Vec<ScreenTabView>,
     pub layout: LayoutDocument,
     pub panes: Vec<PaneView>,
 }
@@ -408,7 +429,10 @@ fn place_rows(row_count: u16, rows: Vec<RenderRow>) -> Vec<Option<RenderRow>> {
 
 #[cfg(test)]
 mod tests {
-    use cmux::{RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement, RenderGraphics};
+    use cmux::{
+        PaneId, RenderGraphicFormat, RenderGraphicImage, RenderGraphicPlacement, RenderGraphics,
+        TabId,
+    };
 
     use super::*;
 
@@ -447,6 +471,46 @@ mod tests {
             anchor_row: Some(0),
             z: 0,
         }
+    }
+
+    fn pane_with_tabs(active: usize) -> PaneView {
+        let tabs = (0..3)
+            .map(|index| TabView {
+                id: TabId::parse(format!("tab_{:032x}", index + 1)).unwrap(),
+                name: None,
+                index: index as u32,
+                focused: index == active,
+                content: TabContent::Browser,
+            })
+            .collect::<Vec<_>>();
+        PaneView {
+            id: PaneId::parse(format!("pane_{:032x}", 1)).unwrap(),
+            name: None,
+            active_tab_id: Some(tabs[active].id.clone()),
+            tabs,
+        }
+    }
+
+    #[test]
+    fn adjacent_tab_wraps_in_both_directions() {
+        let first = pane_with_tabs(0);
+        assert_eq!(first.adjacent_tab(-1), first.tabs.get(2));
+        assert_eq!(first.adjacent_tab(1), first.tabs.get(1));
+
+        let last = pane_with_tabs(2);
+        assert_eq!(last.adjacent_tab(1), last.tabs.first());
+        assert_eq!(last.adjacent_tab(-1), last.tabs.get(1));
+    }
+
+    #[test]
+    fn adjacent_tab_handles_empty_panes() {
+        let pane = PaneView {
+            id: PaneId::parse(format!("pane_{:032x}", 1)).unwrap(),
+            name: None,
+            active_tab_id: None,
+            tabs: Vec::new(),
+        };
+        assert!(pane.adjacent_tab(1).is_none());
     }
 
     #[test]

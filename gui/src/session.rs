@@ -17,13 +17,14 @@ use std::thread;
 use std::time::Duration;
 
 use cmux::{
-    Client, Config, Direction, LayoutNode, PaneId, RenderPatch, RenderSnapshot, ScreenId,
-    ScrollOptions, Selector, Size, SplitId, SplitOptions, SplitRatioOptions, StreamPoll,
-    TabContentId, TabId, TerminalAttachOptions, TerminalAttachmentItem, TerminalId,
-    TerminalMouseOptions, TextInputOptions, WorkspaceId,
+    Client, Config, CreateScreenOptions, Direction, LayoutNode, PaneId, RenderPatch,
+    RenderSnapshot, ScreenId, ScrollOptions, Selector, Size, SplitId, SplitOptions,
+    SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
+    TerminalAttachmentItem, TerminalCreateOptions, TerminalId, TerminalMouseOptions,
+    TextInputOptions, WorkspaceId,
 };
 
-use crate::screen::{PaneView, TabContent, TabView, WorkspaceView};
+use crate::screen::{PaneView, ScreenTabView, TabContent, TabView, WorkspaceView};
 
 /// Short enough that resize and shutdown commands feel immediate without
 /// turning an idle attachment into a busy loop.
@@ -110,6 +111,34 @@ pub enum Input {
         workspace: WorkspaceId,
         target: Option<TerminalId>,
     },
+    CreateWorkspace,
+    RenameWorkspace {
+        workspace: WorkspaceId,
+        name: String,
+    },
+    CloseWorkspace {
+        workspace: WorkspaceId,
+    },
+    MoveWorkspace {
+        workspace: WorkspaceId,
+        index: u32,
+    },
+    CreateScreen {
+        workspace: WorkspaceId,
+    },
+    FocusScreen {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+    },
+    RenameScreen {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        name: String,
+    },
+    CloseScreen {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+    },
     FocusPane {
         workspace: WorkspaceId,
         screen: ScreenId,
@@ -122,6 +151,24 @@ pub enum Input {
         pane: PaneId,
         tab: TabId,
         target: Option<TerminalId>,
+    },
+    CreateTab {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+    },
+    CloseTab {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+        tab: TabId,
+    },
+    RenameTab {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+        tab: TabId,
+        name: String,
     },
     SplitPane {
         workspace: WorkspaceId,
@@ -601,6 +648,101 @@ fn control_loop(
                     }
                 }
             }
+            Input::CreateWorkspace => match session.create_workspace(None) {
+                Ok(_) => refresh_after_focus(&client, &updates),
+                Err(error) => {
+                    let _ = updates.send_blocking(Update::Error(format!(
+                        "workspace creation failed: {error}"
+                    )));
+                }
+            },
+            Input::RenameWorkspace { workspace, name } => {
+                match session.workspace(Selector::id(workspace)).rename(name) {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates.send_blocking(Update::Error(format!(
+                            "workspace rename failed: {error}"
+                        )));
+                    }
+                }
+            }
+            Input::CloseWorkspace { workspace } => {
+                match session.workspace(Selector::id(workspace)).close() {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates.send_blocking(Update::Error(format!(
+                            "workspace close failed: {error}"
+                        )));
+                    }
+                }
+            }
+            Input::MoveWorkspace { workspace, index } => {
+                match session.workspace(Selector::id(workspace)).move_to(index) {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates.send_blocking(Update::Error(format!(
+                            "workspace move failed: {error}"
+                        )));
+                    }
+                }
+            }
+            Input::CreateScreen { workspace } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .create_screen(CreateScreenOptions::default())
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates.send_blocking(Update::Error(format!(
+                            "screen creation failed: {error}"
+                        )));
+                    }
+                }
+            }
+            Input::FocusScreen { workspace, screen } => {
+                target = None;
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .focus()
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("screen focus failed: {error}")));
+                    }
+                }
+            }
+            Input::RenameScreen {
+                workspace,
+                screen,
+                name,
+            } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .rename(name)
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("screen rename failed: {error}")));
+                    }
+                }
+            }
+            Input::CloseScreen { workspace, screen } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .close()
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("screen close failed: {error}")));
+                    }
+                }
+            }
             Input::FocusPane {
                 workspace,
                 screen,
@@ -638,6 +780,65 @@ fn control_loop(
                     Err(error) => {
                         let _ = updates
                             .send_blocking(Update::Error(format!("tab focus failed: {error}")));
+                    }
+                }
+            }
+            Input::CreateTab {
+                workspace,
+                screen,
+                pane,
+            } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane))
+                    .create_terminal(TerminalCreateOptions::default())
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("tab creation failed: {error}")));
+                    }
+                }
+            }
+            Input::CloseTab {
+                workspace,
+                screen,
+                pane,
+                tab,
+            } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane))
+                    .tab(Selector::id(tab))
+                    .close()
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("tab close failed: {error}")));
+                    }
+                }
+            }
+            Input::RenameTab {
+                workspace,
+                screen,
+                pane,
+                tab,
+                name,
+            } => {
+                match session
+                    .workspace(Selector::id(workspace))
+                    .screen(Selector::id(screen))
+                    .pane(Selector::id(pane))
+                    .tab(Selector::id(tab))
+                    .rename(name)
+                {
+                    Ok(_) => refresh_after_focus(&client, &updates),
+                    Err(error) => {
+                        let _ = updates
+                            .send_blocking(Update::Error(format!("tab rename failed: {error}")));
                     }
                 }
             }
@@ -733,6 +934,7 @@ fn publish_workspaces(
             .map_err(|error| format!("could not read workspace: {error}"))?;
         let mut terminals = Vec::new();
         let mut views = Vec::new();
+        let mut screen_tabs = Vec::new();
 
         for screen_handle in workspace
             .screens()
@@ -741,6 +943,12 @@ fn publish_workspaces(
             let screen_snapshot = screen_handle
                 .refresh()
                 .map_err(|error| format!("could not read screen: {error}"))?;
+            screen_tabs.push(ScreenTabView {
+                id: screen_snapshot.id.clone(),
+                name: screen_snapshot.name.clone(),
+                index: screen_snapshot.index,
+                focused: screen_snapshot.focused,
+            });
             let mut panes = Vec::new();
             for pane_handle in screen_handle
                 .panes()
@@ -795,10 +1003,16 @@ fn publish_workspaces(
                 WorkspaceView {
                     workspace_id: snapshot.id.clone(),
                     screen_id: screen_snapshot.id,
+                    screen_tabs: Vec::new(),
                     layout: screen_snapshot.layout,
                     panes,
                 },
             ));
+        }
+
+        screen_tabs.sort_by_key(|screen| screen.index);
+        for (_, view) in &mut views {
+            view.screen_tabs.clone_from(&screen_tabs);
         }
 
         let view = views

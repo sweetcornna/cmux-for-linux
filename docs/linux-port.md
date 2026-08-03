@@ -123,7 +123,7 @@ connection-only diagnostic and never starts a session.
 | 3 | Package the GUI alongside the TUI | **done** - both frontends ship in the full `cmux` package |
 
 The stage 2 work verified against live sessions includes pane splits with
-per-pane PTY sizing, a tab strip, click-to-focus, mouse forwarding to terminal
+per-pane PTY sizing, tab strips, click-to-focus, mouse forwarding to terminal
 applications, border theming with xterm-256 indexes, a separate
 `cmux-gtk.json` font setting, malformed-configuration safety, selection with a
 Shift override, wheel scrollback, dynamic resize, workspace switching with a
@@ -143,18 +143,38 @@ viewport coordinates keep images aligned while scrolling. Cairo preserves
 source cropping and z-order around text, while the pane-wide inactive scrim
 dims images and text together to 70%.
 
+The GTK lifecycle pass now exposes both tab-like protocol levels without
+conflating them. Workspace `ScreenId` entries form the workspace-level screen
+strip and support focus, create, close and rename. Pane `TabId` entries retain
+their own strip and support focus, terminal-tab creation, close and rename.
+Hover close controls, middle-click close, double-click rename and action-lane
+creation all enqueue Rust binding mutations; the frontend waits for refreshed
+server topology before redrawing. The default `Ctrl+B` keymap matches the TUI:
+`t`, `x`, `Tab`, `Shift+Tab`, `,`, `$` and `&` retain their distinct
+NewTab, CloseTab, tab-navigation, RenameScreen, RenameWorkspace and CloseScreen
+semantics.
+
+Workspace rows now expose hover close and double-click rename controls. A
+20x20 titlebar button creates workspaces, while row drag gestures compute a
+server index for `Workspace::move_to` and render the existing accent drop
+indicator. Closing the last workspace or last tab is never preflighted or
+blocked by GTK: the request reaches the server, and any rejection is displayed
+through the existing toast path. Pure tests cover screen/pane tab hit geometry,
+tab wrapping, rename input validation and workspace drag-index calculation.
+
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
-240px resizable workspace sidebar, always-visible 28px pane tab strips,
+240px resizable workspace sidebar, always-visible 28px screen and pane tab strips,
 derived 1px separators, inactive-pane dimming, and overlay error toasts in
 place of a status bar. Chrome colors are recomputed from the active terminal's
 resolved background, with auto/light/dark semantics and explicit
 `cmux-tui.json` theme values taking precedence. This remains a presentation
 change only; render state, input, mouse reporting and PTY sizing still cross
 `cmux.protocol/1`, and the server remains the sole VT implementation.
-Pane creation, close and divider ratios likewise run through the Rust resource
-bindings on the protocol worker thread; the server owns each layout mutation
-and the GTK frontend redraws only after refreshed topology arrives.
+Pane, tab, screen and workspace lifecycle operations plus divider ratios all
+run through the Rust resource bindings on the protocol worker thread; the
+server owns every mutation and the GTK frontend redraws only after refreshed
+topology arrives.
 
 There is no remaining stage 2 tail.
 

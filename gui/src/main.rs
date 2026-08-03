@@ -25,10 +25,11 @@ use cmux::{
 use gtk4::prelude::*;
 use gtk4::{gdk, gio};
 use gtk4::{
-    Align, Application, ApplicationWindow, Box as GtkBox, CenterBox, CssProvider, DrawingArea,
-    EventControllerKey, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
-    GestureClick, GestureDrag, Label, ListBox, ListBoxRow, Orientation, Overlay, PackType, Paned,
-    PopoverMenu, ScrolledWindow, SelectionMode, WindowControls,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider,
+    DrawingArea, Entry, EventControllerKey, EventControllerMotion, EventControllerScroll,
+    EventControllerScrollFlags, GestureClick, GestureDrag, Label, ListBox, ListBoxRow, Orientation,
+    Overlay, PackType, Paned, Popover, PopoverMenu, ScrolledWindow, SelectionMode, Widget,
+    WindowControls,
 };
 
 use screen::ScreenSet;
@@ -52,6 +53,48 @@ struct PaneTarget {
     workspace: WorkspaceId,
     screen: ScreenId,
     pane: PaneId,
+}
+
+#[derive(Clone)]
+struct TabTarget {
+    pane: PaneTarget,
+    tab: cmux::TabId,
+    terminal: Option<TerminalId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RenameTarget {
+    Screen {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+    },
+    Tab {
+        workspace: WorkspaceId,
+        screen: ScreenId,
+        pane: PaneId,
+        tab: cmux::TabId,
+    },
+    Workspace(WorkspaceId),
+}
+
+struct RenamePrompt {
+    popover: Popover,
+    entry: Entry,
+    target: Rc<RefCell<Option<RenameTarget>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixAction {
+    NewTab,
+    NextTab,
+    PrevTab,
+    CloseTab,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    RenameScreen,
+    RenameWorkspace,
+    CloseScreen,
 }
 
 struct DividerDrag {
@@ -234,6 +277,42 @@ fn focused_pane_target(screens: &ScreenSet) -> Option<PaneTarget> {
     })
 }
 
+fn focused_tab_target(screens: &ScreenSet) -> Option<TabTarget> {
+    let workspace = screens.workspace.as_ref()?;
+    let pane = workspace.active_pane()?;
+    let tab = pane.active_tab()?;
+    Some(TabTarget {
+        pane: PaneTarget {
+            workspace: workspace.workspace_id.clone(),
+            screen: workspace.screen_id.clone(),
+            pane: pane.id.clone(),
+        },
+        tab: tab.id.clone(),
+        terminal: match &tab.content {
+            screen::TabContent::Terminal(terminal) => Some(terminal.clone()),
+            screen::TabContent::Browser => None,
+        },
+    })
+}
+
+fn adjacent_tab_target(screens: &ScreenSet, offset: i32) -> Option<TabTarget> {
+    let workspace = screens.workspace.as_ref()?;
+    let pane = workspace.active_pane()?;
+    let tab = pane.adjacent_tab(offset)?;
+    Some(TabTarget {
+        pane: PaneTarget {
+            workspace: workspace.workspace_id.clone(),
+            screen: workspace.screen_id.clone(),
+            pane: pane.id.clone(),
+        },
+        tab: tab.id.clone(),
+        terminal: match &tab.content {
+            screen::TabContent::Terminal(terminal) => Some(terminal.clone()),
+            screen::TabContent::Browser => None,
+        },
+    })
+}
+
 fn divider_at(
     screens: &ScreenSet,
     terminal: &DrawingArea,
@@ -266,6 +345,150 @@ fn send_close(worker: &Worker, target: &PaneTarget) {
         screen: target.screen.clone(),
         pane: target.pane.clone(),
     });
+}
+
+fn send_focus_tab(worker: &Worker, target: &TabTarget) {
+    let _ = worker.input.send(Input::FocusTab {
+        workspace: target.pane.workspace.clone(),
+        screen: target.pane.screen.clone(),
+        pane: target.pane.pane.clone(),
+        tab: target.tab.clone(),
+        target: target.terminal.clone(),
+    });
+}
+
+fn prefix_action(key: gdk::Key) -> Option<PrefixAction> {
+    match key {
+        gdk::Key::t => Some(PrefixAction::NewTab),
+        gdk::Key::Tab => Some(PrefixAction::NextTab),
+        gdk::Key::ISO_Left_Tab => Some(PrefixAction::PrevTab),
+        gdk::Key::x => Some(PrefixAction::CloseTab),
+        gdk::Key::percent => Some(PrefixAction::SplitRight),
+        gdk::Key::quotedbl => Some(PrefixAction::SplitDown),
+        gdk::Key::X => Some(PrefixAction::ClosePane),
+        gdk::Key::comma => Some(PrefixAction::RenameScreen),
+        gdk::Key::dollar => Some(PrefixAction::RenameWorkspace),
+        gdk::Key::ampersand => Some(PrefixAction::CloseScreen),
+        _ => None,
+    }
+}
+
+fn rename_submission(text: &str) -> Option<String> {
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn workspace_drop_index(
+    source: usize,
+    delta_y: f64,
+    row_height: f64,
+    count: usize,
+) -> Option<usize> {
+    if source >= count || count == 0 || !delta_y.is_finite() || row_height <= 0.0 {
+        return None;
+    }
+    let delta = (delta_y / row_height).round() as isize;
+    Some((source as isize + delta).clamp(0, count.saturating_sub(1) as isize) as usize)
+}
+
+fn build_rename_prompt(worker: Rc<Worker>, toast: Label) -> RenamePrompt {
+    let entry = Entry::new();
+    entry.set_max_length(120);
+    entry.set_width_chars(24);
+    entry.add_css_class("rename-entry");
+    let content = GtkBox::new(Orientation::Vertical, 0);
+    content.append(&entry);
+    let popover = Popover::new();
+    popover.add_css_class("cmux-menu");
+    popover.add_css_class("rename-prompt");
+    popover.set_autohide(true);
+    popover.set_has_arrow(true);
+    popover.set_child(Some(&content));
+    let target = Rc::new(RefCell::new(None::<RenameTarget>));
+
+    {
+        let target = Rc::clone(&target);
+        let worker = Rc::clone(&worker);
+        let popover = popover.clone();
+        let toast = toast.clone();
+        entry.connect_activate(move |entry| {
+            let Some(name) = rename_submission(entry.text().as_str()) else {
+                set_toast(&toast, "Name cannot be empty");
+                return;
+            };
+            let Some(target) = target.borrow_mut().take() else {
+                return;
+            };
+            let input = match target {
+                RenameTarget::Screen { workspace, screen } => Input::RenameScreen {
+                    workspace,
+                    screen,
+                    name,
+                },
+                RenameTarget::Tab {
+                    workspace,
+                    screen,
+                    pane,
+                    tab,
+                } => Input::RenameTab {
+                    workspace,
+                    screen,
+                    pane,
+                    tab,
+                    name,
+                },
+                RenameTarget::Workspace(workspace) => Input::RenameWorkspace { workspace, name },
+            };
+            let _ = worker.input.send(input);
+            popover.popdown();
+        });
+    }
+    {
+        let target = Rc::clone(&target);
+        let popover = popover.clone();
+        let keys = EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Escape {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            target.borrow_mut().take();
+            popover.popdown();
+            gtk4::glib::Propagation::Stop
+        });
+        entry.add_controller(keys);
+    }
+    {
+        let target = Rc::clone(&target);
+        popover.connect_closed(move |_| {
+            target.borrow_mut().take();
+        });
+    }
+
+    RenamePrompt {
+        popover,
+        entry,
+        target,
+    }
+}
+
+fn open_rename_prompt(
+    prompt: &RenamePrompt,
+    parent: &impl IsA<Widget>,
+    pointing_to: gdk::Rectangle,
+    target: RenameTarget,
+    current_name: &str,
+) {
+    prompt.popover.popdown();
+    if prompt.popover.parent().is_some() {
+        prompt.popover.unparent();
+    }
+    prompt.popover.set_parent(parent);
+    prompt.popover.set_pointing_to(Some(&pointing_to));
+    prompt.entry.set_text(current_name);
+    prompt.entry.select_region(0, -1);
+    *prompt.target.borrow_mut() = Some(target);
+    prompt.popover.popup();
+    prompt.entry.grab_focus();
 }
 
 fn send_split_ratio(
@@ -371,7 +594,14 @@ fn refresh_chrome(
     }
 }
 
-fn workspace_row(entry: &session::WorkspaceEntry, theme: Rc<view::Theme>) -> ListBoxRow {
+fn workspace_row(
+    entry: &session::WorkspaceEntry,
+    theme: Rc<view::Theme>,
+    worker: Rc<Worker>,
+    rename_prompt: Rc<RenamePrompt>,
+    drop_indicators: Rc<RefCell<Vec<GtkBox>>>,
+    workspace_count: usize,
+) -> ListBoxRow {
     let title = if entry.name.is_empty() {
         "(unnamed)"
     } else {
@@ -450,17 +680,116 @@ fn workspace_row(entry: &session::WorkspaceEntry, theme: Rc<view::Theme>) -> Lis
         overlay.add_overlay(&rail);
     }
 
+    let close = Button::from_icon_name("window-close-symbolic");
+    close.add_css_class("workspace-close");
+    close.set_halign(Align::End);
+    close.set_valign(Align::Center);
+    close.set_tooltip_text(Some("Close workspace"));
+    {
+        let worker = Rc::clone(&worker);
+        let workspace = entry.id.clone();
+        close.connect_clicked(move |_| {
+            let _ = worker.input.send(Input::CloseWorkspace {
+                workspace: workspace.clone(),
+            });
+        });
+    }
+    overlay.add_overlay(&close);
+
+    let drop_indicator = GtkBox::new(Orientation::Horizontal, 0);
+    drop_indicator.add_css_class("drop-indicator");
+    drop_indicator.set_halign(Align::Fill);
+    drop_indicator.set_valign(Align::Start);
+    drop_indicator.set_can_target(false);
+    drop_indicator.set_visible(false);
+    overlay.add_overlay(&drop_indicator);
+    drop_indicators.borrow_mut().push(drop_indicator);
+
     let row = ListBoxRow::new();
     row.add_css_class("workspace-row");
     row.set_child(Some(&overlay));
+
+    let rename_click = GestureClick::new();
+    rename_click.set_button(1);
+    {
+        let label = label.clone();
+        let rename_prompt = Rc::clone(&rename_prompt);
+        let workspace = entry.id.clone();
+        let current_name = entry.name.clone();
+        rename_click.connect_pressed(move |_, press_count, _, _| {
+            if press_count != 2 {
+                return;
+            }
+            open_rename_prompt(
+                &rename_prompt,
+                &label,
+                gdk::Rectangle::new(0, 0, label.width().max(1), label.height().max(1)),
+                RenameTarget::Workspace(workspace.clone()),
+                &current_name,
+            );
+        });
+    }
+    label.add_controller(rename_click);
+
     let drag = GestureDrag::new();
+    drag.set_button(1);
     {
         let row = row.clone();
         drag.connect_drag_begin(move |_, _, _| row.add_css_class("dragging"));
     }
     {
         let row = row.clone();
-        drag.connect_drag_end(move |_, _, _| row.remove_css_class("dragging"));
+        let drop_indicators = Rc::clone(&drop_indicators);
+        drag.connect_drag_update(move |_, _, delta_y| {
+            for indicator in drop_indicators.borrow().iter() {
+                indicator.set_visible(false);
+            }
+            let Ok(source) = usize::try_from(row.index()) else {
+                return;
+            };
+            let row_height = f64::from((row.height() + 2).max(1));
+            let Some(target) = workspace_drop_index(source, delta_y, row_height, workspace_count)
+            else {
+                return;
+            };
+            if target == source {
+                return;
+            }
+            if let Some(indicator) = drop_indicators.borrow().get(target) {
+                indicator.set_valign(if target < source {
+                    Align::Start
+                } else {
+                    Align::End
+                });
+                indicator.set_visible(true);
+            }
+        });
+    }
+    {
+        let row = row.clone();
+        let drop_indicators = Rc::clone(&drop_indicators);
+        let worker = Rc::clone(&worker);
+        let workspace = entry.id.clone();
+        drag.connect_drag_end(move |_, _, delta_y| {
+            row.remove_css_class("dragging");
+            for indicator in drop_indicators.borrow().iter() {
+                indicator.set_visible(false);
+            }
+            let Ok(source) = usize::try_from(row.index()) else {
+                return;
+            };
+            let row_height = f64::from((row.height() + 2).max(1));
+            let Some(target) = workspace_drop_index(source, delta_y, row_height, workspace_count)
+            else {
+                return;
+            };
+            if target != source {
+                let _ = worker.input.send(Input::MoveWorkspace {
+                    workspace: workspace.clone(),
+                    index: target as u32,
+                });
+            }
+        });
     }
     row.add_controller(drag);
     row
@@ -470,6 +799,7 @@ fn build_ui(application: &Application) {
     let args = parse_args();
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
+    let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let (update_tx, update_rx) = async_channel::unbounded::<Update>();
     let worker = Rc::new(session::spawn(
         args.session.clone(),
@@ -478,6 +808,7 @@ fn build_ui(application: &Application) {
         update_tx,
     ));
     let blink = Rc::new(Cell::new(view::BlinkState::new(false)));
+    let tab_strip = Rc::new(view::TabStripState::default());
 
     let css_provider = CssProvider::new();
     css_provider.load_from_data(&theme.css());
@@ -496,12 +827,26 @@ fn build_ui(application: &Application) {
     titlebar.set_center_widget(Some(&title));
     let controls_start = WindowControls::new(PackType::Start);
     let controls_end = WindowControls::new(PackType::End);
+    let new_workspace = Button::from_icon_name("list-add-symbolic");
+    new_workspace.add_css_class("titlebar-action");
+    new_workspace.set_tooltip_text(Some("New workspace"));
+    {
+        let worker = Rc::clone(&worker);
+        new_workspace.connect_clicked(move |_| {
+            let _ = worker.input.send(Input::CreateWorkspace);
+        });
+    }
+    let titlebar_actions = GtkBox::new(Orientation::Horizontal, 0);
+    titlebar_actions.add_css_class("titlebar-actions");
+    titlebar_actions.append(&new_workspace);
+    titlebar_actions.append(&controls_end);
     titlebar.set_start_widget(Some(&controls_start));
-    titlebar.set_end_widget(Some(&controls_end));
+    titlebar.set_end_widget(Some(&titlebar_actions));
 
     let workspaces = ListBox::new();
     workspaces.set_selection_mode(SelectionMode::Single);
     workspaces.add_css_class("workspace-list");
+    let drop_indicators: Rc<RefCell<Vec<GtkBox>>> = Rc::new(RefCell::new(Vec::new()));
     let sidebar_scroll = ScrolledWindow::builder()
         .child(&workspaces)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -512,7 +857,12 @@ fn build_ui(application: &Application) {
     sidebar.add_css_class("sidebar-surface");
     sidebar.set_child(Some(&sidebar_scroll));
     sidebar.add_overlay(&sidebar_scrims);
-    let terminal = view::build(Rc::clone(&screens), Rc::clone(&theme), Rc::clone(&blink));
+    let terminal = view::build(
+        Rc::clone(&screens),
+        Rc::clone(&theme),
+        Rc::clone(&blink),
+        Rc::clone(&tab_strip),
+    );
 
     let toast = Label::new(None);
     toast.add_css_class("toast");
@@ -544,6 +894,7 @@ fn build_ui(application: &Application) {
     window.add_css_class("cmux-window");
     window.set_size_request(300, 200);
     window.set_titlebar(Some(&titlebar));
+    let rename_prompt = Rc::new(build_rename_prompt(Rc::clone(&worker), toast.clone()));
 
     let context_target = Rc::new(RefCell::new(None::<PaneTarget>));
     let pane_menu_model = gio::Menu::new();
@@ -656,6 +1007,8 @@ fn build_ui(application: &Application) {
         let screens = Rc::clone(&screens);
         let terminal_for_keys = terminal.clone();
         let toast = toast.clone();
+        let rename_prompt = Rc::clone(&rename_prompt);
+        let entries = Rc::clone(&entries);
         let prefix_armed = Cell::new(false);
         key_controller.connect_key_pressed(move |_, key, _, state| {
             let is_prefix = state.contains(gdk::ModifierType::CONTROL_MASK)
@@ -670,30 +1023,131 @@ fn build_ui(application: &Application) {
                     let _ = worker.input.send(Input::Bytes(vec![0x02]));
                     return gtk4::glib::Propagation::Stop;
                 }
-                let target = focused_pane_target(&screens.borrow());
-                match key.to_unicode() {
-                    Some('%') => {
-                        if let Some(target) = target.as_ref() {
-                            send_split(&worker, target, Direction::Right);
+                let action = prefix_action(key);
+                let screens_ref = screens.borrow();
+                match action {
+                    Some(PrefixAction::NewTab) => {
+                        if let Some(target) = focused_pane_target(&screens_ref) {
+                            let _ = worker.input.send(Input::CreateTab {
+                                workspace: target.workspace,
+                                screen: target.screen,
+                                pane: target.pane,
+                            });
+                        } else {
+                            set_toast(&toast, "No focused pane for a new tab");
+                        }
+                    }
+                    Some(PrefixAction::NextTab) | Some(PrefixAction::PrevTab) => {
+                        let offset = if action == Some(PrefixAction::NextTab) {
+                            1
+                        } else {
+                            -1
+                        };
+                        if let Some(target) = adjacent_tab_target(&screens_ref, offset) {
+                            send_focus_tab(&worker, &target);
+                        } else {
+                            set_toast(&toast, "No focused tab to switch");
+                        }
+                    }
+                    Some(PrefixAction::CloseTab) => {
+                        if let Some(target) = focused_tab_target(&screens_ref) {
+                            let _ = worker.input.send(Input::CloseTab {
+                                workspace: target.pane.workspace,
+                                screen: target.pane.screen,
+                                pane: target.pane.pane,
+                                tab: target.tab,
+                            });
+                        } else {
+                            set_toast(&toast, "No focused tab to close");
+                        }
+                    }
+                    Some(PrefixAction::SplitRight) | Some(PrefixAction::SplitDown) => {
+                        if let Some(target) = focused_pane_target(&screens_ref) {
+                            let direction = if action == Some(PrefixAction::SplitRight) {
+                                Direction::Right
+                            } else {
+                                Direction::Down
+                            };
+                            send_split(&worker, &target, direction);
                         } else {
                             set_toast(&toast, "No focused pane to split");
                         }
                     }
-                    Some('"') => {
-                        if let Some(target) = target.as_ref() {
-                            send_split(&worker, target, Direction::Down);
-                        } else {
-                            set_toast(&toast, "No focused pane to split");
-                        }
-                    }
-                    Some('X') => {
-                        if let Some(target) = target.as_ref() {
-                            send_close(&worker, target);
+                    Some(PrefixAction::ClosePane) => {
+                        if let Some(target) = focused_pane_target(&screens_ref) {
+                            send_close(&worker, &target);
                         } else {
                             set_toast(&toast, "No focused pane to close");
                         }
                     }
-                    _ => {}
+                    Some(PrefixAction::RenameScreen) => {
+                        if let Some(workspace) = screens_ref.workspace.as_ref() {
+                            let screen = workspace
+                                .screen_tabs
+                                .iter()
+                                .find(|screen| screen.id == workspace.screen_id);
+                            if let Some(screen) = screen {
+                                let geometry = view::screen_bar_geometry(
+                                    &screens_ref,
+                                    terminal_for_keys.width(),
+                                    terminal_for_keys.height(),
+                                );
+                                let rect = geometry
+                                    .as_ref()
+                                    .and_then(|geometry| {
+                                        geometry.tabs.iter().find(|tab| tab.id == screen.id)
+                                    })
+                                    .map(|tab| {
+                                        gdk::Rectangle::new(
+                                            tab.rect.x as i32,
+                                            tab.rect.y as i32,
+                                            tab.rect.width.max(1.0) as i32,
+                                            tab.rect.height.max(1.0) as i32,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| gdk::Rectangle::new(0, 0, 1, 1));
+                                open_rename_prompt(
+                                    &rename_prompt,
+                                    &terminal_for_keys,
+                                    rect,
+                                    RenameTarget::Screen {
+                                        workspace: workspace.workspace_id.clone(),
+                                        screen: screen.id.clone(),
+                                    },
+                                    screen.name.as_deref().unwrap_or(""),
+                                );
+                            }
+                        }
+                    }
+                    Some(PrefixAction::RenameWorkspace) => {
+                        if let Some(workspace) = screens_ref.workspace.as_ref() {
+                            let entry = entries
+                                .borrow()
+                                .iter()
+                                .find(|entry| entry.id == workspace.workspace_id)
+                                .cloned();
+                            if let Some(entry) = entry {
+                                open_rename_prompt(
+                                    &rename_prompt,
+                                    &terminal_for_keys,
+                                    gdk::Rectangle::new(0, 0, 1, 1),
+                                    RenameTarget::Workspace(entry.id),
+                                    &entry.name,
+                                );
+                            }
+                        }
+                    }
+                    Some(PrefixAction::CloseScreen) => {
+                        if let Some(workspace) = screens_ref.workspace.as_ref() {
+                            let _ = worker.input.send(Input::CloseScreen {
+                                workspace: workspace.workspace_id.clone(),
+                                screen: workspace.screen_id.clone(),
+                            });
+                        } else {
+                            set_toast(&toast, "No focused screen to close");
+                        }
+                    }
+                    None => {}
                 }
                 return gtk4::glib::Propagation::Stop;
             }
@@ -759,7 +1213,8 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
-        let theme = Rc::clone(&theme);
+        let theme_for_enter = Rc::clone(&theme);
+        let theme_for_motion = Rc::clone(&theme);
         let pointer_for_enter = Rc::clone(&pointer);
         let pointer_for_motion = Rc::clone(&pointer);
         let pointer_for_leave = Rc::clone(&pointer);
@@ -770,6 +1225,9 @@ fn build_ui(application: &Application) {
         let screens_for_motion = Rc::clone(&screens);
         let drag_direction_for_motion = Rc::clone(&divider_drag_direction);
         let drag_direction_for_leave = Rc::clone(&divider_drag_direction);
+        let tab_strip_for_enter = Rc::clone(&tab_strip);
+        let tab_strip_for_motion = Rc::clone(&tab_strip);
+        let tab_strip_for_leave = Rc::clone(&tab_strip);
         let terminal_for_enter = terminal.clone();
         let terminal_for_motion = terminal.clone();
         let terminal_for_leave = terminal.clone();
@@ -777,12 +1235,51 @@ fn build_ui(application: &Application) {
         motion.connect_enter(move |_, x, y| {
             pointer_for_enter.set(Some((x, y)));
             throttle_for_enter.borrow_mut().reset();
-            let direction = divider_at(&screens_for_enter.borrow(), &terminal_for_enter, x, y)
-                .map(|divider| divider.direction);
+            let screens = screens_for_enter.borrow();
+            let hovered_screen = view::screen_bar_geometry(
+                &screens,
+                terminal_for_enter.width(),
+                terminal_for_enter.height(),
+            )
+            .and_then(|geometry| view::hovered_screen(&geometry, x, y));
+            let panes = view::pane_geometries(
+                &screens,
+                view::cell_metrics(&terminal_for_enter, &theme_for_enter),
+                terminal_for_enter.width(),
+                terminal_for_enter.height(),
+            );
+            let hovered_tab = view::hovered_pane_tab(&panes, x, y);
+            let screen_changed = tab_strip_for_enter.set_hovered_screen(hovered_screen);
+            let tab_changed = tab_strip_for_enter.set_hovered_tab(hovered_tab);
+            if screen_changed || tab_changed {
+                terminal_for_enter.queue_draw();
+            }
+            let direction =
+                divider_at(&screens, &terminal_for_enter, x, y).map(|divider| divider.direction);
             terminal_for_enter.set_cursor_from_name(direction.map(resize_cursor));
         });
         motion.connect_motion(move |controller, x, y| {
             pointer_for_motion.set(Some((x, y)));
+            let screens_ref = screens_for_motion.borrow();
+            let hovered_screen = view::screen_bar_geometry(
+                &screens_ref,
+                terminal_for_motion.width(),
+                terminal_for_motion.height(),
+            )
+            .and_then(|geometry| view::hovered_screen(&geometry, x, y));
+            let panes = view::pane_geometries(
+                &screens_ref,
+                view::cell_metrics(&terminal_for_motion, &theme_for_motion),
+                terminal_for_motion.width(),
+                terminal_for_motion.height(),
+            );
+            let hovered_tab = view::hovered_pane_tab(&panes, x, y);
+            let screen_changed = tab_strip_for_motion.set_hovered_screen(hovered_screen);
+            let tab_changed = tab_strip_for_motion.set_hovered_tab(hovered_tab);
+            if screen_changed || tab_changed {
+                terminal_for_motion.queue_draw();
+            }
+            drop(screens_ref);
             let state = controller.current_event_state();
             let held = mouse_button_held(state);
             let direction = drag_direction_for_motion.get().or_else(|| {
@@ -801,7 +1298,7 @@ fn build_ui(application: &Application) {
             if held && state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
             }
-            let metrics = view::cell_metrics(&terminal_for_motion, &theme);
+            let metrics = view::cell_metrics(&terminal_for_motion, &theme_for_motion);
             let Some(target) = mouse_target(&screens.borrow(), &terminal_for_motion, metrics, x, y)
             else {
                 if !held {
@@ -833,6 +1330,11 @@ fn build_ui(application: &Application) {
         motion.connect_leave(move |_| {
             pointer_for_leave.set(None);
             throttle_for_leave.borrow_mut().reset();
+            let screen_changed = tab_strip_for_leave.set_hovered_screen(None);
+            let tab_changed = tab_strip_for_leave.set_hovered_tab(None);
+            if screen_changed || tab_changed {
+                terminal_for_leave.queue_draw();
+            }
             terminal_for_leave
                 .set_cursor_from_name(drag_direction_for_leave.get().map(resize_cursor));
         });
@@ -904,14 +1406,81 @@ fn build_ui(application: &Application) {
         let terminal_for_release = terminal.clone();
         let context_target_for_click = Rc::clone(&context_target);
         let pane_menu_for_click = pane_menu.clone();
+        let rename_prompt_for_click = Rc::clone(&rename_prompt);
         let suppress_for_click = Rc::clone(&suppress_mouse_release);
         let suppress_for_release = Rc::clone(&suppress_mouse_release);
         let click = GestureClick::new();
         click.set_button(0);
-        click.connect_pressed(move |gesture, _, x, y| {
+        click.connect_pressed(move |gesture, press_count, x, y| {
             terminal_for_click.grab_focus();
             suppress_for_click.set(false);
             let screens = screens.borrow();
+            let button_number = gesture.current_button();
+            if let Some(geometry) = view::screen_bar_geometry(
+                &screens,
+                terminal_for_click.width(),
+                terminal_for_click.height(),
+            ) {
+                if let Some(hit) = view::screen_bar_hit(&geometry, x, y) {
+                    let Some(workspace) = screens.workspace.as_ref() else {
+                        return;
+                    };
+                    suppress_for_click.set(true);
+                    match hit {
+                        view::ScreenBarHit::New if button_number == 1 => {
+                            let _ = worker.input.send(Input::CreateScreen {
+                                workspace: workspace.workspace_id.clone(),
+                            });
+                        }
+                        view::ScreenBarHit::Close(screen) if button_number == 1 => {
+                            let _ = worker.input.send(Input::CloseScreen {
+                                workspace: workspace.workspace_id.clone(),
+                                screen,
+                            });
+                        }
+                        view::ScreenBarHit::Tab(screen) if button_number == 2 => {
+                            let _ = worker.input.send(Input::CloseScreen {
+                                workspace: workspace.workspace_id.clone(),
+                                screen,
+                            });
+                        }
+                        view::ScreenBarHit::Tab(screen)
+                            if button_number == 1 && press_count == 2 =>
+                        {
+                            let screen_entry = workspace
+                                .screen_tabs
+                                .iter()
+                                .find(|entry| entry.id == screen);
+                            let tab = geometry.tabs.iter().find(|tab| tab.id == screen);
+                            if let (Some(screen_entry), Some(tab)) = (screen_entry, tab) {
+                                open_rename_prompt(
+                                    &rename_prompt_for_click,
+                                    &terminal_for_click,
+                                    gdk::Rectangle::new(
+                                        tab.rect.x as i32,
+                                        tab.rect.y as i32,
+                                        tab.rect.width.max(1.0) as i32,
+                                        tab.rect.height.max(1.0) as i32,
+                                    ),
+                                    RenameTarget::Screen {
+                                        workspace: workspace.workspace_id.clone(),
+                                        screen,
+                                    },
+                                    screen_entry.name.as_deref().unwrap_or(""),
+                                );
+                            }
+                        }
+                        view::ScreenBarHit::Tab(screen) if button_number == 1 => {
+                            let _ = worker.input.send(Input::FocusScreen {
+                                workspace: workspace.workspace_id.clone(),
+                                screen,
+                            });
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+            }
             if divider_at(&screens, &terminal_for_click, x, y).is_some() {
                 suppress_for_click.set(true);
                 return;
@@ -928,28 +1497,75 @@ fn build_ui(application: &Application) {
             let Some(pane) = geometries.iter().find(|pane| pane.rect.contains(x, y)) else {
                 return;
             };
-            let tab = pane.tabs.iter().find(|tab| tab.rect.contains(x, y));
-            if let Some(tab) = tab {
-                let _ = worker.input.send(Input::FocusTab {
-                    workspace: workspace.workspace_id.clone(),
-                    screen: workspace.screen_id.clone(),
-                    pane: pane.pane.clone(),
-                    tab: tab.id.clone(),
-                    target: tab.terminal.clone(),
-                });
-            } else {
-                let target = workspace
-                    .pane(&pane.pane)
-                    .and_then(|pane| pane.active_terminal())
-                    .cloned();
-                let _ = worker.input.send(Input::FocusPane {
-                    workspace: workspace.workspace_id.clone(),
-                    screen: workspace.screen_id.clone(),
-                    pane: pane.pane.clone(),
-                    target,
-                });
+            let pane_bar_hit = view::pane_bar_hit(pane, x, y);
+            if let Some(hit) = pane_bar_hit.as_ref() {
+                match hit {
+                    view::PaneBarHit::New if button_number == 1 => {
+                        let _ = worker.input.send(Input::CreateTab {
+                            workspace: workspace.workspace_id.clone(),
+                            screen: workspace.screen_id.clone(),
+                            pane: pane.pane.clone(),
+                        });
+                    }
+                    view::PaneBarHit::Close(tab) if button_number == 1 => {
+                        let _ = worker.input.send(Input::CloseTab {
+                            workspace: workspace.workspace_id.clone(),
+                            screen: workspace.screen_id.clone(),
+                            pane: pane.pane.clone(),
+                            tab: tab.clone(),
+                        });
+                    }
+                    view::PaneBarHit::Tab(tab) if button_number == 2 => {
+                        let _ = worker.input.send(Input::CloseTab {
+                            workspace: workspace.workspace_id.clone(),
+                            screen: workspace.screen_id.clone(),
+                            pane: pane.pane.clone(),
+                            tab: tab.clone(),
+                        });
+                    }
+                    view::PaneBarHit::Tab(tab) if button_number == 1 && press_count == 2 => {
+                        let tab_view = workspace
+                            .pane(&pane.pane)
+                            .and_then(|pane| pane.tabs.iter().find(|entry| entry.id == *tab));
+                        let hit = pane.tabs.iter().find(|entry| entry.id == *tab);
+                        if let (Some(tab_view), Some(hit)) = (tab_view, hit) {
+                            open_rename_prompt(
+                                &rename_prompt_for_click,
+                                &terminal_for_click,
+                                gdk::Rectangle::new(
+                                    hit.rect.x as i32,
+                                    hit.rect.y as i32,
+                                    hit.rect.width.max(1.0) as i32,
+                                    hit.rect.height.max(1.0) as i32,
+                                ),
+                                RenameTarget::Tab {
+                                    workspace: workspace.workspace_id.clone(),
+                                    screen: workspace.screen_id.clone(),
+                                    pane: pane.pane.clone(),
+                                    tab: tab.clone(),
+                                },
+                                tab_view.name.as_deref().unwrap_or(""),
+                            );
+                        }
+                    }
+                    view::PaneBarHit::Tab(tab) if button_number == 1 => {
+                        if let Some(hit) = pane.tabs.iter().find(|entry| entry.id == *tab) {
+                            let _ = worker.input.send(Input::FocusTab {
+                                workspace: workspace.workspace_id.clone(),
+                                screen: workspace.screen_id.clone(),
+                                pane: pane.pane.clone(),
+                                tab: tab.clone(),
+                                target: hit.terminal.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if button_number == 1 || button_number == 2 {
+                    suppress_for_click.set(true);
+                    return;
+                }
             }
-            let button_number = gesture.current_button();
             if button_number == 3 {
                 *context_target_for_click.borrow_mut() = Some(PaneTarget {
                     workspace: workspace.workspace_id.clone(),
@@ -966,9 +1582,16 @@ fn build_ui(application: &Application) {
                 pane_menu_for_click.popup();
                 return;
             }
-            if tab.is_some() {
-                return;
-            }
+            let target = workspace
+                .pane(&pane.pane)
+                .and_then(|pane| pane.active_terminal())
+                .cloned();
+            let _ = worker.input.send(Input::FocusPane {
+                workspace: workspace.workspace_id.clone(),
+                screen: workspace.screen_id.clone(),
+                pane: pane.pane.clone(),
+                target,
+            });
             let state = gesture.current_event_state();
             if state.contains(gdk::ModifierType::SHIFT_MASK) {
                 return;
@@ -1171,7 +1794,6 @@ fn build_ui(application: &Application) {
     }
 
     // --- workspace switching ---------------------------------------------
-    let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
     {
         let worker = Rc::clone(&worker);
         let entries = Rc::clone(&entries);
@@ -1232,6 +1854,8 @@ fn build_ui(application: &Application) {
         let theme = Rc::clone(&theme);
         let css_provider = css_provider.clone();
         let sidebar_scrims = sidebar_scrims.clone();
+        let rename_prompt = Rc::clone(&rename_prompt);
+        let drop_indicators = Rc::clone(&drop_indicators);
         gtk4::glib::spawn_future_local(async move {
             while let Ok(update) = update_rx.recv().await {
                 match update {
@@ -1248,11 +1872,19 @@ fn build_ui(application: &Application) {
                             .cloned();
                         let changed = *entries.borrow() != list;
                         if changed {
+                            drop_indicators.borrow_mut().clear();
                             while let Some(child) = workspaces.first_child() {
                                 workspaces.remove(&child);
                             }
                             for entry in &list {
-                                let row = workspace_row(entry, Rc::clone(&theme));
+                                let row = workspace_row(
+                                    entry,
+                                    Rc::clone(&theme),
+                                    Rc::clone(&worker),
+                                    Rc::clone(&rename_prompt),
+                                    Rc::clone(&drop_indicators),
+                                    list.len(),
+                                );
                                 workspaces.append(&row);
                             }
                             *entries.borrow_mut() = list;
@@ -1395,5 +2027,49 @@ mod tests {
         assert_eq!(clamp_sidebar_width(900, 2400), 600);
         assert_eq!(clamp_sidebar_width(240, 699), 233);
         assert_eq!(clamp_sidebar_width(240, 300), 100);
+    }
+
+    #[test]
+    fn rename_submission_rejects_blank_names_and_trims_valid_input() {
+        assert_eq!(rename_submission(""), None);
+        assert_eq!(rename_submission("  \t "), None);
+        assert_eq!(
+            rename_submission("  build logs  "),
+            Some("build logs".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_drop_index_rounds_to_rows_and_clamps_to_catalog() {
+        assert_eq!(workspace_drop_index(2, -90.0, 30.0, 5), Some(0));
+        assert_eq!(workspace_drop_index(2, -16.0, 30.0, 5), Some(1));
+        assert_eq!(workspace_drop_index(2, 14.0, 30.0, 5), Some(2));
+        assert_eq!(workspace_drop_index(2, 16.0, 30.0, 5), Some(3));
+        assert_eq!(workspace_drop_index(2, 900.0, 30.0, 5), Some(4));
+        assert_eq!(workspace_drop_index(5, 0.0, 30.0, 5), None);
+        assert_eq!(workspace_drop_index(0, f64::NAN, 30.0, 5), None);
+    }
+
+    #[test]
+    fn prefix_actions_match_the_tui_default_keymap() {
+        assert_eq!(prefix_action(gdk::Key::t), Some(PrefixAction::NewTab));
+        assert_eq!(prefix_action(gdk::Key::Tab), Some(PrefixAction::NextTab));
+        assert_eq!(
+            prefix_action(gdk::Key::ISO_Left_Tab),
+            Some(PrefixAction::PrevTab)
+        );
+        assert_eq!(prefix_action(gdk::Key::x), Some(PrefixAction::CloseTab));
+        assert_eq!(
+            prefix_action(gdk::Key::comma),
+            Some(PrefixAction::RenameScreen)
+        );
+        assert_eq!(
+            prefix_action(gdk::Key::dollar),
+            Some(PrefixAction::RenameWorkspace)
+        );
+        assert_eq!(
+            prefix_action(gdk::Key::ampersand),
+            Some(PrefixAction::CloseScreen)
+        );
     }
 }

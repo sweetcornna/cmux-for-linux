@@ -289,6 +289,26 @@ window.cmux-window * {{ transition: none; }}
   min-width: 12px;
   min-height: 12px;
 }}
+.titlebar-actions {{ margin-right: 2px; }}
+.titlebar-action,
+.workspace-close {{
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  border-radius: 6px;
+  background-color: transparent;
+  color: @chrome_fg;
+}}
+.titlebar-action {{ margin: 4px 2px; }}
+.titlebar-action:hover,
+.workspace-close:hover {{ background-color: @sidebar_hover_bg; }}
+.titlebar-action:active,
+.workspace-close:active {{ opacity: 0.5; }}
+.titlebar-action image,
+.workspace-close image {{
+  min-width: 12px;
+  min-height: 12px;
+}}
 .sidebar-surface,
 .workspace-list {{ background-color: @sidebar_bg; }}
 .workspace-list {{ padding-top: 2px; }}
@@ -343,6 +363,10 @@ window.cmux-window .group-add {{
 }}
 .workspace-row:hover .workspace-close,
 .group-header:hover .group-add {{ opacity: 1; }}
+.workspace-close {{
+  margin-right: 8px;
+  color: @sidebar_dim_fg;
+}}
 .group-header {{ border-radius: 4px; }}
 .group-header:hover {{ background-color: @sidebar_hover_bg; }}
 .group-header.multi-selected {{ border-radius: 6px; }}
@@ -390,6 +414,18 @@ popover.cmux-menu modelbutton {{
 }}
 popover.cmux-menu modelbutton:hover {{
   background-color: @selection_bg;
+}}
+popover.rename-prompt > contents {{
+  padding: 6px;
+  background-color: @menu_bg;
+  color: @menu_fg;
+}}
+.rename-entry {{
+  min-height: 24px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: @selection_bg;
+  color: @menu_fg;
 }}
 .toast {{
   margin: 12px;
