@@ -1,8 +1,10 @@
-Resources/markdown-viewer/diff-viewer/**/*.mjs -whitespace
+# The ghostty submodule is upstream Zig source, not authored here.
+ghostty/** linguist-vendored
 
-# Resources/markdown-viewer holds vendored third-party runtime bundles (mermaid,
-# vega, highlight.js, the Pierre/Shiki diff renderer + per-language grammars and
-# WASM) plus the generated diff-viewer React app build. They are not authored
-# source, so exclude them from GitHub Linguist's language stats.
-Resources/markdown-viewer/** linguist-vendored
-Resources/markdown-viewer/diff-viewer-app/** linguist-generated
+# Vendored crates inside the Rust workspace are not authored here either.
+cmux-tui/vendor/** linguist-vendored
+
+# Keep shell scripts and packaging metadata LF regardless of platform.
+*.sh text eol=lf
+*.spec text eol=lf
+PKGBUILD text eol=lf

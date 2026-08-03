@@ -62,7 +62,7 @@ Description: $PKG_SUMMARY
  terminals and browsers, and exposes them through a noun-first CLI and a
  terminal UI. Terminal emulation is handled by libghostty-vt.
  .
- This package is built from the Linux maintenance branch of cmux and ships the
+ This package is built from the cmux for linux fork and ships the
  cmux-tui multiplexer, the cmux-relay transport primitive, a man page, shell
  completions and a desktop entry.
 EOF

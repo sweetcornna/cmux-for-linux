@@ -40,7 +40,7 @@ ln -sf cmux-tui "$STAGE/usr/bin/cmux"
 # Desktop entry + icons.
 install -m 0644 "$PKG_DIR/common/cmux.desktop" "$STAGE/usr/share/applications/cmux.desktop"
 for size in 16 32 128 256 512; do
-  src="$REPO_ROOT/Assets.xcassets/AppIcon.appiconset/$size.png"
+  src="$PKG_DIR/common/icons/cmux-$size.png"
   [ -f "$src" ] || continue
   mkdir -p "$STAGE/usr/share/icons/hicolor/${size}x${size}/apps"
   install -m 0644 "$src" "$STAGE/usr/share/icons/hicolor/${size}x${size}/apps/cmux.png"

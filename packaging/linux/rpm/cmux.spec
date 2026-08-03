@@ -1,4 +1,4 @@
-# RPM spec for the cmux Linux maintenance branch.
+# RPM spec for cmux for linux.
 #
 # This is a binary-repack spec: the cmux binaries and data files are built
 # beforehand by packaging/linux/build-binaries.sh and laid out by
@@ -16,7 +16,7 @@ Release:        1%{?dist}
 Summary:        Terminal multiplexer TUI for AI coding agents, backed by libghostty-vt
 
 License:        GPL-3.0-or-later
-URL:            https://github.com/sweetcornna/cmux
+URL:            https://github.com/sweetcornna/cmux-for-linux
 Source0:        %{cmux_stage_tar}
 
 BuildRequires:  tar
@@ -27,7 +27,7 @@ cmux keeps a tree of machines, sessions, workspaces, screens, panes, tabs,
 terminals and browsers, and exposes them through a noun-first CLI and a
 terminal UI. Terminal emulation is handled by libghostty-vt.
 
-This package is built from the Linux maintenance branch of cmux and ships the
+This package is built from the cmux for linux fork and ships the
 cmux-tui multiplexer, the cmux-relay transport primitive, a man page, shell
 completions and a desktop entry.
 
@@ -62,5 +62,5 @@ test -x %{buildroot}%{_bindir}/cmux-relay
 %{_datadir}/fish/vendor_completions.d/cmux.fish
 
 %changelog
-* Sun Aug 02 2026 cmux Linux maintenance branch <travon_evenietyku@sanfranmail.com>
+* Sun Aug 02 2026 cmux for linux <travon_evenietyku@sanfranmail.com>
 - Initial native Linux packaging for the cmux TUI and relay.

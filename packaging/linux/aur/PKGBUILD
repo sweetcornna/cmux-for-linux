@@ -1,7 +1,7 @@
-# Maintainer: cmux Linux maintenance branch <travon_evenietyku@sanfranmail.com>
+# Maintainer: cmux for linux <travon_evenietyku@sanfranmail.com>
 #
 # Binary package for the cmux TUI, built from the release tarballs produced by
-# packaging/linux/build-tarball.sh on the `linux` maintenance branch.
+# packaging/linux/build-tarball.sh in the cmux for linux fork.
 #
 # A from-source PKGBUILD would need Zig 0.16 plus a fully vendored Cargo
 # registry inside the build sandbox; the binary package tracks the same
@@ -13,7 +13,7 @@ pkgver=0.0.0
 pkgrel=1
 pkgdesc="Terminal multiplexer TUI for AI coding agents, backed by libghostty-vt"
 arch=('x86_64' 'aarch64')
-url="https://github.com/sweetcornna/cmux"
+url="https://github.com/sweetcornna/cmux-for-linux"
 license=('GPL-3.0-or-later')
 depends=('glibc')
 provides=('cmux' 'cmux-tui')

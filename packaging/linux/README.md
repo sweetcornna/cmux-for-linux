@@ -1,8 +1,8 @@
 # Native Linux packaging
 
-This directory belongs to the `linux` maintenance branch of cmux. It turns the
-Rust `cmux-tui` workspace into native Linux packages. Upstream `main` ships the
-same binaries only through npm and PyPI; nothing here changes upstream code.
+This directory turns the Rust `cmux-tui` workspace into native Linux packages.
+Upstream cmux ships the same binaries only through npm and PyPI; nothing here
+modifies upstream code.
 
 ## What gets packaged
 
@@ -12,14 +12,12 @@ same binaries only through npm and PyPI; nothing here changes upstream code.
 | `/usr/bin/cmux-relay` | stdio↔socket transport primitive |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching the upstream npm command name |
 | `/usr/share/applications/cmux.desktop` | desktop entry (`Terminal=true`) |
-| `/usr/share/icons/hicolor/*/apps/cmux.png` | icons lifted from `Assets.xcassets` |
+| `/usr/share/icons/hicolor/*/apps/cmux.png` | icons from `common/icons/` |
 | `/usr/share/man/man1/cmux.1.gz` | man page generated from `common/cmux.1.in` |
 | `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | README, third-party notices, GPL-3.0 text |
 
-The `cmux-browser`, `webviews`, `agent-chat` and Swift components are **not**
-in these packages. They are macOS-app surfaces; see `docs/linux-port.md` for
-the GUI port status.
+There is no GUI package yet; see [`../../docs/linux-port.md`](../../docs/linux-port.md).
 
 ## Build requirements
 
@@ -27,6 +25,8 @@ the GUI port status.
 - Zig **0.16.x** — `ghostty-vt-sys` compiles `libghostty-vt.a` from the
   `ghostty` submodule before any Rust crate builds
 - the `ghostty` submodule checked out: `git submodule update --init ghostty`
+- `clang` and `libclang-dev` — bindgen needs clang's builtin header directory,
+  or the build fails with `'limits.h' file not found`
 - `dpkg-deb` for `.deb`; `dpkg-dev` additionally enables real `dpkg-shlibdeps`
   dependency resolution
 - `docker` for `.rpm` (a Fedora container supplies `rpmbuild`), or a local
@@ -53,14 +53,15 @@ Artifacts land in `build/linux/dist/`, each with a `.sha256` next to it.
 ```
 packaging/linux/
 ├── build-all.sh          orchestrator
-├── build-binaries.sh     cargo build -p cmux-tui -p cmux-relay
+├── build-binaries.sh     cargo build -p cmux-tui -p cmux-relay, then strip
 ├── stage-tree.sh         the one FHS tree every format installs
 ├── build-tarball.sh      portable .tar.gz + install.sh
 ├── build-deb.sh          dpkg-deb
 ├── build-rpm.sh          rpmbuild, containerised by default
 ├── build-aur.sh          renders aur/PKGBUILD for the current version
 ├── build-appimage.sh     appimagetool
-├── common/               desktop entry, man page source, completions, install.sh
+├── sync-upstream.sh      pull cmux-tui/ and ghostty from upstream
+├── common/               desktop entry, man page source, icons, completions, install.sh
 ├── rpm/cmux.spec         binary-repack spec
 └── aur/PKGBUILD          cmux-bin
 ```

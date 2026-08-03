@@ -1,12 +1,12 @@
-# Native Linux packages for the `linux` maintenance branch.
+# Native Linux packages for cmux for linux.
 #
 # Upstream `main` ships the cmux TUI only through npm and PyPI. This workflow
 # builds the distro-native formats — .deb, .rpm, AUR directory, AppImage and a
 # portable tarball — for x86_64 and aarch64, and publishes them on
 # `cmux-tui-v*` tags.
 #
-# This workflow exists only on the `linux` branch and must never be proposed
-# upstream as part of a rebase.
+# This workflow belongs to the fork only. Upstream's own macOS and iOS
+# workflows were removed along with the code they built.
 
 name: linux-packages
 
@@ -144,7 +144,7 @@ jobs:
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "cmux Linux packages $tag" \
-            --notes "Native Linux packages built from the \`linux\` maintenance branch.
+            --notes "Native Linux packages built from the cmux for linux fork.
 
           Formats: \`.deb\`, \`.rpm\`, AppImage, portable tarball, and the AUR \`PKGBUILD\`.
           Every artifact has a matching \`.sha256\`.

@@ -246,7 +246,7 @@ Follow session events as JSON lines:
 Full documentation is in the
 .B cmux\-tui/docs
 directory of the source distribution, and at
-.IR https://github.com/sweetcornna/cmux .
+.IR https://github.com/sweetcornna/cmux-for-linux .
 .SH LICENSE
 GPL\-3.0\-or\-later. See
 .I /usr/share/licenses/cmux/LICENSE
