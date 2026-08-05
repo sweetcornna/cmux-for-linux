@@ -894,16 +894,28 @@ fn refresh_chrome(
     }
 }
 
-fn workspace_row(
-    entry: &session::WorkspaceEntry,
+struct WorkspaceRowHandles {
     theme: Rc<view::Theme>,
     attention: Rc<RefCell<attention::AttentionState>>,
     worker: Rc<Worker>,
     rename_prompt: Rc<RenamePrompt>,
     drop_indicators: Rc<RefCell<Vec<GtkBox>>>,
     attention_indicators: Rc<RefCell<Vec<DrawingArea>>>,
+}
+
+fn workspace_row(
+    entry: &session::WorkspaceEntry,
+    handles: WorkspaceRowHandles,
     workspace_count: usize,
 ) -> ListBoxRow {
+    let WorkspaceRowHandles {
+        theme,
+        attention,
+        worker,
+        rename_prompt,
+        drop_indicators,
+        attention_indicators,
+    } = handles;
     let title = if entry.name.is_empty() {
         "(unnamed)"
     } else {
@@ -1235,16 +1247,17 @@ fn build_ui(application: &Application) {
     sidebar.add_css_class("sidebar-surface");
     sidebar.set_child(Some(&sidebar_scroll));
     sidebar.add_overlay(&sidebar_scrims);
-    let terminal = view::build(
-        Rc::clone(&screens),
-        Rc::clone(&attention),
-        Rc::clone(&screen_terminals),
-        Rc::clone(&theme),
-        Rc::clone(&blink),
-        Rc::clone(&tab_strip),
-        Rc::clone(&scrollbar),
-        Rc::clone(&search_state),
-    );
+    let view_handles = view::ViewHandles {
+        screens: Rc::clone(&screens),
+        attention: Rc::clone(&attention),
+        screen_terminals: Rc::clone(&screen_terminals),
+        theme: Rc::clone(&theme),
+        blink: Rc::clone(&blink),
+        tab_strip: Rc::clone(&tab_strip),
+        scrollbar: Rc::clone(&scrollbar),
+        search_state: Rc::clone(&search_state),
+    };
+    let terminal = view::build(view_handles);
 
     let toast = Label::new(None);
     toast.add_css_class("toast");
@@ -2658,12 +2671,14 @@ fn build_ui(application: &Application) {
                             for entry in &list {
                                 let row = workspace_row(
                                     entry,
-                                    Rc::clone(&theme),
-                                    Rc::clone(&attention),
-                                    Rc::clone(&worker),
-                                    Rc::clone(&rename_prompt),
-                                    Rc::clone(&drop_indicators),
-                                    Rc::clone(&attention_indicators),
+                                    WorkspaceRowHandles {
+                                        theme: Rc::clone(&theme),
+                                        attention: Rc::clone(&attention),
+                                        worker: Rc::clone(&worker),
+                                        rename_prompt: Rc::clone(&rename_prompt),
+                                        drop_indicators: Rc::clone(&drop_indicators),
+                                        attention_indicators: Rc::clone(&attention_indicators),
+                                    },
                                     list.len(),
                                 );
                                 workspaces.append(&row);

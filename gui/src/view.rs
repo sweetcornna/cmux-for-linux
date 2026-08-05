@@ -210,6 +210,18 @@ impl MouseMoveThrottle {
     }
 }
 
+#[derive(Clone)]
+pub struct ViewHandles {
+    pub screens: Rc<RefCell<ScreenSet>>,
+    pub attention: Rc<RefCell<AttentionState>>,
+    pub screen_terminals: Rc<RefCell<HashMap<ScreenId, Vec<TerminalId>>>>,
+    pub theme: Rc<Theme>,
+    pub blink: Rc<Cell<BlinkState>>,
+    pub tab_strip: Rc<TabStripState>,
+    pub scrollbar: Rc<ScrollbarState>,
+    pub search_state: Rc<RefCell<SearchUiState>>,
+}
+
 pub struct Theme {
     font: RefCell<pango::FontDescription>,
     default_font: pango::FontDescription,
@@ -1168,16 +1180,17 @@ fn run_colors(
     (fg, bg)
 }
 
-pub fn build(
-    screens: Rc<RefCell<ScreenSet>>,
-    attention: Rc<RefCell<AttentionState>>,
-    screen_terminals: Rc<RefCell<HashMap<ScreenId, Vec<TerminalId>>>>,
-    theme: Rc<Theme>,
-    blink: Rc<Cell<BlinkState>>,
-    tab_strip: Rc<TabStripState>,
-    scrollbar: Rc<ScrollbarState>,
-    search_state: Rc<RefCell<SearchUiState>>,
-) -> DrawingArea {
+pub fn build(handles: ViewHandles) -> DrawingArea {
+    let ViewHandles {
+        screens,
+        attention,
+        screen_terminals,
+        theme,
+        blink,
+        tab_strip,
+        scrollbar,
+        search_state,
+    } = handles;
     let area = DrawingArea::new();
     area.set_focusable(true);
     area.set_hexpand(true);
@@ -1252,16 +1265,18 @@ pub fn build(
                     cr.clip();
                     cr.translate(geometry.content.x, geometry.content.y);
                     draw_grid(
-                        area,
-                        cr,
+                        GridDrawContext {
+                            area,
+                            cr,
+                            screen,
+                            metrics,
+                            height: geometry.content.height,
+                            blink: blink.get(),
+                        },
                         terminal,
-                        screen,
                         search_query.as_deref(),
-                        metrics,
-                        geometry.content.height,
                         geometry.pane == workspace.layout.active_pane_id,
                         &theme,
-                        blink.get(),
                         &mut image_cache,
                     );
                     let _ = cr.restore();
@@ -1272,14 +1287,16 @@ pub fn build(
 
             if !geometry.tabs.is_empty() {
                 draw_tabs(
-                    area,
-                    cr,
+                    TabStripDrawContext {
+                        area,
+                        cr,
+                        colors: &chrome,
+                        window_active: blink.get().window_active(),
+                        attention: &attention,
+                    },
                     workspace.pane(&geometry.pane),
                     geometry,
-                    &chrome,
-                    blink.get().window_active(),
                     tab_strip.hovered_tab().as_ref(),
-                    &attention,
                 );
             }
             let focused = geometry.pane == workspace.layout.active_pane_id;
@@ -1306,14 +1323,16 @@ pub fn build(
         }
         if let Some(geometry) = screen_bar_geometry(&screens, width, height) {
             draw_screen_bar(
-                area,
-                cr,
+                TabStripDrawContext {
+                    area,
+                    cr,
+                    colors: &chrome,
+                    window_active: blink.get().window_active(),
+                    attention: &attention,
+                },
                 workspace,
                 &geometry,
                 tab_strip.hovered_screen().as_ref(),
-                &chrome,
-                blink.get().window_active(),
-                &attention,
                 &screen_terminals,
             );
         }
@@ -1391,17 +1410,28 @@ fn rounded_rectangle(cr: &gtk4::cairo::Context, rect: Rect, radius: f64) {
     cr.close_path();
 }
 
+struct TabStripDrawContext<'a> {
+    area: &'a DrawingArea,
+    cr: &'a gtk4::cairo::Context,
+    colors: &'a ChromeColors,
+    window_active: bool,
+    attention: &'a AttentionState,
+}
+
 fn draw_screen_bar(
-    area: &DrawingArea,
-    cr: &gtk4::cairo::Context,
+    context: TabStripDrawContext<'_>,
     workspace: &WorkspaceView,
     geometry: &ScreenBarGeometry,
     hovered: Option<&ScreenId>,
-    colors: &ChromeColors,
-    window_active: bool,
-    attention: &AttentionState,
     screen_terminals: &HashMap<ScreenId, Vec<TerminalId>>,
 ) {
+    let TabStripDrawContext {
+        area,
+        cr,
+        colors,
+        window_active,
+        attention,
+    } = context;
     let background = if colors.tab_bar_is_opaque {
         colors.tab_bar_background
     } else {
@@ -1679,19 +1709,32 @@ pub fn draw_task_status_ring(
     let _ = cr.stroke();
 }
 
-fn draw_grid(
-    area: &DrawingArea,
-    cr: &gtk4::cairo::Context,
-    terminal: &TerminalId,
-    screen: &Screen,
-    search_query: Option<&str>,
+#[derive(Clone, Copy)]
+struct GridDrawContext<'a> {
+    area: &'a DrawingArea,
+    cr: &'a gtk4::cairo::Context,
+    screen: &'a Screen,
     metrics: CellMetrics,
     height: f64,
+    blink: BlinkState,
+}
+
+fn draw_grid(
+    context: GridDrawContext<'_>,
+    terminal: &TerminalId,
+    search_query: Option<&str>,
     draw_selection: bool,
     theme: &Theme,
-    blink: BlinkState,
     image_cache: &mut ImageCache,
 ) {
+    let GridDrawContext {
+        cr,
+        screen,
+        metrics,
+        height,
+        blink,
+        ..
+    } = context;
     if !screen.is_initialized() {
         return;
     }
@@ -1716,22 +1759,13 @@ fn draw_grid(
         let _ = cr.fill();
     }
     let font = theme.font();
-    draw_grid_text(area, cr, screen, metrics, height, &font, None, blink);
+    draw_grid_text(context, &font, None);
     if draw_selection && screen.selection.is_some() {
         if let Some(foreground) = theme.chrome().selection_foreground {
             let _ = cr.save();
             selection_path(cr, screen, metrics);
             cr.clip();
-            draw_grid_text(
-                area,
-                cr,
-                screen,
-                metrics,
-                height,
-                &font,
-                Some(foreground),
-                blink,
-            );
+            draw_grid_text(context, &font, Some(foreground));
             let _ = cr.restore();
         }
     }
@@ -2037,15 +2071,18 @@ fn draw_grid_backgrounds(
 }
 
 fn draw_grid_text(
-    area: &DrawingArea,
-    cr: &gtk4::cairo::Context,
-    screen: &Screen,
-    metrics: CellMetrics,
-    height: f64,
+    context: GridDrawContext<'_>,
     font: &pango::FontDescription,
     foreground: Option<Rgb>,
-    blink: BlinkState,
 ) {
+    let GridDrawContext {
+        area,
+        cr,
+        screen,
+        metrics,
+        height,
+        blink,
+    } = context;
     let layout = area.create_pango_layout(None);
     let mut description = font.clone();
     for (index, row) in screen.rows.iter().enumerate() {
@@ -2126,15 +2163,18 @@ fn selection_path(cr: &gtk4::cairo::Context, screen: &Screen, metrics: CellMetri
 }
 
 fn draw_tabs(
-    area: &DrawingArea,
-    cr: &gtk4::cairo::Context,
+    context: TabStripDrawContext<'_>,
     pane: Option<&PaneView>,
     geometry: &PaneGeometry,
-    colors: &ChromeColors,
-    window_active: bool,
     hovered: Option<&(PaneId, TabId)>,
-    attention: &AttentionState,
 ) {
+    let TabStripDrawContext {
+        area,
+        cr,
+        colors,
+        window_active,
+        attention,
+    } = context;
     let Some(pane) = pane else { return };
     let layout = area.create_pango_layout(None);
     let mut tab_font = pango::FontDescription::from_string("Sans");
