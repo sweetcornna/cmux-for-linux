@@ -108,3 +108,36 @@ and makes the dependency explicit: sync applies 0001 first, then 0004 promotes
 the consumed graphics value into typed data. It also keeps the carried patch
 history reviewable and localizes future upstream conflicts to the semantic
 upgrade.
+
+## 0005 — make resource event values satisfy snapshot schemas
+
+The resource event stream decodes every upsert value as the corresponding
+public snapshot type. Full-tree and tab-move delta encoders in
+`mux/resource_content.rs` omitted the required `focused` field from
+`TabSnapshot` values, so the first tree mutation ended the stream with:
+
+```
+invalid tab: missing field `focused`
+```
+
+The full-tree terminal encoder also omitted the required `lifecycle` field.
+`TerminalSnapshot` requires `running` to be true exactly for the `running`
+lifecycle and requires `exit` exactly for the `exited` lifecycle. The same
+incomplete terminal value was returned by `terminal.move` even though that
+operation returns a `TerminalSnapshot`.
+
+Reproduce without the patch:
+
+```bash
+cmux-tui --headless --session delta-schema &
+cargo run --release -p cmux-gtk -- --probe --session delta-schema
+cmux-tui --session delta-schema workspace create --name second
+# Disconnected: session event stream error: invalid tab: missing field `focused`
+```
+
+The patch derives tab focus from the owning pane and mirrors the existing
+terminal snapshot lifecycle, `cwd` and exit mapping. The fields were already
+required by `spec/resource-operations-v1.json`, so no spec or catalog
+fingerprint changes are needed. This affects any protocol client consuming
+session resource events or typed `terminal.move` results, not just this fork,
+and is worth reporting upstream.

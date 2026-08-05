@@ -5,9 +5,10 @@
 //! an async channel. The UI thread never blocks on a socket.
 //!
 //! The control thread sends input and focus mutations over a shared client.
-//! An attachment manager owns the visible-terminal set and gives every
-//! attachment its own polling thread. A slow terminal therefore cannot add its
-//! 50ms poll timeout to every other pane's latency.
+//! A session-event thread coalesces workspace-tree changes into topology
+//! publications. An attachment manager owns the visible-terminal set and gives
+//! every attachment its own polling thread. A slow terminal therefore cannot add
+//! its 50ms poll timeout to every other pane's latency.
 
 use std::collections::HashMap;
 use std::fs;
@@ -20,8 +21,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cmux::{
-    Client, Config, CreateScreenOptions, Direction, LayoutNode, PaneId, ReadHistoryOptions,
-    RenderPatch, RenderSnapshot, ScreenId, ScrollOptions, Selector, Size, SplitId, SplitOptions,
+    Client, Config, CreateScreenOptions, Direction, EventStreamOptions, LayoutNode, PaneId,
+    ReadHistoryOptions, RenderPatch, RenderSnapshot, ResourceChange, ResourceKind, ScreenId,
+    ScrollOptions, Selector, SessionEvent, SessionEventStream, Size, SplitId, SplitOptions,
     SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
     TerminalAttachmentItem, TerminalCreateOptions, TerminalId, TerminalMouseOptions,
     TextInputOptions, WorkspaceId,
@@ -33,6 +35,8 @@ use crate::search::{self, SearchRequest, SearchResults};
 /// Short enough that resize and shutdown commands feel immediate without
 /// turning an idle attachment into a busy loop.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
+const TOPOLOGY_ERROR_THRESHOLD: u8 = 3;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,6 +72,102 @@ impl Iterator for RetrySchedule {
         }
         self.elapsed = next;
         Some(self.interval)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TopologyRefreshSchedule {
+    interval: Duration,
+    next_allowed: Option<Instant>,
+    pending: bool,
+    consecutive_failures: u8,
+}
+
+impl TopologyRefreshSchedule {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_allowed: None,
+            pending: false,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn request(&mut self, now: Instant) -> bool {
+        if self.next_allowed.is_none_or(|deadline| now >= deadline) {
+            self.next_allowed = Some(now + self.interval);
+            self.pending = false;
+            true
+        } else {
+            self.pending = true;
+            false
+        }
+    }
+
+    fn take_due(&mut self, now: Instant) -> bool {
+        if self.pending && self.next_allowed.is_some_and(|deadline| now >= deadline) {
+            self.next_allowed = Some(now + self.interval);
+            self.pending = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll_timeout(&self, now: Instant, maximum: Duration) -> Duration {
+        if self.pending {
+            self.next_allowed
+                .map(|deadline| deadline.saturating_duration_since(now).min(maximum))
+                .unwrap_or(maximum)
+        } else {
+            maximum
+        }
+    }
+
+    fn record_publish_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    fn record_publish_failure(&mut self) -> bool {
+        self.pending = true;
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.consecutive_failures == TOPOLOGY_ERROR_THRESHOLD
+    }
+}
+
+fn resource_kind_affects_topology(resource: ResourceKind) -> bool {
+    match resource {
+        ResourceKind::Session
+        | ResourceKind::Workspace
+        | ResourceKind::Screen
+        | ResourceKind::Pane
+        | ResourceKind::Tab
+        | ResourceKind::Terminal => true,
+        ResourceKind::Machine
+        | ResourceKind::Browser
+        | ResourceKind::Client
+        | ResourceKind::Notification
+        | ResourceKind::Agent
+        | ResourceKind::PairingRequest
+        | ResourceKind::FrontendProjection
+        | ResourceKind::SidebarView => false,
+    }
+}
+
+fn resource_change_affects_topology(change: &ResourceChange) -> bool {
+    match change {
+        ResourceChange::Upsert { resource, .. } | ResourceChange::Delete { resource, .. } => {
+            resource_kind_affects_topology(*resource)
+        }
+        ResourceChange::Unknown { .. } => true,
+    }
+}
+
+fn session_event_affects_topology(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::Snapshot(_) => true,
+        SessionEvent::Delta(delta) => delta.changes.iter().any(resource_change_affects_topology),
+        SessionEvent::Unknown { .. } => true,
     }
 }
 
@@ -213,7 +313,6 @@ pub enum Input {
         split: SplitId,
         ratio: f64,
     },
-    RefreshWorkspaces,
     Search(SearchRequest),
     /// `None` is meaningful for a focused browser tab: input must not leak to
     /// the terminal that happened to be focused before it.
@@ -378,16 +477,20 @@ fn send_update(updates: &async_channel::Sender<StampedUpdate>, generation: u64, 
 struct Runtime {
     input: mpsc::Sender<Input>,
     control: mpsc::Sender<Control>,
+    session_event_stop: mpsc::Sender<()>,
     control_join: JoinHandle<()>,
     attachment_join: JoinHandle<()>,
+    session_event_join: JoinHandle<()>,
 }
 
 impl Runtime {
     fn stop(self) {
         let _ = self.input.send(Input::Stop);
         let _ = self.control.send(Control::Stop);
+        let _ = self.session_event_stop.send(());
         let _ = self.control_join.join();
         let _ = self.attachment_join.join();
+        let _ = self.session_event_join.join();
     }
 }
 
@@ -673,13 +776,30 @@ fn start_runtime(
         name,
         socket_path: requested.socket_path.clone(),
     };
+    let session_events = client
+        .session(Selector::current())
+        .events(EventStreamOptions::default())
+        .map_err(|error| format!("could not open session event stream: {error}"))?;
     let (input_tx, input_rx) = mpsc::channel::<Input>();
     let (control_tx, control_rx) = mpsc::channel::<Control>();
-    let publish_client = client.clone();
+    let (session_event_stop_tx, session_event_stop_rx) = mpsc::channel();
     let control_client = client.clone();
     let control_updates = sink.clone();
     let control_join =
         thread::spawn(move || control_loop(control_client, control_updates, input_rx));
+    let session_event_client = client.clone();
+    let session_event_updates = sink.clone();
+    let session_event_runtime_events = runtime_events.clone();
+    let session_event_join = thread::spawn(move || {
+        session_event_loop(
+            session_event_client,
+            session_events,
+            session_event_updates,
+            session_event_stop_rx,
+            generation,
+            session_event_runtime_events,
+        )
+    });
     let attachment_updates = sink.clone();
     let attachment_events = runtime_events.clone();
     let attachment_join = thread::spawn(move || {
@@ -696,20 +816,89 @@ fn start_runtime(
     let runtime = Runtime {
         input: input_tx,
         control: control_tx,
+        session_event_stop: session_event_stop_tx,
         control_join,
         attachment_join,
+        session_event_join,
     };
-    if let Err(error) = publish_workspaces(&publish_client, &sink) {
-        input_route.clear();
-        control_route.clear();
-        runtime.stop();
-        return Err(error);
-    }
     let _ = sink.send_blocking(Update::Connected {
         session: connected.clone(),
     });
 
     Ok((connected, runtime))
+}
+
+fn session_event_loop(
+    client: Client,
+    mut stream: SessionEventStream,
+    updates: UpdateSink,
+    stop: mpsc::Receiver<()>,
+    generation: u64,
+    runtime_events: mpsc::Sender<SupervisorCommand>,
+) {
+    let mut refreshes = TopologyRefreshSchedule::new(TOPOLOGY_REFRESH_INTERVAL);
+
+    loop {
+        if session_event_stop_requested(&stop) {
+            return;
+        }
+
+        let now = Instant::now();
+        if refreshes.take_due(now) {
+            publish_event_topology(&client, &updates, &mut refreshes);
+        }
+
+        let timeout = refreshes.poll_timeout(Instant::now(), POLL_INTERVAL);
+        match stream.next_timeout(timeout) {
+            Ok(StreamPoll::Item(item)) => {
+                if session_event_affects_topology(&item.value) && refreshes.request(Instant::now())
+                {
+                    if session_event_stop_requested(&stop) {
+                        return;
+                    }
+                    publish_event_topology(&client, &updates, &mut refreshes);
+                }
+            }
+            Ok(StreamPoll::TimedOut) => {}
+            Ok(StreamPoll::End) => {
+                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                    generation,
+                    message: "session event stream ended".to_string(),
+                });
+                return;
+            }
+            Err(error) => {
+                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                    generation,
+                    message: format!("session event stream error: {error}"),
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn session_event_stop_requested(stop: &mpsc::Receiver<()>) -> bool {
+    match stop.try_recv() {
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => true,
+        Err(mpsc::TryRecvError::Empty) => false,
+    }
+}
+
+fn publish_event_topology(
+    client: &Client,
+    updates: &UpdateSink,
+    refreshes: &mut TopologyRefreshSchedule,
+) {
+    match publish_workspaces(client, updates) {
+        Ok(()) => refreshes.record_publish_success(),
+        Err(error) => {
+            if refreshes.record_publish_failure() {
+                let _ = updates
+                    .send_blocking(Update::Error(format!("topology refresh failed: {error}")));
+            }
+        }
+    }
 }
 
 fn connected_session_name(client: &Client) -> Option<String> {
@@ -1200,78 +1389,54 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 target: next,
             } => {
                 target = next;
-                match session.workspace(Selector::id(workspace)).focus() {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates.send_blocking(Update::Error(format!(
-                            "workspace focus failed: {error}"
-                        )));
-                    }
+                if let Err(error) = session.workspace(Selector::id(workspace)).focus() {
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("workspace focus failed: {error}")));
                 }
             }
-            Input::CreateWorkspace => match session.create_workspace(None) {
-                Ok(_) => refresh_after_focus(&client, &updates),
-                Err(error) => {
+            Input::CreateWorkspace => {
+                if let Err(error) = session.create_workspace(None) {
                     let _ = updates.send_blocking(Update::Error(format!(
                         "workspace creation failed: {error}"
                     )));
                 }
-            },
+            }
             Input::RenameWorkspace { workspace, name } => {
-                match session.workspace(Selector::id(workspace)).rename(name) {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates.send_blocking(Update::Error(format!(
-                            "workspace rename failed: {error}"
-                        )));
-                    }
+                if let Err(error) = session.workspace(Selector::id(workspace)).rename(name) {
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("workspace rename failed: {error}")));
                 }
             }
             Input::CloseWorkspace { workspace } => {
-                match session.workspace(Selector::id(workspace)).close() {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates.send_blocking(Update::Error(format!(
-                            "workspace close failed: {error}"
-                        )));
-                    }
+                if let Err(error) = session.workspace(Selector::id(workspace)).close() {
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("workspace close failed: {error}")));
                 }
             }
             Input::MoveWorkspace { workspace, index } => {
-                match session.workspace(Selector::id(workspace)).move_to(index) {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates.send_blocking(Update::Error(format!(
-                            "workspace move failed: {error}"
-                        )));
-                    }
+                if let Err(error) = session.workspace(Selector::id(workspace)).move_to(index) {
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("workspace move failed: {error}")));
                 }
             }
             Input::CreateScreen { workspace } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .create_screen(CreateScreenOptions::default())
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates.send_blocking(Update::Error(format!(
-                            "screen creation failed: {error}"
-                        )));
-                    }
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("screen creation failed: {error}")));
                 }
             }
             Input::FocusScreen { workspace, screen } => {
                 target = None;
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .focus()
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("screen focus failed: {error}")));
-                    }
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("screen focus failed: {error}")));
                 }
             }
             Input::RenameScreen {
@@ -1279,29 +1444,23 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 screen,
                 name,
             } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .rename(name)
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("screen rename failed: {error}")));
-                    }
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("screen rename failed: {error}")));
                 }
             }
             Input::CloseScreen { workspace, screen } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .close()
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("screen close failed: {error}")));
-                    }
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("screen close failed: {error}")));
                 }
             }
             Input::FocusPane {
@@ -1315,12 +1474,9 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane));
-                match handle.focus() {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("pane focus failed: {error}")));
-                    }
+                if let Err(error) = handle.focus() {
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("pane focus failed: {error}")));
                 }
             }
             Input::FocusTab {
@@ -1336,12 +1492,9 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane))
                     .tab(Selector::id(tab));
-                match handle.focus() {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("tab focus failed: {error}")));
-                    }
+                if let Err(error) = handle.focus() {
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("tab focus failed: {error}")));
                 }
             }
             Input::CreateTab {
@@ -1349,17 +1502,14 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 screen,
                 pane,
             } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane))
                     .create_terminal(TerminalCreateOptions::default())
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("tab creation failed: {error}")));
-                    }
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("tab creation failed: {error}")));
                 }
             }
             Input::CloseTab {
@@ -1368,18 +1518,15 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 pane,
                 tab,
             } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane))
                     .tab(Selector::id(tab))
                     .close()
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("tab close failed: {error}")));
-                    }
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("tab close failed: {error}")));
                 }
             }
             Input::RenameTab {
@@ -1389,18 +1536,15 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 tab,
                 name,
             } => {
-                match session
+                if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane))
                     .tab(Selector::id(tab))
                     .rename(name)
                 {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("tab rename failed: {error}")));
-                    }
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("tab rename failed: {error}")));
                 }
             }
             Input::SplitPane {
@@ -1413,12 +1557,9 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane));
-                match handle.split(SplitOptions::new(direction)) {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("pane split failed: {error}")));
-                    }
+                if let Err(error) = handle.split(SplitOptions::new(direction)) {
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("pane split failed: {error}")));
                 }
             }
             Input::ClosePane {
@@ -1430,12 +1571,9 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane));
-                match handle.close() {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("pane close failed: {error}")));
-                    }
+                if let Err(error) = handle.close() {
+                    let _ =
+                        updates.send_blocking(Update::Error(format!("pane close failed: {error}")));
                 }
             }
             Input::SetSplitRatio {
@@ -1449,30 +1587,16 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
                     .pane(Selector::id(pane));
-                match handle.set_split_ratio(SplitRatioOptions {
+                if let Err(error) = handle.set_split_ratio(SplitRatioOptions {
                     split_id: split,
                     ratio,
                 }) {
-                    Ok(_) => refresh_after_focus(&client, &updates),
-                    Err(error) => {
-                        let _ = updates
-                            .send_blocking(Update::Error(format!("pane resize failed: {error}")));
-                    }
-                }
-            }
-            Input::RefreshWorkspaces => {
-                if let Err(error) = publish_workspaces(&client, &updates) {
-                    let _ = updates.send_blocking(Update::Error(error));
+                    let _ = updates
+                        .send_blocking(Update::Error(format!("pane resize failed: {error}")));
                 }
             }
             Input::SetTarget(next) => target = next,
         }
-    }
-}
-
-fn refresh_after_focus(client: &Client, updates: &UpdateSink) {
-    if let Err(error) = publish_workspaces(client, updates) {
-        let _ = updates.send_blocking(Update::Error(error));
     }
 }
 
@@ -1667,12 +1791,17 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_socket_candidates, session_socket_path, RebuildPlan, RetrySchedule, RoutedSender,
-        SessionEntry,
+        parse_socket_candidates, resource_change_affects_topology, resource_kind_affects_topology,
+        session_event_affects_topology, session_socket_path, RebuildPlan, RetrySchedule,
+        RoutedSender, SessionEntry, TopologyRefreshSchedule,
+    };
+    use cmux::{
+        Cursor, Document, MachineId, ResourceChange, ResourceKind, ResourceReference,
+        SessionDeltaEvent, SessionEvent, WorkspaceId,
     };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn startup_retry_schedule_covers_the_timeout_without_exceeding_it() {
@@ -1699,6 +1828,157 @@ mod tests {
         let delays = RetrySchedule::new(Duration::ZERO, Duration::from_secs(5)).collect::<Vec<_>>();
 
         assert!(delays.is_empty());
+    }
+
+    #[test]
+    fn topology_refresh_schedule_coalesces_a_burst_and_publishes_the_trailing_state() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(125);
+        let mut schedule = TopologyRefreshSchedule::new(interval);
+
+        assert!(schedule.request(start));
+        assert!(!schedule.request(start + Duration::from_millis(20)));
+        assert!(!schedule.request(start + Duration::from_millis(100)));
+        assert_eq!(
+            schedule.poll_timeout(
+                start + Duration::from_millis(100),
+                Duration::from_millis(50)
+            ),
+            Duration::from_millis(25)
+        );
+        assert!(!schedule.take_due(start + Duration::from_millis(124)));
+        assert!(schedule.take_due(start + interval));
+        assert!(!schedule.take_due(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn topology_refresh_schedule_keeps_spacing_subsequent_bursts() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(125);
+        let mut schedule = TopologyRefreshSchedule::new(interval);
+
+        assert!(schedule.request(start));
+        assert!(!schedule.request(start + Duration::from_millis(10)));
+        assert!(schedule.take_due(start + interval));
+        assert!(!schedule.request(start + interval + Duration::from_millis(10)));
+        assert!(schedule.take_due(start + interval + interval));
+    }
+
+    #[test]
+    fn topology_publish_failures_rearm_retries_and_report_only_the_third_failure() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(125);
+        let mut schedule = TopologyRefreshSchedule::new(interval);
+
+        assert!(schedule.request(start));
+        assert!(!schedule.record_publish_failure());
+        assert!(!schedule.take_due(start + Duration::from_millis(124)));
+        assert!(schedule.take_due(start + interval));
+        assert!(!schedule.record_publish_failure());
+        assert!(schedule.take_due(start + interval * 2));
+        assert!(schedule.record_publish_failure());
+        assert!(schedule.take_due(start + interval * 3));
+        assert!(!schedule.record_publish_failure());
+    }
+
+    #[test]
+    fn successful_topology_publish_resets_the_failure_counter() {
+        let mut schedule = TopologyRefreshSchedule::new(Duration::from_millis(125));
+
+        assert!(!schedule.record_publish_failure());
+        assert!(!schedule.record_publish_failure());
+        schedule.record_publish_success();
+        assert!(!schedule.record_publish_failure());
+        assert!(!schedule.record_publish_failure());
+        assert!(schedule.record_publish_failure());
+    }
+
+    #[test]
+    fn resource_kind_classification_matches_rendered_topology() {
+        for resource in [
+            ResourceKind::Session,
+            ResourceKind::Workspace,
+            ResourceKind::Screen,
+            ResourceKind::Pane,
+            ResourceKind::Tab,
+            ResourceKind::Terminal,
+        ] {
+            assert!(resource_kind_affects_topology(resource));
+        }
+        for resource in [
+            ResourceKind::Machine,
+            ResourceKind::Browser,
+            ResourceKind::Client,
+            ResourceKind::Notification,
+            ResourceKind::Agent,
+            ResourceKind::PairingRequest,
+            ResourceKind::FrontendProjection,
+            ResourceKind::SidebarView,
+        ] {
+            assert!(!resource_kind_affects_topology(resource));
+        }
+    }
+
+    #[test]
+    fn unknown_resource_changes_and_session_events_are_topology_affecting() {
+        let raw = Document::from_serializable(&serde_json::json!({"future": true})).unwrap();
+        let change = ResourceChange::Unknown {
+            kind: "future_change".to_string(),
+            raw: raw.clone(),
+        };
+        assert!(resource_change_affects_topology(&change));
+
+        let delta = SessionEvent::Delta(SessionDeltaEvent {
+            cursor: Cursor {
+                generation: "generation".to_string(),
+                revision: 2,
+            },
+            previous_revision: 1,
+            revision: 2,
+            changes: vec![change],
+        });
+        assert!(session_event_affects_topology(&delta));
+        assert!(session_event_affects_topology(&SessionEvent::Unknown {
+            kind: "future_event".to_string(),
+            raw,
+        }));
+    }
+
+    #[test]
+    fn deltas_refresh_only_when_a_change_affects_topology() {
+        let event = |changes| {
+            SessionEvent::Delta(SessionDeltaEvent {
+                cursor: Cursor {
+                    generation: "generation".to_string(),
+                    revision: 2,
+                },
+                previous_revision: 1,
+                revision: 2,
+                changes,
+            })
+        };
+        let machine = ResourceChange::Delete {
+            sequence: 1,
+            resource: ResourceKind::Machine,
+            id: ResourceReference::Machine(
+                MachineId::parse("machine_00000000000000000000000000000000").unwrap(),
+            ),
+        };
+        let workspace = ResourceChange::Delete {
+            sequence: 2,
+            resource: ResourceKind::Workspace,
+            id: ResourceReference::Workspace(
+                WorkspaceId::parse("ws_00000000000000000000000000000000").unwrap(),
+            ),
+        };
+
+        assert!(!session_event_affects_topology(&event(Vec::new())));
+        assert!(!session_event_affects_topology(&event(vec![
+            machine.clone()
+        ])));
+        assert!(session_event_affects_topology(&event(vec![
+            machine, workspace
+        ])));
     }
 
     #[test]

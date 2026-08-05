@@ -28,7 +28,8 @@ session and reports the failure in a toast.
 
 - connects to a cmux session over `cmux.protocol/1`, starting it when needed
 - lists, switches and creates local sessions without opening another window
-- lists the session's workspaces in a sidebar
+- seeds workspace topology from the session event snapshot and coalesces
+  topology-affecting deltas into sidebar and layout refreshes
 - renders pane splits and tabs from the server's styled render stream
 - creates, closes and resizes panes through server-owned layout mutations
 - sends keyboard and supported mouse input back to each pane's PTY
@@ -76,7 +77,7 @@ cargo run --release -- --probe --session main
 | Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |
 | Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
-| Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology refreshes every 3 seconds |
+| Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
 | Scrollback | the mouse wheel scrolls the viewport; a rounded 4px overlay thumb appears off-bottom, widens on hover, and supports direct dragging |
 | Scrollback search | `Ctrl+Shift+F` opens a prompt-themed search bar; literal case-insensitive matches cover retained history plus the current viewport, Enter/Shift+Enter navigate them, and visible hits use accent at 25% opacity |
@@ -191,7 +192,7 @@ The following were checked against live sessions:
 - pane splits render with per-pane PTY sizes, and dynamic window resizing
   updates those sizes;
 - the tab strip is present, panes accept click-to-focus, and workspace
-  switching follows topology refreshed every 3 seconds;
+  switching follows refreshed server topology;
 - keyboard input includes Ctrl and Alt sequences;
 - application mouse forwarding works for clicks in `htop` and wheel input in
   an alternate-screen application;

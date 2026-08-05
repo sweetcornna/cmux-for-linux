@@ -134,8 +134,8 @@ The stage 2 work verified against live sessions includes pane splits with
 per-pane PTY sizing, tab strips, click-to-focus, mouse forwarding to terminal
 applications, border theming with xterm-256 indexes, a separate
 `cmux-gtk.json` font setting, malformed-configuration safety, selection with a
-Shift override, wheel scrollback, dynamic resize, workspace switching with a
-3-second topology refresh, and keyboard input including Ctrl and Alt
+Shift override, wheel scrollback, dynamic resize, workspace switching with
+refreshed server topology, and keyboard input including Ctrl and Alt
 sequences. Mouse checks included clicking in `htop` and wheel input in an
 alternate-screen application. Additional stage 2 items now implemented and
 covered by the GUI tests are `Ctrl+Shift+V` through the server's
@@ -156,8 +156,9 @@ conflating them. Workspace `ScreenId` entries form the workspace-level screen
 strip and support focus, create, close and rename. Pane `TabId` entries retain
 their own strip and support focus, terminal-tab creation, close and rename.
 Hover close controls, middle-click close, double-click rename and action-lane
-creation all enqueue Rust binding mutations; the frontend waits for refreshed
-server topology before redrawing. The default `Ctrl+B` keymap matches the TUI:
+creation all enqueue Rust binding mutations; the frontend waits for topology
+changes from the server resource event stream before redrawing. The default
+`Ctrl+B` keymap matches the TUI:
 `t`, `x`, `Tab`, `Shift+Tab`, `,`, `$` and `&` retain their distinct
 NewTab, CloseTab, tab-navigation, RenameScreen, RenameWorkspace and CloseScreen
 semantics.
@@ -174,11 +175,19 @@ session socket candidate parsing.
 
 Session switching and transport recovery share one protocol-worker supervisor.
 It unbinds GTK command routes, stops and joins the control thread, attachment
-manager and every attachment thread, then connects and publishes a fresh
-topology. Updates carry a connection generation so late events from the old
-runtime are ignored. An attachment disconnect enters the same teardown and
-rebuild path after the one-second reconnect interval; it no longer maintains a
-competing per-attachment reconnect loop.
+manager, session-event thread and every attachment thread, then reconnects.
+Updates carry a connection generation so late events from the old runtime are
+ignored. An attachment disconnect enters the same teardown and rebuild path
+after the one-second reconnect interval; it no longer maintains a competing
+per-attachment reconnect loop.
+
+The session resource-event stream drives workspace topology. Its initial
+snapshot supplies the first tree; deltas are filtered to session, workspace,
+screen, pane, tab and terminal changes. Topology publications coalesce at 125ms
+with a guaranteed trailing publication. A failed non-atomic tree walk is
+re-armed for the next interval instead of tearing down the runtime, with an
+error reported after three consecutive failures. Stream end or error uses the
+existing supervisor teardown and rebuild path.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
@@ -191,8 +200,8 @@ change only; render state, input, mouse reporting and PTY sizing still cross
 `cmux.protocol/1`, and the server remains the sole VT implementation.
 Pane, tab, screen and workspace lifecycle operations plus divider ratios all
 run through the Rust resource bindings on the protocol worker thread; the
-server owns every mutation and the GTK frontend redraws only after refreshed
-topology arrives.
+server owns every mutation and the GTK frontend redraws only after matching
+topology events arrive.
 
 The GTK frontend also has per-pane overlay scrollbars, scrollback search and
 runtime font zoom. Attachment scroll events provide the absolute viewport
@@ -216,7 +225,9 @@ fields the server actually sends, and a protocol client had no way to claim
 sizing authority for its own viewer lease. Neither was a protocol problem;
 both were the public Rust surface lagging its own server. Inline rendering adds
 a later SDK patch that exposes the already-generated graphics schema through
-the public typed render decoder instead of discarding it.
+the public typed render decoder instead of discarding it. Patch 0005 makes tab
+and terminal resource-event values satisfy their existing public snapshot
+schemas; it changes no spec field or catalog fingerprint.
 
 ## Tracking upstream
 

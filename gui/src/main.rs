@@ -2670,16 +2670,6 @@ fn build_ui(application: &Application) {
         });
     }
 
-    // Other clients can mutate the workspace tree, so periodically refreshing
-    // the catalog is also how foreign splits and tab changes reach this view.
-    {
-        let worker = Rc::clone(&worker);
-        gtk4::glib::timeout_add_seconds_local(3, move || {
-            let _ = worker.input.send(Input::RefreshWorkspaces);
-            gtk4::glib::ControlFlow::Continue
-        });
-    }
-
     {
         let worker = Rc::clone(&worker);
         window.connect_close_request(move |_| {
