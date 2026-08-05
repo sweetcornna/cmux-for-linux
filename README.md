@@ -99,14 +99,22 @@ in the `upstream` remote.
 | `/usr/bin/cmux-tui` | the multiplexer and public CLI |
 | `/usr/bin/cmux-relay` | stdio-to-socket transport primitive |
 | `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session automatically when needed |
+| `/usr/bin/cmux-open-here` | helper for file-manager context-menu actions |
 | `/usr/share/applications/cmux.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons |
+| `/usr/share/{kio/servicemenus,file-manager/actions,nemo/actions,nautilus-python/extensions}/...` | file-manager context-menu integrations |
 | `/usr/share/man/man1/cmux.1.gz` | man page |
 | `/usr/share/{bash-completion,zsh,fish}/...` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | docs, third-party notices, GPL-3.0 text |
 
 The TUI and relay link only `libc`, `libm` and `libgcc_s`; `cmux-gtk` also uses
 the packaged GTK4, Pango and cairo runtime libraries.
+
+The package adds **New cmux window here** and **New cmux workspace here** to
+supported file managers. The window action opens the GTK frontend with a new
+workspace rooted at the selected directory. The workspace action adds that
+workspace to the running session and reuses an attached window; if no viewer
+is attached, it opens a GTK window so the new workspace is visible.
 
 ## Building from source
 

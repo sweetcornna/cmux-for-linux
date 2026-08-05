@@ -8,7 +8,7 @@ Profiles=cmux-window;cmux-workspace;
 
 [X-Action-Profile cmux-window]
 Name=New cmux window here
-Icon=utilities-terminal
+Icon=cmux
 Exec=cmux-open-here window %d/%b
 MimeTypes=inode/directory;
 

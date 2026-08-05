@@ -9,7 +9,7 @@ Icon=cmux
 
 [Desktop Action cmuxWindow]
 Name=New cmux window here
-Icon=utilities-terminal
+Icon=cmux
 Exec=cmux-open-here window %f
 
 [Desktop Action cmuxWorkspace]

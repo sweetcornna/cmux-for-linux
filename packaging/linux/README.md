@@ -12,8 +12,10 @@ through npm and PyPI; nothing here modifies upstream code.
 | `/usr/bin/cmux-relay` | stdio↔socket transport primitive |
 | `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session when needed |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching the upstream npm command name |
+| `/usr/bin/cmux-open-here` | helper for file-manager context-menu actions |
 | `/usr/share/applications/cmux.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons from `common/icons/` |
+| `/usr/share/{kio/servicemenus,file-manager/actions,nemo/actions,nautilus-python/extensions}/...` | file-manager context-menu integrations |
 | `/usr/share/man/man1/cmux.1.gz` | man page generated from `common/cmux.1.in` |
 | `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
 | `/usr/share/doc/cmux/`, `/usr/share/licenses/cmux/` | TUI and GUI READMEs, third-party notices, GPL-3.0 text |
@@ -30,6 +32,13 @@ desktop environment happens to use by default. There is intentionally no TUI
 desktop Action because `Terminal` is not a per-action key in the freedesktop
 desktop-entry specification. Such an action would have to hardcode a terminal
 emulator and would fail silently on systems where that binary is unavailable.
+
+Supported file managers also get **New cmux window here** and **New cmux
+workspace here** actions. The window action creates a workspace rooted at the
+selected directory and opens it in the GTK frontend, matching the application
+launcher. The workspace action adds the directory-backed workspace to the
+running session and keeps using an attached window; it opens a GTK window only
+when no viewer is attached.
 
 ## Build requirements
 
