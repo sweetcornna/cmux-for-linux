@@ -80,7 +80,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 
 | | |
 | --- | --- |
-| Window chrome | custom 28px titlebar, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
+| Window chrome | custom draggable 28px titlebar with GTK-configured double-, middle- and right-click actions, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
 | Sessions | titlebar selector for live sibling sockets, current-session highlighting, in-place switching with rollback, and prompt-based headless session creation |
 | Panes | server-owned split layouts with per-pane PTY sizing, click-to-focus, split-right/split-down creation and pane close from the keyboard or context menu |
 | Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |

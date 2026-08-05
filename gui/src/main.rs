@@ -32,7 +32,7 @@ use gtk4::{
     DrawingArea, Entry, EventControllerKey, EventControllerMotion, EventControllerScroll,
     EventControllerScrollFlags, GestureClick, GestureDrag, Label, ListBox, ListBoxRow, Orientation,
     Overlay, PackType, Paned, Popover, PopoverMenu, ScrolledWindow, SelectionMode, Widget,
-    WindowControls,
+    WindowControls, WindowHandle,
 };
 
 use screen::ScreenSet;
@@ -1231,6 +1231,7 @@ fn build_ui(application: &Application) {
     titlebar_actions.append(&controls_end);
     titlebar.set_start_widget(Some(&controls_start));
     titlebar.set_end_widget(Some(&titlebar_actions));
+    let titlebar_handle = WindowHandle::builder().child(&titlebar).build();
 
     let workspaces = ListBox::new();
     workspaces.set_selection_mode(SelectionMode::Single);
@@ -1311,7 +1312,7 @@ fn build_ui(application: &Application) {
         .build();
     window.add_css_class("cmux-window");
     window.set_size_request(300, 200);
-    window.set_titlebar(Some(&titlebar));
+    window.set_titlebar(Some(&titlebar_handle));
     let rename_prompt = Rc::new(build_rename_prompt(Rc::clone(&worker), toast.clone()));
     let new_session_prompt = Rc::new(build_new_session_prompt(Rc::clone(&worker), toast.clone()));
     {

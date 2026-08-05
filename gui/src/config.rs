@@ -371,6 +371,9 @@ window.cmux-window * {{ transition: none; }}
   padding: 0;
   border-radius: 6px;
   background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @chrome_fg;
 }}
 .titlebar-action {{ margin: 4px 2px; }}
@@ -502,6 +505,9 @@ popover.session-menu > contents {{
   padding: 2px 8px;
   border-radius: 4px;
   background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @menu_fg;
 }}
 .session-item:hover,
@@ -563,6 +569,9 @@ popover.rename-prompt > contents {{
   padding: 0;
   border-radius: 4px;
   background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @prompt_fg;
 }}
 .search-close:hover {{ background-color: @sidebar_hover_bg; }}
