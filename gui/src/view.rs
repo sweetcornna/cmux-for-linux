@@ -17,6 +17,8 @@ use cmux::{
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{gdk, gdk_pixbuf, DrawingArea};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::attention::{self, AttentionIndicator, AttentionState};
 use crate::config::{
@@ -2039,6 +2041,59 @@ fn draw_graphic_placeholder(cr: &gtk4::cairo::Context, rect: Rect, color: Rgb) {
     let _ = cr.stroke();
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GraphemePlacement<'a> {
+    text: &'a str,
+    column: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RunTextPlacement<'a> {
+    columns: u32,
+    graphemes: Vec<GraphemePlacement<'a>>,
+    use_fast_path: bool,
+}
+
+fn unicode_column_count(text: &str) -> u32 {
+    u32::try_from(text.width()).unwrap_or(u32::MAX)
+}
+
+fn unicode_text_column_count(text: &str) -> u32 {
+    text.graphemes(true).fold(0u32, |columns, grapheme| {
+        columns.saturating_add(unicode_column_count(grapheme))
+    })
+}
+
+fn run_column_count(text: &str, width_hint: Option<u16>) -> u32 {
+    width_hint
+        .map(u32::from)
+        .unwrap_or_else(|| unicode_text_column_count(text))
+}
+
+fn place_run_text(text: &str, width_hint: Option<u16>) -> RunTextPlacement<'_> {
+    let mut graphemes = Vec::new();
+    let mut column = 0u32;
+    let mut all_single_width = true;
+
+    for grapheme in text.graphemes(true) {
+        let width = unicode_column_count(grapheme);
+        graphemes.push(GraphemePlacement {
+            text: grapheme,
+            column,
+        });
+        column = column.saturating_add(width);
+        all_single_width &= width == 1;
+    }
+
+    let columns = width_hint.map(u32::from).unwrap_or(column);
+    let grapheme_count = u32::try_from(graphemes.len()).unwrap_or(u32::MAX);
+    RunTextPlacement {
+        columns,
+        use_fast_path: all_single_width && columns == grapheme_count,
+        graphemes,
+    }
+}
+
 fn draw_grid_backgrounds(
     cr: &gtk4::cairo::Context,
     screen: &Screen,
@@ -2055,10 +2110,7 @@ fn draw_grid_backgrounds(
         for run in &row.runs {
             // The server's width hint wins whenever Unicode text does not map
             // one-to-one onto terminal grid columns.
-            let cells = run
-                .width_hint
-                .map(u32::from)
-                .unwrap_or_else(|| run.text.chars().count() as u32);
+            let cells = run_column_count(&run.text, run.width_hint);
             let x = f64::from(column) * metrics.width;
             let run_width = f64::from(cells) * metrics.width;
             let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg);
@@ -2093,14 +2145,11 @@ fn draw_grid_text(
         }
         let mut column = 0u32;
         for run in &row.runs {
-            let cells = run
-                .width_hint
-                .map(u32::from)
-                .unwrap_or_else(|| run.text.chars().count() as u32);
-            if !run.has_attr(RenderRun::ATTR_INVISIBLE)
+            let should_draw = !run.has_attr(RenderRun::ATTR_INVISIBLE)
                 && blinking_content_visible(run.has_attr(RenderRun::ATTR_BLINK), blink)
-                && !run.text.trim().is_empty()
-            {
+                && !run.text.trim().is_empty();
+            let cells = if should_draw {
+                let placement = place_run_text(&run.text, run.width_hint);
                 description.set_weight(if run.has_attr(RenderRun::ATTR_BOLD) {
                     pango::Weight::Bold
                 } else {
@@ -2124,15 +2173,29 @@ fn draw_grid_text(
                     attributes.insert(pango::AttrInt::new_strikethrough(true));
                 }
                 layout.set_attributes(Some(&attributes));
-                layout.set_text(&run.text);
                 let color = foreground
                     .map(Rgb::cairo)
                     .unwrap_or_else(|| run_colors(run, &screen.default_fg, &screen.default_bg).0);
                 cr.set_source_rgb(color.0, color.1, color.2);
-                cr.move_to(f64::from(column) * metrics.width, y);
-                pangocairo::functions::show_layout(cr, &layout);
-            }
-            column += cells;
+                if placement.use_fast_path {
+                    layout.set_text(&run.text);
+                    cr.move_to(f64::from(column) * metrics.width, y);
+                    pangocairo::functions::show_layout(cr, &layout);
+                } else {
+                    for grapheme in placement.graphemes {
+                        layout.set_text(grapheme.text);
+                        cr.move_to(
+                            f64::from(column.saturating_add(grapheme.column)) * metrics.width,
+                            y,
+                        );
+                        pangocairo::functions::show_layout(cr, &layout);
+                    }
+                }
+                placement.columns
+            } else {
+                run_column_count(&run.text, run.width_hint)
+            };
+            column = column.saturating_add(cells);
         }
     }
 }
@@ -2487,6 +2550,67 @@ mod tests {
 
     use super::*;
     use crate::screen::{PaneView, ScreenSet, ScreenTabView, TabContent, TabView, WorkspaceView};
+
+    fn placement_offsets(placement: &RunTextPlacement<'_>) -> Vec<u32> {
+        placement
+            .graphemes
+            .iter()
+            .map(|grapheme| grapheme.column)
+            .collect()
+    }
+
+    #[test]
+    fn ascii_run_uses_consecutive_columns_and_fast_path() {
+        let placement = place_run_text("abcdef", Some(6));
+
+        assert_eq!(placement.columns, 6);
+        assert_eq!(placement_offsets(&placement), vec![0, 1, 2, 3, 4, 5]);
+        assert!(placement.use_fast_path);
+    }
+
+    #[test]
+    fn cjk_run_places_each_grapheme_two_columns_apart() {
+        let placement = place_run_text("中文中文", Some(8));
+
+        assert_eq!(placement.columns, 8);
+        assert_eq!(placement_offsets(&placement), vec![0, 2, 4, 6]);
+        assert!(!placement.use_fast_path);
+    }
+
+    #[test]
+    fn mixed_run_places_text_at_terminal_cell_offsets() {
+        let placement = place_run_text("abc中文def", Some(10));
+
+        assert_eq!(placement.columns, 10);
+        assert_eq!(placement_offsets(&placement), vec![0, 1, 2, 3, 5, 7, 8, 9]);
+        assert!(!placement.use_fast_path);
+    }
+
+    #[test]
+    fn combining_mark_stays_with_its_preceding_cell() {
+        let placement = place_run_text("e\u{301}x", Some(2));
+
+        assert_eq!(placement.columns, 2);
+        assert_eq!(placement_offsets(&placement), vec![0, 1]);
+        assert_eq!(
+            placement
+                .graphemes
+                .iter()
+                .map(|grapheme| grapheme.text)
+                .collect::<Vec<_>>(),
+            vec!["e\u{301}", "x"]
+        );
+        assert!(placement.use_fast_path);
+    }
+
+    #[test]
+    fn missing_width_hint_uses_unicode_column_widths() {
+        let placement = place_run_text("a中b", None);
+
+        assert_eq!(placement.columns, 4);
+        assert_eq!(placement_offsets(&placement), vec![0, 1, 3]);
+        assert!(!placement.use_fast_path);
+    }
 
     fn pane(number: u8) -> PaneId {
         PaneId::parse(format!("pane_{number:032x}")).unwrap()
