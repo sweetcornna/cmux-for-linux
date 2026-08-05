@@ -22,8 +22,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::attention::{self, AttentionIndicator, AttentionState};
 use crate::config::{
-    ChromeColors, ChromeMode, Rgb, Settings, ThemeOverrides, DEFAULT_DARK_BACKGROUND,
-    DEFAULT_LIGHT_BACKGROUND,
+    ChromeColors, ChromeMode, CursorShape, Rgb, Settings, TerminalAppearance, ThemeOverrides,
+    DEFAULT_DARK_BACKGROUND, DEFAULT_LIGHT_BACKGROUND, MAX_LETTER_SPACING, MAX_LINE_HEIGHT,
+    MIN_LINE_HEIGHT,
 };
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 use crate::search::{self, SearchUiState};
@@ -230,6 +231,7 @@ pub struct Theme {
     default_font_size: f64,
     chrome_mode: ChromeMode,
     overrides: ThemeOverrides,
+    terminal: TerminalAppearance,
     chrome: RefCell<ChromeColors>,
 }
 
@@ -242,21 +244,32 @@ impl Theme {
         let mut font = pango::FontDescription::from_string(&settings.font);
         let default_font_size = clamp_font_size(font_description_size(&font));
         set_description_size(&mut font, default_font_size);
+        // A configured terminal background is also the chrome's derivation base,
+        // so the window agrees with the grid instead of deriving from a colour
+        // the user just overrode.
+        let base = settings.terminal.background.unwrap_or(fallback);
         Self {
             font: RefCell::new(font.clone()),
             default_font: font,
             default_font_size,
             chrome_mode: settings.chrome,
             overrides: settings.theme,
-            chrome: RefCell::new(ChromeColors::derive(
-                fallback,
-                settings.chrome,
-                settings.theme,
-            )),
+            terminal: settings.terminal,
+            chrome: RefCell::new(ChromeColors::derive(base, settings.chrome, settings.theme)),
         }
     }
 
+    pub fn terminal(&self) -> &TerminalAppearance {
+        &self.terminal
+    }
+
+    /// Recomputes chrome for the terminal background that just arrived.
+    ///
+    /// A configured terminal background wins: the grid is already being drawn
+    /// in it, so deriving chrome from the server's value instead would leave the
+    /// window disagreeing with its own terminal.
     pub fn refresh_chrome(&self, background: Rgb) -> bool {
+        let background = self.terminal.background.unwrap_or(background);
         let colors = ChromeColors::derive(background, self.chrome_mode, self.overrides);
         if *self.chrome.borrow() == colors {
             return false;
@@ -337,12 +350,12 @@ pub fn adjusted_font_size(current: f64, delta: f64) -> f64 {
     clamp_font_size(current + delta)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CellMetrics {
     pub width: f64,
     pub height: f64,
-    /// Distance from the top of a cell to the text baseline.
-    #[allow(dead_code)]
+    /// Distance from the top of a cell to the text baseline. A configured line
+    /// height shifts this so glyphs stay centred in a taller cell.
     pub baseline: f64,
 }
 
@@ -505,10 +518,33 @@ pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetri
     let width = f64::from(metrics.approximate_digit_width()) / f64::from(pango::SCALE);
     let ascent = f64::from(metrics.ascent()) / f64::from(pango::SCALE);
     let descent = f64::from(metrics.descent()) / f64::from(pango::SCALE);
+    apply_cell_overrides(
+        CellMetrics {
+            width,
+            height: ascent + descent,
+            baseline: ascent,
+        },
+        theme.terminal(),
+    )
+}
+
+/// Scales a cell to the configured line height and letter spacing. Extra height
+/// is split above and below the glyphs so text stays optically centred rather
+/// than riding the top of a taller cell.
+fn apply_cell_overrides(metrics: CellMetrics, appearance: &TerminalAppearance) -> CellMetrics {
+    let scale = appearance
+        .line_height
+        .unwrap_or(1.0)
+        .clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT);
+    let spacing = appearance
+        .letter_spacing
+        .unwrap_or(0.0)
+        .clamp(0.0, MAX_LETTER_SPACING);
+    let height = metrics.height * scale;
     CellMetrics {
-        width,
-        height: ascent + descent,
-        baseline: ascent,
+        width: metrics.width + spacing,
+        height,
+        baseline: metrics.baseline + (height - metrics.height) / 2.0,
     }
 }
 
@@ -1175,16 +1211,63 @@ fn parse_color(value: &str) -> (f64, f64, f64) {
     }
 }
 
+/// The palette the server resolves runs against, captured from a live session's
+/// OSC 4 announcement. `spec/render.md` says runs carry resolved RGB with
+/// palette indexes already applied, so a client that wants to restyle an ANSI
+/// slot has to recognise the resolved value: these are the keys it matches.
+/// A run recoloured by an application's own OSC 4 no longer matches, and is
+/// deliberately left as the server sent it.
+const SERVER_ANSI: [Rgb; 16] = [
+    Rgb(0x1d, 0x1f, 0x21),
+    Rgb(0xcc, 0x66, 0x66),
+    Rgb(0xb5, 0xbd, 0x68),
+    Rgb(0xf0, 0xc6, 0x74),
+    Rgb(0x81, 0xa2, 0xbe),
+    Rgb(0xb2, 0x94, 0xbb),
+    Rgb(0x8a, 0xbe, 0xb7),
+    Rgb(0xc5, 0xc8, 0xc6),
+    Rgb(0x66, 0x66, 0x66),
+    Rgb(0xd5, 0x4e, 0x53),
+    Rgb(0xb9, 0xca, 0x4a),
+    Rgb(0xe7, 0xc5, 0x47),
+    Rgb(0x7a, 0xa6, 0xda),
+    Rgb(0xc3, 0x97, 0xd8),
+    Rgb(0x70, 0xc0, 0xb1),
+    Rgb(0xea, 0xea, 0xea),
+];
+
+/// Substitutes a configured palette entry for the resolved colour the server
+/// sent, leaving anything that matches no known slot untouched.
+fn remap_palette(rgb: (f64, f64, f64), appearance: &TerminalAppearance) -> (f64, f64, f64) {
+    let to_byte = |channel: f64| (channel * 255.0).round() as u8;
+    let probe = Rgb(to_byte(rgb.0), to_byte(rgb.1), to_byte(rgb.2));
+    SERVER_ANSI
+        .iter()
+        .position(|known| *known == probe)
+        .and_then(|slot| appearance.palette[slot])
+        .map_or(rgb, |color| color.cairo())
+}
+
 fn run_colors(
     run: &RenderRun,
     default_fg: &ColorHex,
     default_bg: &ColorHex,
+    appearance: &TerminalAppearance,
 ) -> ((f64, f64, f64), (f64, f64, f64)) {
-    let pick = |value: &Option<ColorHex>, fallback: &ColorHex| {
-        parse_color(value.as_ref().unwrap_or(fallback).as_str())
+    let pick = |value: &Option<ColorHex>,
+                fallback: &ColorHex,
+                override_color: Option<Rgb>|
+     -> (f64, f64, f64) {
+        match (value, override_color) {
+            // An explicit run colour is palette-resolved, so it may be remapped
+            // but never replaced by the default override.
+            (Some(color), _) => remap_palette(parse_color(color.as_str()), appearance),
+            (None, Some(color)) => color.cairo(),
+            (None, None) => remap_palette(parse_color(fallback.as_str()), appearance),
+        }
     };
-    let mut fg = pick(&run.fg, default_fg);
-    let mut bg = pick(&run.bg, default_bg);
+    let mut fg = pick(&run.fg, default_fg, appearance.foreground);
+    let mut bg = pick(&run.bg, default_bg, appearance.background);
     if run.has_attr(RenderRun::ATTR_INVERSE) {
         std::mem::swap(&mut fg, &mut bg);
     }
@@ -1260,7 +1343,10 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                         .borrow()
                         .visible_query(terminal)
                         .map(str::to_string);
-                    let (r, g, b) = parse_color(screen.default_bg.as_str());
+                    let (r, g, b) = theme
+                        .terminal()
+                        .background
+                        .map_or_else(|| parse_color(screen.default_bg.as_str()), Rgb::cairo);
                     cr.set_source_rgb(r, g, b);
                     cr.rectangle(
                         geometry.content.x,
@@ -1283,6 +1369,7 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                             area,
                             cr,
                             screen,
+                            appearance: theme.terminal(),
                             metrics,
                             height: geometry.content.height,
                             blink: blink.get(),
@@ -1762,6 +1849,7 @@ struct GridDrawContext<'a> {
     area: &'a DrawingArea,
     cr: &'a gtk4::cairo::Context,
     screen: &'a Screen,
+    appearance: &'a TerminalAppearance,
     metrics: CellMetrics,
     height: f64,
     blink: BlinkState,
@@ -1778,6 +1866,7 @@ fn draw_grid(
     let GridDrawContext {
         cr,
         screen,
+        appearance,
         metrics,
         height,
         blink,
@@ -1786,7 +1875,7 @@ fn draw_grid(
     if !screen.is_initialized() {
         return;
     }
-    draw_grid_backgrounds(cr, screen, metrics, height);
+    draw_grid_backgrounds(cr, screen, appearance, metrics, height);
     draw_graphics(
         cr,
         terminal,
@@ -1832,13 +1921,27 @@ fn draw_grid(
         if !cursor.visible {
             return;
         }
-        let presentation = cursor_presentation(cursor.style, cursor.blink, blink);
+        let appearance = theme.terminal();
+        // A configured shape or blink setting wins over the protocol's own,
+        // which is what makes it a user preference rather than a hint.
+        let style = appearance
+            .cursor_shape
+            .map_or(cursor.style, |shape| match shape {
+                CursorShape::Block => RenderCursorStyle::Block,
+                CursorShape::Bar => RenderCursorStyle::Bar,
+                CursorShape::Underline => RenderCursorStyle::Underline,
+            });
+        let blinking = appearance.cursor_blink.unwrap_or(cursor.blink);
+        let presentation = cursor_presentation(style, blinking, blink);
         if presentation == CursorPresentation::Hidden {
             return;
         }
         let x = f64::from(cursor.x) * metrics.width;
         let y = f64::from(cursor.y) * metrics.height;
-        let (r, g, b) = parse_color(cursor.color.as_ref().unwrap_or(&screen.default_fg).as_str());
+        let (r, g, b) = appearance.cursor.map_or_else(
+            || parse_color(cursor.color.as_ref().unwrap_or(&screen.default_fg).as_str()),
+            Rgb::cairo,
+        );
         cr.set_source_rgba(r, g, b, if blink.window_active { 0.75 } else { 0.5 });
         if presentation == CursorPresentation::Hollow {
             cr.set_line_width(1.0);
@@ -1846,7 +1949,7 @@ fn draw_grid(
             let _ = cr.stroke();
             return;
         }
-        match cursor.style {
+        match style {
             RenderCursorStyle::Block => cr.rectangle(x, y, metrics.width, metrics.height),
             RenderCursorStyle::Underline => {
                 cr.rectangle(x, y + metrics.height - 2.0, metrics.width, 2.0);
@@ -2143,6 +2246,7 @@ fn place_run_text(text: &str, width_hint: Option<u16>) -> RunTextPlacement<'_> {
 fn draw_grid_backgrounds(
     cr: &gtk4::cairo::Context,
     screen: &Screen,
+    appearance: &TerminalAppearance,
     metrics: CellMetrics,
     height: f64,
 ) {
@@ -2159,7 +2263,7 @@ fn draw_grid_backgrounds(
             let cells = run_column_count(&run.text, run.width_hint);
             let x = f64::from(column) * metrics.width;
             let run_width = f64::from(cells) * metrics.width;
-            let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg);
+            let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg, appearance);
             cr.set_source_rgb(bg.0, bg.1, bg.2);
             cr.rectangle(x, y, run_width, metrics.height);
             let _ = cr.fill();
@@ -2177,6 +2281,7 @@ fn draw_grid_text(
         area,
         cr,
         screen,
+        appearance,
         metrics,
         height,
         blink,
@@ -2219,9 +2324,9 @@ fn draw_grid_text(
                     attributes.insert(pango::AttrInt::new_strikethrough(true));
                 }
                 layout.set_attributes(Some(&attributes));
-                let color = foreground
-                    .map(Rgb::cairo)
-                    .unwrap_or_else(|| run_colors(run, &screen.default_fg, &screen.default_bg).0);
+                let color = foreground.map(Rgb::cairo).unwrap_or_else(|| {
+                    run_colors(run, &screen.default_fg, &screen.default_bg, appearance).0
+                });
                 cr.set_source_rgb(color.0, color.1, color.2);
                 if placement.use_fast_path {
                     layout.set_text(&run.text);
@@ -2908,6 +3013,68 @@ mod tests {
         assert!(!throttle.should_send(Duration::from_millis(60), 0.7, false));
         assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
         assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
+    }
+
+    #[test]
+    fn configured_line_height_and_spacing_grow_the_cell_and_recentre_text() {
+        let base = CellMetrics {
+            width: 10.0,
+            height: 20.0,
+            baseline: 16.0,
+        };
+        let appearance = TerminalAppearance {
+            line_height: Some(1.5),
+            letter_spacing: Some(2.0),
+            ..TerminalAppearance::default()
+        };
+        let scaled = apply_cell_overrides(base, &appearance);
+
+        assert_eq!(scaled.width, 12.0);
+        assert_eq!(scaled.height, 30.0);
+        // The extra 10px is split above and below, so the glyph stays centred.
+        assert_eq!(scaled.baseline, 21.0);
+
+        let untouched = apply_cell_overrides(base, &TerminalAppearance::default());
+        assert_eq!(untouched, base);
+    }
+
+    #[test]
+    fn out_of_range_line_height_is_clamped_rather_than_trusted() {
+        let base = CellMetrics {
+            width: 10.0,
+            height: 20.0,
+            baseline: 16.0,
+        };
+        let appearance = TerminalAppearance {
+            line_height: Some(99.0),
+            ..TerminalAppearance::default()
+        };
+        assert_eq!(
+            apply_cell_overrides(base, &appearance).height,
+            20.0 * MAX_LINE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn palette_remap_replaces_known_ansi_slots_only() {
+        let mut appearance = TerminalAppearance::default();
+        appearance.palette[1] = Some(Rgb(0x11, 0x22, 0x33));
+
+        // The server's resolved ANSI red maps to the configured colour.
+        let red = SERVER_ANSI[1].cairo();
+        assert_eq!(
+            remap_palette(red, &appearance),
+            Rgb(0x11, 0x22, 0x33).cairo()
+        );
+
+        // A colour that is not a known slot is left exactly as the server sent
+        // it, which is what keeps an application's own OSC 4 intact.
+        let arbitrary = Rgb(0x12, 0x34, 0x56).cairo();
+        assert_eq!(remap_palette(arbitrary, &appearance), arbitrary);
+
+        // An unconfigured slot also passes through untouched.
+        let green = SERVER_ANSI[2].cairo();
+        assert_eq!(remap_palette(green, &appearance), green);
     }
 
     #[test]

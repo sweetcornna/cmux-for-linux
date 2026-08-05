@@ -19,6 +19,13 @@ pub const DEFAULT_NOTIFICATION_INFO: Rgb = Rgb(0x87, 0xaf, 0xd7);
 pub const DEFAULT_NOTIFICATION_WARNING: Rgb = Rgb(0xd7, 0xaf, 0x5f);
 pub const DEFAULT_NOTIFICATION_ERROR: Rgb = Rgb(0xd7, 0x5f, 0x5f);
 
+/// Light-chrome values sampled from the upstream application's own window, so
+/// `theme.chrome = "light"` reproduces it rather than approximating it. The row
+/// selection there is a filled accent with white text, not a grey wash, and the
+/// secondary text is warm rather than neutral grey.
+pub const UPSTREAM_LIGHT_SELECTED_FOREGROUND: Rgb = Rgb(0xff, 0xff, 0xff);
+pub const UPSTREAM_LIGHT_DIM_FOREGROUND: Rgb = Rgb(0x77, 0x72, 0x68);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
@@ -70,11 +77,43 @@ pub struct ThemeOverrides {
     pub notification_error: Option<Rgb>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Cursor shape requested by configuration, overriding the protocol's own
+/// per-terminal style when set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+/// Client-side overrides for the terminal surface itself.
+///
+/// The server resolves `default_fg`, `default_bg` and the 16 ANSI colors for
+/// every render frame, so these exist to let a user restyle the grid without
+/// changing the shared `cmux-tui.json` palette every frontend reads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TerminalAppearance {
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub cursor: Option<Rgb>,
+    pub cursor_shape: Option<CursorShape>,
+    pub cursor_blink: Option<bool>,
+    /// ANSI 0-15 overrides, indexed by palette slot.
+    pub palette: [Option<Rgb>; 16],
+    /// Multiplier on the font's natural line height. Clamped on read.
+    pub line_height: Option<f64>,
+    /// Extra pixels between cell origins. Clamped on read.
+    pub letter_spacing: Option<f64>,
+    /// Padding in pixels between a pane's edge and its first cell.
+    pub padding: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub font: String,
     pub chrome: ChromeMode,
     pub theme: ThemeOverrides,
+    pub terminal: TerminalAppearance,
 }
 
 impl Default for Settings {
@@ -83,6 +122,7 @@ impl Default for Settings {
             font: DEFAULT_FONT.to_string(),
             chrome: ChromeMode::Auto,
             theme: ThemeOverrides::default(),
+            terminal: TerminalAppearance::default(),
         }
     }
 }
@@ -184,9 +224,9 @@ impl ChromeColors {
                 tab_active_foreground: Rgb(0x1c, 0x1c, 0x1c),
                 tab_active_unfocused_background: Rgb(0xda, 0xda, 0xda),
                 tab_active_unfocused_foreground: Rgb(0x30, 0x30, 0x30),
-                sidebar_selected_background: Rgb(0xda, 0xda, 0xda),
-                sidebar_selected_foreground: Rgb(0x1c, 0x1c, 0x1c),
-                sidebar_dim_foreground: Rgb(0x6c, 0x6c, 0x6c),
+                sidebar_selected_background: Rgb(0x00, 0x88, 0xff),
+                sidebar_selected_foreground: UPSTREAM_LIGHT_SELECTED_FOREGROUND,
+                sidebar_dim_foreground: UPSTREAM_LIGHT_DIM_FOREGROUND,
                 sidebar_border: Rgb(0x94, 0x94, 0x94),
                 border_foreground: Rgb(0x94, 0x94, 0x94),
                 border_active_foreground: overrides.border_active.unwrap_or(Rgb(0x00, 0x87, 0xaf)),
@@ -696,7 +736,16 @@ pub fn separator_color(background: Rgb) -> Rgba {
     }
 }
 
+/// Approximates the macOS sidebar material over a given window base.
+///
+/// Darkening reads as depth on a dark base, but the same multiplier on a light
+/// one turns a warm background muddy grey; upstream's light window shows the
+/// sidebar sharing the terminal's colour exactly. So a light base is carried
+/// through unchanged and only a dark base is deepened.
 pub fn sidebar_background(background: Rgb) -> Rgb {
+    if is_light_background(background) {
+        return background;
+    }
     let channel = |value: u8| (f64::from(value) * 0.82).floor() as u8;
     Rgb(
         channel(background.0),
@@ -916,6 +965,11 @@ fn apply_tui_theme(settings: &mut Settings, document: &Value) {
     );
 }
 
+pub const MIN_LINE_HEIGHT: f64 = 0.8;
+pub const MAX_LINE_HEIGHT: f64 = 3.0;
+pub const MAX_LETTER_SPACING: f64 = 8.0;
+pub const MAX_PADDING: f64 = 64.0;
+
 fn apply_gtk_config(settings: &mut Settings, document: &Value) {
     if let Some(font) = document
         .get("font")
@@ -924,6 +978,80 @@ fn apply_gtk_config(settings: &mut Settings, document: &Value) {
     {
         settings.font = font.to_string();
     }
+    if let Some(terminal) = document.get("terminal").and_then(Value::as_object) {
+        apply_terminal_appearance(&mut settings.terminal, terminal);
+    }
+}
+
+fn apply_terminal_appearance(
+    appearance: &mut TerminalAppearance,
+    terminal: &serde_json::Map<String, Value>,
+) {
+    apply_optional_color(terminal.get("foreground"), &mut appearance.foreground);
+    apply_optional_color(terminal.get("background"), &mut appearance.background);
+    apply_optional_color(terminal.get("cursor"), &mut appearance.cursor);
+    if let Some(shape) = terminal.get("cursor_shape").and_then(Value::as_str) {
+        appearance.cursor_shape = match shape {
+            "block" => Some(CursorShape::Block),
+            "bar" | "beam" => Some(CursorShape::Bar),
+            "underline" => Some(CursorShape::Underline),
+            _ => appearance.cursor_shape,
+        };
+    }
+    if let Some(blink) = terminal.get("cursor_blink").and_then(Value::as_bool) {
+        appearance.cursor_blink = Some(blink);
+    }
+    // A 16-entry array is the compact form; named keys stay available for
+    // setting one slot without restating the rest.
+    if let Some(entries) = terminal.get("palette").and_then(Value::as_array) {
+        for (slot, value) in entries.iter().take(16).enumerate() {
+            if let Some(color) = parse_color(value) {
+                appearance.palette[slot] = Some(color);
+            }
+        }
+    }
+    if let Some(named) = terminal.get("palette").and_then(Value::as_object) {
+        for (name, value) in named {
+            if let (Some(slot), Some(color)) = (palette_slot(name), parse_color(value)) {
+                appearance.palette[slot] = Some(color);
+            }
+        }
+    }
+    appearance.line_height = clamped_number(
+        terminal.get("line_height"),
+        MIN_LINE_HEIGHT,
+        MAX_LINE_HEIGHT,
+    )
+    .or(appearance.line_height);
+    appearance.letter_spacing =
+        clamped_number(terminal.get("letter_spacing"), 0.0, MAX_LETTER_SPACING)
+            .or(appearance.letter_spacing);
+    appearance.padding =
+        clamped_number(terminal.get("padding"), 0.0, MAX_PADDING).or(appearance.padding);
+}
+
+/// Maps an ANSI colour name to its palette slot. Both the plain and `bright_`
+/// forms are accepted, matching how terminal configurations usually spell them.
+fn palette_slot(name: &str) -> Option<usize> {
+    const BASE: [&str; 8] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    ];
+    if let Some(rest) = name.strip_prefix("bright_") {
+        return BASE.iter().position(|base| *base == rest).map(|i| i + 8);
+    }
+    if let Some(index) = name.strip_prefix("color").and_then(|i| i.parse().ok()) {
+        return (index < 16usize).then_some(index);
+    }
+    BASE.iter().position(|base| *base == name)
+}
+
+/// Reads a finite number and clamps it, so a malformed or absurd value cannot
+/// produce an unusable grid.
+fn clamped_number(value: Option<&Value>, min: f64, max: f64) -> Option<f64> {
+    value
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+        .map(|number| number.clamp(min, max))
 }
 
 fn apply_optional_color(value: Option<&Value>, target: &mut Option<Rgb>) {
@@ -1155,9 +1283,16 @@ mod tests {
         let light_separator = separator_color(DEFAULT_LIGHT_BACKGROUND);
         assert_eq!(light_separator.color, Rgb(0xe0, 0xe1, 0xe1));
         assert_eq!(light_separator.alpha, 0.26);
+        // A light base keeps its colour: upstream's light window shows the
+        // sidebar sharing the terminal background exactly, and darkening a warm
+        // light colour reads as muddy grey rather than as depth.
         assert_eq!(
             sidebar_background(DEFAULT_LIGHT_BACKGROUND),
-            Rgb(0xd0, 0xd1, 0xd1)
+            DEFAULT_LIGHT_BACKGROUND
+        );
+        assert_eq!(
+            sidebar_background(DEFAULT_DARK_BACKGROUND),
+            Rgb(0x18, 0x18, 0x18)
         );
         assert!(is_light_background(DEFAULT_LIGHT_BACKGROUND));
     }
@@ -1283,5 +1418,91 @@ mod tests {
         assert!((boosted_brightness - expected).abs() < 0.005);
         assert!((boosted_saturation - saturation).abs() < 0.005);
         assert_eq!(workspace_display_color(base, true), base);
+    }
+
+    #[test]
+    fn terminal_appearance_reads_colors_palette_and_metrics() {
+        let document = serde_json::json!({
+            "font": "monospace 12",
+            "terminal": {
+                "foreground": "#161107",
+                "background": "#f6f1e5",
+                "cursor": 110,
+                "cursor_shape": "bar",
+                "cursor_blink": false,
+                "palette": {"red": "#cc0000", "bright_blue": "#7aa6da", "color7": "#c5c8c6"},
+                "line_height": 1.4,
+                "letter_spacing": 0.5,
+                "padding": 8
+            }
+        });
+        let mut settings = Settings::default();
+        apply_gtk_config(&mut settings, &document);
+
+        assert_eq!(settings.font, "monospace 12");
+        let terminal = &settings.terminal;
+        assert_eq!(terminal.foreground, Some(Rgb(0x16, 0x11, 0x07)));
+        assert_eq!(terminal.background, Some(Rgb(0xf6, 0xf1, 0xe5)));
+        assert_eq!(terminal.cursor, Some(xterm_color(110)));
+        assert_eq!(terminal.cursor_shape, Some(CursorShape::Bar));
+        assert_eq!(terminal.cursor_blink, Some(false));
+        assert_eq!(terminal.palette[1], Some(Rgb(0xcc, 0x00, 0x00)));
+        assert_eq!(terminal.palette[12], Some(Rgb(0x7a, 0xa6, 0xda)));
+        assert_eq!(terminal.palette[7], Some(Rgb(0xc5, 0xc8, 0xc6)));
+        assert_eq!(terminal.palette[0], None);
+        assert_eq!(terminal.line_height, Some(1.4));
+        assert_eq!(terminal.letter_spacing, Some(0.5));
+        assert_eq!(terminal.padding, Some(8.0));
+    }
+
+    #[test]
+    fn terminal_palette_also_accepts_an_ordered_array() {
+        let document = serde_json::json!({
+            "terminal": {"palette": ["#000000", "#111111", "#222222"]}
+        });
+        let mut settings = Settings::default();
+        apply_gtk_config(&mut settings, &document);
+
+        assert_eq!(settings.terminal.palette[0], Some(Rgb(0, 0, 0)));
+        assert_eq!(settings.terminal.palette[2], Some(Rgb(0x22, 0x22, 0x22)));
+        assert_eq!(settings.terminal.palette[3], None);
+    }
+
+    #[test]
+    fn terminal_metrics_are_clamped_and_bad_values_ignored() {
+        let document = serde_json::json!({
+            "terminal": {
+                "line_height": 99.0,
+                "letter_spacing": -5.0,
+                "padding": 10_000,
+                "cursor_shape": "spiral",
+                "foreground": "not a colour"
+            }
+        });
+        let mut settings = Settings::default();
+        apply_gtk_config(&mut settings, &document);
+
+        assert_eq!(settings.terminal.line_height, Some(MAX_LINE_HEIGHT));
+        assert_eq!(settings.terminal.letter_spacing, Some(0.0));
+        assert_eq!(settings.terminal.padding, Some(MAX_PADDING));
+        // An unknown shape and an unparseable colour leave the defaults intact
+        // rather than failing the whole configuration.
+        assert_eq!(settings.terminal.cursor_shape, None);
+        assert_eq!(settings.terminal.foreground, None);
+    }
+
+    #[test]
+    fn light_chrome_matches_the_sampled_upstream_selection() {
+        let colors = ChromeColors::derive(
+            Rgb(0xf6, 0xf1, 0xe5),
+            ChromeMode::Light,
+            ThemeOverrides::default(),
+        );
+        assert_eq!(colors.sidebar_selected_background, Rgb(0x00, 0x88, 0xff));
+        assert_eq!(
+            colors.sidebar_selected_foreground,
+            UPSTREAM_LIGHT_SELECTED_FOREGROUND
+        );
+        assert_eq!(colors.sidebar_dim_foreground, UPSTREAM_LIGHT_DIM_FOREGROUND);
     }
 }

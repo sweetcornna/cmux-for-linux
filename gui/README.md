@@ -109,7 +109,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
 | Inline images | server-decoded Kitty RGB/RGBA pixels with source cropping, cell-relative scaling, scroll-aware viewport placement and z-order; inactive panes use the same 70% dimming as text |
-| Theme | automatic runtime chrome colors from the active terminal background, explicit light/dark chrome bases and `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT`, with non-persistent 6pt-32pt runtime zoom |
+| Theme | automatic runtime chrome colors from the active terminal background, explicit light/dark chrome bases and `cmux-tui.json` overrides; a `terminal` section in `cmux-gtk.json` restyles the grid's colors, ANSI palette, cursor and cell metrics; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT`, with non-persistent 6pt-32pt runtime zoom |
 
 The visual metrics and color rules follow
 [`../docs/gtk-design-parity.md`](../docs/gtk-design-parity.md).
@@ -202,6 +202,49 @@ CMUX_GTK_FONT="monospace 12" cmux-gtk --session main
 
 Runtime zoom changes only the current process and never writes either config
 file. Each change recomputes cell metrics and resizes every visible pane PTY.
+
+## Terminal appearance
+
+`cmux-tui.json` styles the window chrome for every frontend. A `terminal`
+section in `cmux-gtk.json` restyles the grid itself, for this window only:
+
+```json
+{
+  "font": "monospace 11",
+  "terminal": {
+    "foreground": "#161107",
+    "background": "#f6f1e5",
+    "cursor": "#0088fe",
+    "cursor_shape": "bar",
+    "cursor_blink": false,
+    "line_height": 1.25,
+    "letter_spacing": 0.5,
+    "padding": 8,
+    "palette": { "red": "#c0392b", "bright_blue": "#7aa6da" }
+  }
+}
+```
+
+| Key | Effect |
+| --- | --- |
+| `foreground`, `background` | Replace the defaults the server resolves for each frame. A configured background is also the base the chrome derives from, so the window matches its own grid. |
+| `cursor` | Cursor colour, replacing the protocol's own. |
+| `cursor_shape` | `block`, `bar` or `underline`, overriding the shape the terminal requested. |
+| `cursor_blink` | Forces blinking on or off instead of following the protocol attribute. |
+| `line_height` | Multiplier on the font's natural cell height, 0.8 to 3.0. Added space is split above and below so glyphs stay centred. |
+| `letter_spacing` | Extra pixels per cell, up to 8. |
+| `padding` | Pixels between a pane's edge and its first cell, up to 64. |
+| `palette` | ANSI 0-15. Either an ordered array or named keys: `red`, `bright_blue`, or `color7`. |
+
+Colours accept `#rrggbb`, `#rgb` or an xterm-256 index. Out-of-range metrics are
+clamped rather than rejected, and an unreadable value leaves that single setting
+at its default instead of discarding the file.
+
+`palette` has one limitation worth knowing. `spec/render.md` has the server
+send runs as resolved RGB with palette indexes already applied, so the frontend
+recognises an ANSI slot by the colour the server resolved it to. A run that an
+application recoloured through its own OSC 4 sequence no longer matches a known
+slot and is drawn exactly as the server sent it.
 
 ## Mouse policy
 
