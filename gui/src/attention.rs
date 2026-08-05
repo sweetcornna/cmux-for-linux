@@ -18,9 +18,21 @@ pub struct AttentionState {
 }
 
 impl AttentionState {
-    pub fn from_resources<'a>(
+    /// Builds attention state, consulting `terminal_is_running` before showing
+    /// an agent as active.
+    ///
+    /// The server only drops an agent record when its terminal is tombstoned, so
+    /// a record survives the process that reported it: an agent that exits or
+    /// dies without reporting a final state leaves `working` behind forever, and
+    /// the row would claim work is happening in a terminal that has exited.
+    /// `spec/frontends.md` says a presentation frontend must display server
+    /// records rather than invent its own agent model, so this does not rewrite
+    /// the state - it declines to present an activity claim that the terminal's
+    /// own lifecycle contradicts.
+    pub fn from_resources_with_liveness<'a>(
         notifications: impl IntoIterator<Item = &'a NotificationSnapshot>,
         agents: impl IntoIterator<Item = &'a AgentSnapshot>,
+        terminal_is_running: impl Fn(&TerminalId) -> bool,
     ) -> Self {
         let mut terminals = HashMap::<TerminalId, AttentionIndicator>::new();
         for notification in notifications {
@@ -46,6 +58,14 @@ impl AttentionState {
             }
         }
         for (terminal, (_, _, state)) in latest_agents {
+            // An exited terminal cannot still be working or blocked on input.
+            // Settled states stay, because "done" remains true after the fact.
+            let state = match state {
+                AgentState::Working | AgentState::Blocked if !terminal_is_running(&terminal) => {
+                    continue
+                }
+                state => state,
+            };
             terminals.entry(terminal).or_default().agent = Some(state);
         }
 
@@ -180,6 +200,14 @@ mod tests {
 
     use super::*;
 
+    /// Test shorthand for the common case where every terminal is running.
+    fn from_resources<'a>(
+        notifications: impl IntoIterator<Item = &'a NotificationSnapshot>,
+        agents: impl IntoIterator<Item = &'a AgentSnapshot>,
+    ) -> AttentionState {
+        AttentionState::from_resources_with_liveness(notifications, agents, |_| true)
+    }
+
     fn terminal(value: u128) -> TerminalId {
         TerminalId::parse(format!("term_{value:032x}")).unwrap()
     }
@@ -229,7 +257,7 @@ mod tests {
             notification(2, Some(first.clone()), NotificationLevel::Error, false),
             notification(3, None, NotificationLevel::Error, true),
         ];
-        let state = AttentionState::from_resources(resources.iter(), std::iter::empty());
+        let state = from_resources(resources.iter(), std::iter::empty());
 
         assert_eq!(
             tab_indicator(&state, &TabContent::Terminal(first)),
@@ -254,7 +282,7 @@ mod tests {
             notification(2, Some(second.clone()), NotificationLevel::Error, true),
             notification(3, Some(third.clone()), NotificationLevel::Warning, true),
         ];
-        let state = AttentionState::from_resources(resources.iter(), std::iter::empty());
+        let state = from_resources(resources.iter(), std::iter::empty());
 
         assert_eq!(
             screen_indicator(&state, &[first.clone(), third]).notification,
@@ -267,6 +295,66 @@ mod tests {
     }
 
     #[test]
+    fn an_exited_terminal_stops_claiming_active_agent_work() {
+        let dead = terminal(1);
+        let alive = terminal(2);
+        let reports = [
+            agent(1, dead.clone(), AgentState::Working, 10),
+            agent(2, alive.clone(), AgentState::Working, 10),
+        ];
+        let state = AttentionState::from_resources_with_liveness(
+            std::iter::empty(),
+            reports.iter(),
+            |id| *id == alive,
+        );
+
+        // The server keeps an agent record until its terminal is tombstoned, so
+        // a terminal that exited mid-run would otherwise report work forever.
+        assert_eq!(
+            tab_indicator(&state, &TabContent::Terminal(dead)).agent,
+            None
+        );
+        assert_eq!(
+            tab_indicator(&state, &TabContent::Terminal(alive)).agent,
+            Some(AgentState::Working)
+        );
+    }
+
+    #[test]
+    fn settled_agent_states_survive_their_terminal_exiting() {
+        let dead = terminal(1);
+        let reports = [agent(1, dead.clone(), AgentState::Done, 10)];
+        let state = AttentionState::from_resources_with_liveness(
+            std::iter::empty(),
+            reports.iter(),
+            |_| false,
+        );
+
+        // "Done" stays true after the fact; only claims of ongoing activity are
+        // contradicted by the terminal having exited.
+        assert_eq!(
+            tab_indicator(&state, &TabContent::Terminal(dead)).agent,
+            Some(AgentState::Done)
+        );
+    }
+
+    #[test]
+    fn a_blocked_agent_in_a_dead_terminal_is_not_shown_as_waiting() {
+        let dead = terminal(1);
+        let reports = [agent(1, dead.clone(), AgentState::Blocked, 10)];
+        let state = AttentionState::from_resources_with_liveness(
+            std::iter::empty(),
+            reports.iter(),
+            |_| false,
+        );
+
+        assert_eq!(
+            tab_indicator(&state, &TabContent::Terminal(dead)).agent,
+            None
+        );
+    }
+
+    #[test]
     fn newest_agent_report_is_the_current_tab_state() {
         let first = terminal(1);
         let reports = [
@@ -274,7 +362,7 @@ mod tests {
             agent(2, first.clone(), AgentState::Blocked, 40),
             agent(3, first.clone(), AgentState::Done, 30),
         ];
-        let state = AttentionState::from_resources(std::iter::empty(), reports.iter());
+        let state = from_resources(std::iter::empty(), reports.iter());
 
         assert_eq!(
             tab_indicator(&state, &TabContent::Terminal(first)).agent,
@@ -296,7 +384,7 @@ mod tests {
     fn workspace_agent_rollup_uses_one_terminal_report() {
         let first = terminal(1);
         let reports = [agent(1, first.clone(), AgentState::Working, 20)];
-        let state = AttentionState::from_resources(std::iter::empty(), reports.iter());
+        let state = from_resources(std::iter::empty(), reports.iter());
 
         assert_eq!(
             workspace_indicator(&state, &[first]).agent,
@@ -317,7 +405,7 @@ mod tests {
             agent(3, third.clone(), AgentState::Working, 20),
             agent(4, fourth.clone(), AgentState::Blocked, 20),
         ];
-        let state = AttentionState::from_resources(std::iter::empty(), reports.iter());
+        let state = from_resources(std::iter::empty(), reports.iter());
 
         assert_eq!(
             workspace_indicator(&state, &[first, second, third, fourth.clone()]).agent,

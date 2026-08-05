@@ -281,6 +281,14 @@ The following were checked against live sessions:
 
 ## Known gaps
 
+The server drops an agent record only when its terminal is tombstoned, so a
+record outlives the process that reported it: an agent that exits or is killed
+without reporting a final state leaves `working` behind indefinitely. Rows
+therefore stop presenting `working` and `blocked` for a terminal that has
+exited, while settled states such as `done` remain. This does not invent a
+second agent-state model, which `spec/frontends.md` rules out; it declines to
+repeat an activity claim the terminal's own lifecycle contradicts.
+
 The server clears a focused surface's in-memory unread marker after its
 resource focus publication and emits no notification lifecycle change. GTK
 therefore clears matching notification markers locally after a successful

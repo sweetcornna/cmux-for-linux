@@ -880,6 +880,9 @@ fn session_event_loop(
     let mut notifications = HashMap::<NotificationId, NotificationSnapshot>::new();
     let mut agents = HashMap::<AgentId, AgentSnapshot>::new();
     let mut terminal_cwds = HashMap::<TerminalId, String>::new();
+    // Whether each terminal is still running, so a stale agent record cannot
+    // claim work in a terminal that has exited.
+    let mut running_terminals = HashSet::<TerminalId>::new();
     let mut published_attention = None;
 
     loop {
@@ -896,14 +899,33 @@ fn session_event_loop(
             cleared |= clear_terminal_notifications(&mut notifications, &terminal);
         }
         if cleared {
-            publish_attention(&notifications, &agents, &mut published_attention, &updates);
+            publish_attention(
+                &notifications,
+                &agents,
+                &running_terminals,
+                &mut published_attention,
+                &updates,
+            );
         }
 
         let timeout = refreshes.poll_timeout(Instant::now(), POLL_INTERVAL);
         match stream.next_timeout(timeout) {
             Ok(StreamPoll::Item(item)) => {
-                if apply_attention_event(&item.value, &mut notifications, &mut agents) {
-                    publish_attention(&notifications, &agents, &mut published_attention, &updates);
+                // Liveness first: an agent record and its terminal's lifecycle
+                // can change in one delta, and the agent must be judged against
+                // the newer lifecycle rather than the previous one.
+                let liveness_changed =
+                    apply_terminal_liveness_event(&item.value, &mut running_terminals);
+                if apply_attention_event(&item.value, &mut notifications, &mut agents)
+                    || liveness_changed
+                {
+                    publish_attention(
+                        &notifications,
+                        &agents,
+                        &running_terminals,
+                        &mut published_attention,
+                        &updates,
+                    );
                 }
                 if apply_terminal_cwd_event(&item.value, &mut terminal_cwds) {
                     let _ = updates.send_blocking(Update::TerminalCwds(terminal_cwds.clone()));
@@ -964,6 +986,55 @@ fn apply_terminal_cwd_event(
             let mut changed = false;
             for change in &delta.changes {
                 changed |= apply_terminal_cwd_change(change, terminal_cwds);
+            }
+            changed
+        }
+        SessionEvent::Unknown { .. } => false,
+    }
+}
+
+/// Tracks which terminals are still running, from the same resource stream the
+/// cwd map is built from. `TerminalSnapshot::running` is true exactly for the
+/// `running` lifecycle, so this needs no extra round-trip.
+fn apply_terminal_liveness_event(event: &SessionEvent, running: &mut HashSet<TerminalId>) -> bool {
+    match event {
+        SessionEvent::Snapshot(event) => {
+            let next = event
+                .snapshot
+                .terminals
+                .iter()
+                .filter(|terminal| terminal.running)
+                .map(|terminal| terminal.id.clone())
+                .collect::<HashSet<_>>();
+            if *running == next {
+                false
+            } else {
+                *running = next;
+                true
+            }
+        }
+        SessionEvent::Delta(delta) => {
+            let mut changed = false;
+            for change in &delta.changes {
+                changed |= match change {
+                    ResourceChange::Upsert {
+                        resource: ResourceKind::Terminal,
+                        value: ResourceEntitySnapshot::Terminal(terminal),
+                        ..
+                    } => {
+                        if terminal.running {
+                            running.insert(terminal.id.clone())
+                        } else {
+                            running.remove(&terminal.id)
+                        }
+                    }
+                    ResourceChange::Delete {
+                        resource: ResourceKind::Terminal,
+                        id: ResourceReference::Terminal(terminal),
+                        ..
+                    } => running.remove(terminal),
+                    _ => false,
+                };
             }
             changed
         }
@@ -1092,10 +1163,15 @@ fn clear_terminal_notifications(
 fn publish_attention(
     notifications: &HashMap<NotificationId, NotificationSnapshot>,
     agents: &HashMap<AgentId, AgentSnapshot>,
+    running: &HashSet<TerminalId>,
     published: &mut Option<AttentionState>,
     updates: &UpdateSink,
 ) {
-    let next = AttentionState::from_resources(notifications.values(), agents.values());
+    let next = AttentionState::from_resources_with_liveness(
+        notifications.values(),
+        agents.values(),
+        |terminal| running.contains(terminal),
+    );
     if published.as_ref() == Some(&next) {
         return;
     }
