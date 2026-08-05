@@ -3058,7 +3058,7 @@ fn build_ui(application: &Application) {
                     }
                     Update::Detached { terminal: id } => {
                         if screens.borrow().contains_terminal(&id) {
-                            set_toast(&toast, &format!("Detached from {id:?}; reconnecting"));
+                            set_toast(&toast, &format!("Detached from {id:?}"));
                         }
                     }
                     Update::Error(message) => set_toast(&toast, &message),

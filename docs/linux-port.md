@@ -179,9 +179,12 @@ Session switching and transport recovery share one protocol-worker supervisor.
 It unbinds GTK command routes, stops and joins the control thread, attachment
 manager, session-event thread and every attachment thread, then reconnects.
 Updates carry a connection generation so late events from the old runtime are
-ignored. An attachment disconnect enters the same teardown and rebuild path
-after the one-second reconnect interval; it no longer maintains a competing
-per-attachment reconnect loop.
+ignored. A genuine attachment stream error enters that teardown and rebuild
+path after the one-second reconnect interval. An ordinary finished attachment
+stops only its worker and remains satisfied while its terminal is still in the
+visible set, preserving the last rendered frame without reattaching an exited
+terminal. A bounded stream-overflow gap retries only that attachment, at
+one-second intervals, up to three times.
 
 The session resource-event stream drives workspace topology. Its initial
 snapshot supplies the first tree; deltas are filtered to session, workspace,

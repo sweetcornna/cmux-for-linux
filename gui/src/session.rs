@@ -10,7 +10,7 @@
 //! every attachment its own polling thread. A slow terminal therefore cannot add
 //! its 50ms poll timeout to every other pane's latency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -40,6 +40,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TOPOLOGY_REFRESH_INTERVAL: Duration = Duration::from_millis(125);
 const TOPOLOGY_ERROR_THRESHOLD: u8 = 3;
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ATTACHMENT_OVERFLOW_REATTACHES: u8 = 3;
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -1296,6 +1297,54 @@ struct AttachmentWorker {
     join: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+enum AttachmentStreamOutcome {
+    Ended,
+    Overflow,
+    Errored(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentOutcomeAction {
+    Detach { remember: bool },
+    Reattach,
+    Rebuild,
+}
+
+fn attachment_outcome_action(
+    outcome: &AttachmentStreamOutcome,
+    terminal_is_desired: bool,
+) -> AttachmentOutcomeAction {
+    match outcome {
+        AttachmentStreamOutcome::Ended => AttachmentOutcomeAction::Detach {
+            remember: terminal_is_desired,
+        },
+        AttachmentStreamOutcome::Overflow if terminal_is_desired => {
+            AttachmentOutcomeAction::Reattach
+        }
+        AttachmentStreamOutcome::Overflow => AttachmentOutcomeAction::Detach { remember: false },
+        AttachmentStreamOutcome::Errored(_) => AttachmentOutcomeAction::Rebuild,
+    }
+}
+
+struct AttachmentCompletion {
+    terminal: TerminalId,
+    outcome: AttachmentStreamOutcome,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AttachmentOverflowRetry {
+    attempts: u8,
+    retry_at: Option<Instant>,
+}
+
+fn next_attachment_overflow_retry(attempts: u8, now: Instant) -> Option<AttachmentOverflowRetry> {
+    (attempts < MAX_ATTACHMENT_OVERFLOW_REATTACHES).then(|| AttachmentOverflowRetry {
+        attempts: attempts + 1,
+        retry_at: Some(now + RECONNECT_INTERVAL),
+    })
+}
+
 enum AttachmentCommand {
     Resize(Size),
     Stop,
@@ -1310,18 +1359,87 @@ fn attachment_manager_loop(
 ) {
     let session = client.session(Selector::current());
     let mut workers: HashMap<TerminalId, AttachmentWorker> = HashMap::new();
+    let mut desired: HashMap<TerminalId, Size> = HashMap::new();
+    let mut satisfied = HashSet::<TerminalId>::new();
+    let mut overflow_retries = HashMap::<TerminalId, AttachmentOverflowRetry>::new();
+    let (completion_tx, completion_rx) = mpsc::channel::<AttachmentCompletion>();
 
-    while let Ok(control) = controls.recv() {
-        match control {
-            Control::Stop => {
-                for worker in workers.into_values() {
-                    let _ = worker.commands.send(AttachmentCommand::Stop);
-                    let _ = worker.join.join();
-                }
-                return;
+    loop {
+        while let Ok(completion) = completion_rx.try_recv() {
+            if let Some(worker) = workers.remove(&completion.terminal) {
+                let _ = worker.join.join();
             }
-            Control::SyncAttachments(specs) => {
-                let desired: HashMap<TerminalId, Size> = specs
+            let terminal_is_desired = desired.contains_key(&completion.terminal);
+            match attachment_outcome_action(&completion.outcome, terminal_is_desired) {
+                AttachmentOutcomeAction::Detach { remember } => {
+                    let _ = updates.send_blocking(Update::Detached {
+                        terminal: completion.terminal.clone(),
+                    });
+                    overflow_retries.remove(&completion.terminal);
+                    if remember {
+                        satisfied.insert(completion.terminal);
+                    }
+                }
+                AttachmentOutcomeAction::Reattach => {
+                    let _ = updates.send_blocking(Update::Detached {
+                        terminal: completion.terminal.clone(),
+                    });
+                    let attempts = overflow_retries
+                        .get(&completion.terminal)
+                        .map_or(0, |retry| retry.attempts);
+                    if let Some(retry) = next_attachment_overflow_retry(attempts, Instant::now()) {
+                        overflow_retries.insert(completion.terminal, retry);
+                    } else {
+                        let message = format!(
+                            "attachment overflow for {:?}; stopped after {} reattach attempts",
+                            completion.terminal, MAX_ATTACHMENT_OVERFLOW_REATTACHES
+                        );
+                        let _ = updates.send_blocking(Update::Error(message));
+                        overflow_retries.remove(&completion.terminal);
+                        satisfied.insert(completion.terminal);
+                    }
+                }
+                AttachmentOutcomeAction::Rebuild => {
+                    let AttachmentStreamOutcome::Errored(message) = completion.outcome else {
+                        unreachable!("only stream errors rebuild the runtime");
+                    };
+                    let _ = updates.send_blocking(Update::Error(message.clone()));
+                    let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
+                        generation,
+                        message,
+                    });
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let ready: Vec<TerminalId> = overflow_retries
+            .iter()
+            .filter(|(terminal, retry)| {
+                desired.contains_key(*terminal)
+                    && retry.retry_at.is_some_and(|retry_at| now >= retry_at)
+            })
+            .map(|(terminal, _)| terminal.clone())
+            .collect();
+        for terminal in ready {
+            let Some(size) = desired.get(&terminal).copied() else {
+                continue;
+            };
+            let Some(retry) = overflow_retries.get_mut(&terminal) else {
+                continue;
+            };
+            retry.retry_at = None;
+            let worker =
+                spawn_attachment_worker(&session, terminal.clone(), size, &updates, &completion_tx);
+            workers.insert(terminal, worker);
+        }
+
+        match controls.recv_timeout(POLL_INTERVAL) {
+            Ok(Control::Stop) => {
+                break;
+            }
+            Ok(Control::SyncAttachments(specs)) => {
+                desired = specs
                     .into_iter()
                     .map(|spec| (spec.terminal, spec.size))
                     .collect();
@@ -1336,37 +1454,29 @@ fn attachment_manager_loop(
                         let _ = worker.join.join();
                     }
                 }
+                satisfied.retain(|terminal| desired.contains_key(terminal));
+                overflow_retries.retain(|terminal, _| desired.contains_key(terminal));
 
-                for (terminal, size) in desired {
-                    if let Some(worker) = workers.get(&terminal) {
-                        let _ = worker.commands.send(AttachmentCommand::Resize(size));
+                for (terminal, size) in &desired {
+                    if let Some(worker) = workers.get(terminal) {
+                        let _ = worker.commands.send(AttachmentCommand::Resize(*size));
                         continue;
                     }
-                    let (command_tx, command_rx) = mpsc::channel();
-                    let attachment_session = session.clone();
-                    let attachment_updates = updates.clone();
-                    let attachment_terminal = terminal.clone();
-                    let attachment_events = runtime_events.clone();
-                    let join = thread::spawn(move || {
-                        attachment_loop(
-                            attachment_session,
-                            attachment_terminal,
-                            size,
-                            attachment_updates,
-                            command_rx,
-                            generation,
-                            attachment_events,
-                        );
-                    });
-                    workers.insert(
-                        terminal,
-                        AttachmentWorker {
-                            commands: command_tx,
-                            join,
-                        },
+                    if satisfied.contains(terminal) || overflow_retries.contains_key(terminal) {
+                        continue;
+                    }
+                    let worker = spawn_attachment_worker(
+                        &session,
+                        terminal.clone(),
+                        *size,
+                        &updates,
+                        &completion_tx,
                     );
+                    workers.insert(terminal.clone(), worker);
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -1376,31 +1486,56 @@ fn attachment_manager_loop(
     }
 }
 
+fn spawn_attachment_worker(
+    session: &cmux::Session,
+    terminal: TerminalId,
+    size: Size,
+    updates: &UpdateSink,
+    completions: &mpsc::Sender<AttachmentCompletion>,
+) -> AttachmentWorker {
+    let (command_tx, command_rx) = mpsc::channel();
+    let attachment_session = session.clone();
+    let attachment_updates = updates.clone();
+    let attachment_terminal = terminal.clone();
+    let attachment_completions = completions.clone();
+    let join = thread::spawn(move || {
+        if let Some(outcome) = attachment_loop(
+            attachment_session,
+            attachment_terminal.clone(),
+            size,
+            attachment_updates,
+            command_rx,
+        ) {
+            let _ = attachment_completions.send(AttachmentCompletion {
+                terminal: attachment_terminal,
+                outcome,
+            });
+        }
+    });
+    AttachmentWorker {
+        commands: command_tx,
+        join,
+    }
+}
+
 fn attachment_loop(
     session: cmux::Session,
     terminal: TerminalId,
     initial_size: Size,
     updates: UpdateSink,
     commands: mpsc::Receiver<AttachmentCommand>,
-    generation: u64,
-    runtime_events: mpsc::Sender<SupervisorCommand>,
-) {
+) -> Option<AttachmentStreamOutcome> {
     let mut size = initial_size;
     match drain_attachment_commands(&commands, &mut size, None, &terminal, &updates) {
         AttachmentAction::Continue => {}
-        AttachmentAction::Stop => return,
+        AttachmentAction::Stop => return None,
     }
 
     let mut stream = match open_attachment(&session, &terminal, size) {
         Ok(stream) => stream,
         Err(error) => {
             let message = format!("{terminal:?}: {error}");
-            let _ = updates.send_blocking(Update::Error(message.clone()));
-            let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
-                generation,
-                message,
-            });
-            return;
+            return Some(AttachmentStreamOutcome::Errored(message));
         }
     };
     let _ = updates.send_blocking(Update::Attached {
@@ -1416,7 +1551,7 @@ fn attachment_loop(
             &updates,
         ) {
             AttachmentAction::Continue => {}
-            AttachmentAction::Stop => return,
+            AttachmentAction::Stop => return None,
         }
 
         match stream.next_timeout(POLL_INTERVAL) {
@@ -1449,28 +1584,22 @@ fn attachment_loop(
                         at_bottom: scroll.at_bottom,
                     });
                 }
+                TerminalAttachmentItem::Unknown { kind, .. } if kind == "overflow" => {
+                    return Some(AttachmentStreamOutcome::Overflow);
+                }
                 TerminalAttachmentItem::Unknown { .. } => {}
             },
             Ok(StreamPoll::TimedOut) => {}
-            Ok(StreamPoll::End) => {
-                let message = format!("attachment stream ended for {terminal:?}");
-                let _ = updates.send_blocking(Update::Detached {
-                    terminal: terminal.clone(),
-                });
-                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
-                    generation,
-                    message,
-                });
-                return;
-            }
+            Ok(StreamPoll::End) => return Some(AttachmentStreamOutcome::Ended),
             Err(error) => {
+                if matches!(
+                    &error,
+                    cmux::Error::StreamEnded { reason, .. } if reason == "gap"
+                ) {
+                    return Some(AttachmentStreamOutcome::Overflow);
+                }
                 let message = format!("stream error for {terminal:?}: {error}");
-                let _ = updates.send_blocking(Update::Error(message.clone()));
-                let _ = runtime_events.send(SupervisorCommand::RuntimeDisconnected {
-                    generation,
-                    message,
-                });
-                return;
+                return Some(AttachmentStreamOutcome::Errored(message));
             }
         }
     }
@@ -2049,10 +2178,12 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_socket_candidates, resource_change_affects_attention,
-        resource_change_affects_topology, resource_kind_affects_attention,
-        resource_kind_affects_topology, session_event_affects_topology, session_socket_path,
-        RebuildPlan, RetrySchedule, RoutedSender, SessionEntry, TopologyRefreshSchedule,
+        attachment_outcome_action, next_attachment_overflow_retry, parse_socket_candidates,
+        resource_change_affects_attention, resource_change_affects_topology,
+        resource_kind_affects_attention, resource_kind_affects_topology,
+        session_event_affects_topology, session_socket_path, AttachmentOutcomeAction,
+        AttachmentStreamOutcome, RebuildPlan, RetrySchedule, RoutedSender, SessionEntry,
+        TopologyRefreshSchedule, MAX_ATTACHMENT_OVERFLOW_REATTACHES, RECONNECT_INTERVAL,
     };
     use cmux::{
         AgentId, Cursor, Document, MachineId, NotificationId, ResourceChange, ResourceKind,
@@ -2061,6 +2192,53 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn normal_attachment_end_while_desired_detaches_and_is_remembered() {
+        assert_eq!(
+            attachment_outcome_action(&AttachmentStreamOutcome::Ended, true),
+            AttachmentOutcomeAction::Detach { remember: true }
+        );
+    }
+
+    #[test]
+    fn normal_attachment_end_after_removal_detaches_without_memory() {
+        assert_eq!(
+            attachment_outcome_action(&AttachmentStreamOutcome::Ended, false),
+            AttachmentOutcomeAction::Detach { remember: false }
+        );
+    }
+
+    #[test]
+    fn attachment_stream_error_rebuilds_runtime() {
+        assert_eq!(
+            attachment_outcome_action(
+                &AttachmentStreamOutcome::Errored("transport closed".to_string()),
+                true
+            ),
+            AttachmentOutcomeAction::Rebuild
+        );
+    }
+
+    #[test]
+    fn attachment_overflow_while_desired_reattaches_only_attachment() {
+        assert_eq!(
+            attachment_outcome_action(&AttachmentStreamOutcome::Overflow, true),
+            AttachmentOutcomeAction::Reattach
+        );
+    }
+
+    #[test]
+    fn attachment_overflow_reattach_schedule_is_delayed_and_bounded() {
+        let start = Instant::now();
+        let mut attempts = 0;
+        for _ in 0..MAX_ATTACHMENT_OVERFLOW_REATTACHES {
+            let retry = next_attachment_overflow_retry(attempts, start).unwrap();
+            attempts = retry.attempts;
+            assert_eq!(retry.retry_at, Some(start + RECONNECT_INTERVAL));
+        }
+        assert!(next_attachment_overflow_retry(attempts, start).is_none());
+    }
 
     #[test]
     fn startup_retry_schedule_covers_the_timeout_without_exceeding_it() {
