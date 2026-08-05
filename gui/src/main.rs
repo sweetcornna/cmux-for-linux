@@ -41,6 +41,7 @@ use session::{AttachmentSpec, Control, Input, SessionEntry, StampedUpdate, Updat
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const UPDATE_WATCHDOG_INTERVAL: Duration = BLINK_INTERVAL;
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_MAX_WIDTH: i32 = 600;
 
@@ -56,6 +57,60 @@ struct PaneTarget {
     workspace: WorkspaceId,
     screen: ScreenId,
     pane: PaneId,
+}
+
+fn trace_update(generation: u64, update: &Update) {
+    match update {
+        Update::Connected { .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Connected")
+        }
+        Update::Switching { .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Switching")
+        }
+        Update::Disconnected { .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Disconnected")
+        }
+        Update::Sessions(_) => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Sessions")
+        }
+        Update::SwitchFailed { .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=SwitchFailed")
+        }
+        Update::Workspaces(entries) => eprintln!(
+            "cmux-gtk trace: generation={generation} update=Workspaces count={}",
+            entries.len()
+        ),
+        Update::Attention(_) => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Attention")
+        }
+        Update::Attached { terminal } => eprintln!(
+            "cmux-gtk trace: generation={generation} update=Attached terminal={terminal:?}"
+        ),
+        Update::Snapshot { terminal, .. } => eprintln!(
+            "cmux-gtk trace: generation={generation} update=Snapshot terminal={terminal:?}"
+        ),
+        Update::Patch { terminal, .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Patch terminal={terminal:?}")
+        }
+        Update::Scroll { terminal, .. } => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Scroll terminal={terminal:?}")
+        }
+        Update::SearchResults(results) => eprintln!(
+            "cmux-gtk trace: generation={generation} update=SearchResults terminal={:?}",
+            results.terminal
+        ),
+        Update::Detached { terminal } => eprintln!(
+            "cmux-gtk trace: generation={generation} update=Detached terminal={terminal:?}"
+        ),
+        Update::Error(_) => {
+            eprintln!("cmux-gtk trace: generation={generation} update=Error")
+        }
+    }
+}
+
+async fn yield_to_gtk() {
+    gtk4::glib::timeout_future_with_priority(gtk4::glib::Priority::DEFAULT_IDLE, Duration::ZERO)
+        .await;
 }
 
 #[derive(Clone)]
@@ -2484,9 +2539,25 @@ fn build_ui(application: &Application) {
         let session_popover = session_popover.clone();
         let title = title.clone();
         let window = window.clone();
+        let trace_updates = std::env::var_os("CMUX_GTK_TRACE")
+            .is_some_and(|value| value == std::ffi::OsStr::new("1"));
         gtk4::glib::spawn_future_local(async move {
-            while let Ok(stamped) = update_rx.recv().await {
+            loop {
+                let stamped = match gtk4::glib::future_with_timeout(
+                    UPDATE_WATCHDOG_INTERVAL,
+                    update_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Ok(stamped)) => stamped,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                };
+                if trace_updates {
+                    trace_update(stamped.generation, &stamped.update);
+                }
                 if stamped.generation < update_generation.get() {
+                    yield_to_gtk().await;
                     continue;
                 }
                 if stamped.generation > update_generation.get() {
@@ -2752,6 +2823,8 @@ fn build_ui(application: &Application) {
                     }
                     Update::Error(message) => set_toast(&toast, &message),
                 }
+                // Even an already-queued receive must yield so GTK can lay out and draw changes.
+                yield_to_gtk().await;
             }
         });
     }

@@ -67,6 +67,15 @@ prints every update, which separates protocol failures from drawing failures:
 cargo run --release -- --probe --session main
 ```
 
+If `--probe` receives updates but the GTK window does not change, enable the
+GTK consumer trace. `CMUX_GTK_TRACE=1` prints one stderr line for every update
+handled by the GTK main loop, including workspace counts and the terminal ID
+for render, attachment, scroll and search updates:
+
+```bash
+CMUX_GTK_TRACE=1 cargo run --release -- --session main
+```
+
 ## Features
 
 | | |
