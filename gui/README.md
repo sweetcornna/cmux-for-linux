@@ -87,9 +87,9 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |
 | Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
-| Agent state | terminal tabs show a static 9px task-status ring for working, blocked, idle and done reports |
+| Agent state | terminal tabs show a static 9px task-status ring, while workspace rows show the highest-priority reported state across their terminals |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
-| Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
+| Workspaces | macOS-parity sidebar rows with optional agent-status and active-terminal working-directory details, switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
 | Scrollback | the mouse wheel scrolls the viewport; a rounded 4px overlay thumb appears off-bottom, widens on hover, and supports direct dragging |
 | Scrollback search | `Ctrl+Shift+F` opens a prompt-themed search bar; literal case-insensitive matches cover retained history plus the current viewport, Enter/Shift+Enter navigate them, and visible hits use accent at 25% opacity |
@@ -218,6 +218,11 @@ The following were checked against live sessions:
   does not prevent startup.
 
 ## Known gaps
+
+Workspace rows omit the official app's git-branch line (for example, `main*`).
+The Linux server's workspace snapshot exposes no git metadata and its `extra`
+map is empty for real workspaces, so GTK does not invent a branch, shell out to
+Git, or infer one from the working directory.
 
 The upstream 12-spoke activity spinner remains deliberately omitted. It needs
 an animation timer, while this pass keeps the static agent-state ring and the

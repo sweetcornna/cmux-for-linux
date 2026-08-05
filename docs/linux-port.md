@@ -193,13 +193,17 @@ existing supervisor teardown and rebuild path.
 Stage 4 derives a terminal-keyed attention model directly from notification
 and agent resources on that same session event stream. Unread severity rolls
 up from terminal tabs to screen tabs and workspace rows; agent reports drive a
-static task-status ring on terminal tabs. Snapshot events replace the resource
-maps and deltas update them in place, so attention changes add no protocol
-round-trips and never trigger a topology tree walk. The server clears a viewed
-surface only after publishing its focus resource change and does not publish a
-notification upsert for the new read state, so GTK clears that terminal's
-marker locally after a successful focus operation and trusts the next snapshot
-as the resync boundary.
+static task-status ring on terminal tabs and a highest-priority status line on
+workspace rows. The same event thread maintains terminal working directories
+from the resource snapshot and terminal deltas; each workspace row shows the
+active terminal's cwd with the local home prefix abbreviated to `~`. Missing
+agent reports and cwd values omit their respective row lines. Snapshot events
+replace the resource maps and deltas update them in place, so these details add
+no protocol round-trips and never trigger a topology tree walk. The server
+clears a viewed surface only after publishing its focus resource change and
+does not publish a notification upsert for the new read state, so GTK clears
+that terminal's marker locally after a successful focus operation and trusts
+the next snapshot as the resync boundary.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a

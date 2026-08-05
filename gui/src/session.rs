@@ -205,6 +205,7 @@ pub enum Update {
     },
     Workspaces(Vec<WorkspaceEntry>),
     Attention(AttentionState),
+    TerminalCwds(HashMap<TerminalId, String>),
     Attached {
         terminal: TerminalId,
     },
@@ -873,6 +874,7 @@ fn session_event_loop(
     let mut refreshes = TopologyRefreshSchedule::new(TOPOLOGY_REFRESH_INTERVAL);
     let mut notifications = HashMap::<NotificationId, NotificationSnapshot>::new();
     let mut agents = HashMap::<AgentId, AgentSnapshot>::new();
+    let mut terminal_cwds = HashMap::<TerminalId, String>::new();
     let mut published_attention = None;
 
     loop {
@@ -898,6 +900,9 @@ fn session_event_loop(
                 if apply_attention_event(&item.value, &mut notifications, &mut agents) {
                     publish_attention(&notifications, &agents, &mut published_attention, &updates);
                 }
+                if apply_terminal_cwd_event(&item.value, &mut terminal_cwds) {
+                    let _ = updates.send_blocking(Update::TerminalCwds(terminal_cwds.clone()));
+                }
                 if session_event_affects_topology(&item.value) && refreshes.request(Instant::now())
                 {
                     if session_event_stop_requested(&stop) {
@@ -922,6 +927,69 @@ fn session_event_loop(
                 return;
             }
         }
+    }
+}
+
+fn apply_terminal_cwd_event(
+    event: &SessionEvent,
+    terminal_cwds: &mut HashMap<TerminalId, String>,
+) -> bool {
+    match event {
+        SessionEvent::Snapshot(event) => {
+            let next = event
+                .snapshot
+                .terminals
+                .iter()
+                .filter_map(|terminal| {
+                    terminal
+                        .cwd
+                        .as_ref()
+                        .filter(|cwd| !cwd.is_empty())
+                        .map(|cwd| (terminal.id.clone(), cwd.clone()))
+                })
+                .collect::<HashMap<_, _>>();
+            if *terminal_cwds == next {
+                false
+            } else {
+                *terminal_cwds = next;
+                true
+            }
+        }
+        SessionEvent::Delta(delta) => {
+            let mut changed = false;
+            for change in &delta.changes {
+                changed |= apply_terminal_cwd_change(change, terminal_cwds);
+            }
+            changed
+        }
+        SessionEvent::Unknown { .. } => false,
+    }
+}
+
+fn apply_terminal_cwd_change(
+    change: &ResourceChange,
+    terminal_cwds: &mut HashMap<TerminalId, String>,
+) -> bool {
+    match change {
+        ResourceChange::Upsert {
+            resource: ResourceKind::Terminal,
+            value: ResourceEntitySnapshot::Terminal(terminal),
+            ..
+        } => match terminal.cwd.as_ref().filter(|cwd| !cwd.is_empty()) {
+            Some(cwd) => {
+                terminal_cwds
+                    .insert(terminal.id.clone(), cwd.clone())
+                    .as_ref()
+                    != Some(cwd)
+            }
+            None => terminal_cwds.remove(&terminal.id).is_some(),
+        },
+        ResourceChange::Delete {
+            resource: ResourceKind::Terminal,
+            id: ResourceReference::Terminal(terminal),
+            ..
+        } => terminal_cwds.remove(terminal).is_some(),
+        _ => false,
     }
 }
 

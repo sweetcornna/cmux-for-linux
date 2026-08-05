@@ -74,8 +74,33 @@ pub fn screen_indicator(state: &AttentionState, terminals: &[TerminalId]) -> Att
 pub fn workspace_indicator(state: &AttentionState, terminals: &[TerminalId]) -> AttentionIndicator {
     AttentionIndicator {
         notification: rollup_notification(state, terminals),
-        agent: None,
+        agent: rollup_agent(state, terminals),
     }
+}
+
+pub const fn agent_state_text(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Working => "Working",
+        AgentState::Blocked => "Blocked",
+        AgentState::Idle => "Idle",
+        AgentState::Done => "Done",
+        AgentState::Unknown => "Unknown",
+    }
+}
+
+pub fn abbreviate_home(cwd: &str, home: Option<&str>) -> String {
+    let Some(home) = home
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+    else {
+        return cwd.to_string();
+    };
+    if cwd == home {
+        return "~".to_string();
+    }
+    cwd.strip_prefix(home)
+        .filter(|suffix| suffix.starts_with('/'))
+        .map_or_else(|| cwd.to_string(), |suffix| format!("~{suffix}"))
 }
 
 fn rollup_notification(
@@ -85,6 +110,30 @@ fn rollup_notification(
     terminals.iter().fold(None, |current, terminal| {
         highest_severity(current, state.terminal(terminal).notification)
     })
+}
+
+fn rollup_agent(state: &AttentionState, terminals: &[TerminalId]) -> Option<AgentState> {
+    terminals.iter().fold(None, |current, terminal| {
+        highest_agent_priority(current, state.terminal(terminal).agent)
+    })
+}
+
+fn highest_agent_priority(
+    current: Option<AgentState>,
+    candidate: impl Into<Option<AgentState>>,
+) -> Option<AgentState> {
+    let candidate = candidate.into();
+    match (current, candidate) {
+        (None, next) => next,
+        (current, None) => current,
+        (Some(current), Some(candidate)) => {
+            Some(if agent_priority(candidate) > agent_priority(current) {
+                candidate
+            } else {
+                current
+            })
+        }
+    }
 }
 
 fn highest_severity(
@@ -110,6 +159,16 @@ const fn severity_rank(level: NotificationLevel) -> u8 {
         NotificationLevel::Info => 0,
         NotificationLevel::Warning => 1,
         NotificationLevel::Error => 2,
+    }
+}
+
+const fn agent_priority(state: AgentState) -> u8 {
+    match state {
+        AgentState::Unknown => 0,
+        AgentState::Done => 1,
+        AgentState::Idle => 2,
+        AgentState::Working => 3,
+        AgentState::Blocked => 4,
     }
 }
 
@@ -221,5 +280,69 @@ mod tests {
             tab_indicator(&state, &TabContent::Terminal(first)).agent,
             Some(AgentState::Blocked)
         );
+    }
+
+    #[test]
+    fn workspace_agent_rollup_has_no_state_without_reports() {
+        let first = terminal(1);
+
+        assert_eq!(
+            workspace_indicator(&AttentionState::default(), &[first]).agent,
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_agent_rollup_uses_one_terminal_report() {
+        let first = terminal(1);
+        let reports = [agent(1, first.clone(), AgentState::Working, 20)];
+        let state = AttentionState::from_resources(std::iter::empty(), reports.iter());
+
+        assert_eq!(
+            workspace_indicator(&state, &[first]).agent,
+            Some(AgentState::Working)
+        );
+        assert_eq!(agent_state_text(AgentState::Working), "Working");
+    }
+
+    #[test]
+    fn workspace_agent_rollup_prioritizes_actionable_states() {
+        let first = terminal(1);
+        let second = terminal(2);
+        let third = terminal(3);
+        let fourth = terminal(4);
+        let reports = [
+            agent(1, first.clone(), AgentState::Done, 20),
+            agent(2, second.clone(), AgentState::Idle, 20),
+            agent(3, third.clone(), AgentState::Working, 20),
+            agent(4, fourth.clone(), AgentState::Blocked, 20),
+        ];
+        let state = AttentionState::from_resources(std::iter::empty(), reports.iter());
+
+        assert_eq!(
+            workspace_indicator(&state, &[first, second, third, fourth.clone()]).agent,
+            Some(AgentState::Blocked)
+        );
+        assert_eq!(
+            workspace_indicator(&state, &[fourth, terminal(3), terminal(2), terminal(1)]).agent,
+            Some(AgentState::Blocked)
+        );
+    }
+
+    #[test]
+    fn cwd_abbreviation_handles_home_and_descendants() {
+        assert_eq!(abbreviate_home("/home/cornna", Some("/home/cornna")), "~");
+        assert_eq!(
+            abbreviate_home(
+                "/home/cornna/project/open-claude-code",
+                Some("/home/cornna")
+            ),
+            "~/project/open-claude-code"
+        );
+        assert_eq!(
+            abbreviate_home("/home/cornna-other/project", Some("/home/cornna")),
+            "/home/cornna-other/project"
+        );
+        assert_eq!(abbreviate_home("/srv/project", None), "/srv/project");
     }
 }

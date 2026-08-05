@@ -83,6 +83,10 @@ fn trace_update(generation: u64, update: &Update) {
         Update::Attention(_) => {
             eprintln!("cmux-gtk trace: generation={generation} update=Attention")
         }
+        Update::TerminalCwds(cwds) => eprintln!(
+            "cmux-gtk trace: generation={generation} update=TerminalCwds count={}",
+            cwds.len()
+        ),
         Update::Attached { terminal } => eprintln!(
             "cmux-gtk trace: generation={generation} update=Attached terminal={terminal:?}"
         ),
@@ -681,11 +685,13 @@ fn populate_session_menu(
 fn reset_session_view(
     screens: &RefCell<ScreenSet>,
     attention: &RefCell<attention::AttentionState>,
+    terminal_cwds: &RefCell<HashMap<TerminalId, String>>,
     screen_terminals: &RefCell<HashMap<ScreenId, Vec<TerminalId>>>,
     entries: &RefCell<Vec<session::WorkspaceEntry>>,
     workspaces: &ListBox,
     drop_indicators: &RefCell<Vec<GtkBox>>,
     attention_indicators: &RefCell<Vec<DrawingArea>>,
+    workspace_details: &RefCell<Vec<WorkspaceDetailHandle>>,
     search_state: &RefCell<search::SearchUiState>,
     search_bar: &GtkBox,
     search_entry: &Entry,
@@ -697,10 +703,12 @@ fn reset_session_view(
 ) {
     *screens.borrow_mut() = ScreenSet::default();
     *attention.borrow_mut() = attention::AttentionState::default();
+    terminal_cwds.borrow_mut().clear();
     screen_terminals.borrow_mut().clear();
     entries.borrow_mut().clear();
     drop_indicators.borrow_mut().clear();
     attention_indicators.borrow_mut().clear();
+    workspace_details.borrow_mut().clear();
     workspaces.unselect_all();
     while let Some(child) = workspaces.first_child() {
         workspaces.remove(&child);
@@ -897,10 +905,69 @@ fn refresh_chrome(
 struct WorkspaceRowHandles {
     theme: Rc<view::Theme>,
     attention: Rc<RefCell<attention::AttentionState>>,
+    terminal_cwds: Rc<RefCell<HashMap<TerminalId, String>>>,
+    home: Rc<Option<String>>,
     worker: Rc<Worker>,
     rename_prompt: Rc<RenamePrompt>,
     drop_indicators: Rc<RefCell<Vec<GtkBox>>>,
     attention_indicators: Rc<RefCell<Vec<DrawingArea>>>,
+    workspace_details: Rc<RefCell<Vec<WorkspaceDetailHandle>>>,
+}
+
+struct WorkspaceDetailHandle {
+    container: GtkBox,
+    title_line: GtkBox,
+    terminals: Vec<TerminalId>,
+    active_terminal: Option<TerminalId>,
+}
+
+fn detail_label(text: &str, css_class: &str) -> Label {
+    let label = Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    label.set_single_line_mode(true);
+    label.add_css_class(css_class);
+    label
+}
+
+fn refresh_workspace_detail(
+    handle: &WorkspaceDetailHandle,
+    attention: &attention::AttentionState,
+    terminal_cwds: &HashMap<TerminalId, String>,
+    home: Option<&str>,
+) {
+    while let Some(child) = handle.title_line.next_sibling() {
+        handle.container.remove(&child);
+    }
+
+    if let Some(state) = attention::workspace_indicator(attention, &handle.terminals).agent {
+        handle.container.append(&detail_label(
+            attention::agent_state_text(state),
+            "workspace-description",
+        ));
+    }
+    if let Some(cwd) = handle
+        .active_terminal
+        .as_ref()
+        .and_then(|terminal| terminal_cwds.get(terminal))
+    {
+        handle.container.append(&detail_label(
+            &attention::abbreviate_home(cwd, home),
+            "workspace-subtitle",
+        ));
+    }
+}
+
+fn refresh_workspace_details(
+    handles: &[WorkspaceDetailHandle],
+    attention: &attention::AttentionState,
+    terminal_cwds: &HashMap<TerminalId, String>,
+    home: Option<&str>,
+) {
+    for handle in handles {
+        refresh_workspace_detail(handle, attention, terminal_cwds, home);
+    }
 }
 
 fn workspace_row(
@@ -911,10 +978,13 @@ fn workspace_row(
     let WorkspaceRowHandles {
         theme,
         attention,
+        terminal_cwds,
+        home,
         worker,
         rename_prompt,
         drop_indicators,
         attention_indicators,
+        workspace_details,
     } = handles;
     let title = if entry.name.is_empty() {
         "(unnamed)"
@@ -930,6 +1000,10 @@ fn workspace_row(
 
     let content = GtkBox::new(Orientation::Horizontal, 8);
     content.add_css_class("workspace-content");
+    let details = GtkBox::new(Orientation::Vertical, 0);
+    details.set_hexpand(true);
+    details.add_css_class("workspace-details");
+    let title_line = GtkBox::new(Orientation::Horizontal, 8);
     let unread = DrawingArea::new();
     unread.set_content_width(11);
     unread.set_content_height(11);
@@ -965,12 +1039,31 @@ fn workspace_row(
     }
     content.append(&unread);
     attention_indicators.borrow_mut().push(unread);
-    content.append(&label);
+    title_line.append(&label);
     if entry.terminals.len() > 1 {
         let count = Label::new(Some(&entry.terminals.len().to_string()));
         count.add_css_class("workspace-badge");
-        content.append(&count);
+        title_line.append(&count);
     }
+    details.append(&title_line);
+    content.append(&details);
+    let detail_handle = WorkspaceDetailHandle {
+        container: details,
+        title_line,
+        terminals: entry.terminals.clone(),
+        active_terminal: entry
+            .view
+            .as_ref()
+            .and_then(|view| view.active_terminal())
+            .cloned(),
+    };
+    refresh_workspace_detail(
+        &detail_handle,
+        &attention.borrow(),
+        &terminal_cwds.borrow(),
+        home.as_ref().as_deref(),
+    );
+    workspace_details.borrow_mut().push(detail_handle);
 
     let overlay = Overlay::new();
     overlay.set_child(Some(&content));
@@ -1149,6 +1242,12 @@ fn build_ui(application: &Application) {
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let attention = Rc::new(RefCell::new(attention::AttentionState::default()));
+    let terminal_cwds = Rc::new(RefCell::new(HashMap::<TerminalId, String>::new()));
+    let home = Rc::new(
+        std::env::var_os("HOME")
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| !value.is_empty()),
+    );
     let screen_terminals = Rc::new(RefCell::new(HashMap::new()));
     let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let (update_tx, update_rx) = async_channel::unbounded::<StampedUpdate>();
@@ -1238,6 +1337,8 @@ fn build_ui(application: &Application) {
     workspaces.add_css_class("workspace-list");
     let drop_indicators: Rc<RefCell<Vec<GtkBox>>> = Rc::new(RefCell::new(Vec::new()));
     let attention_indicators: Rc<RefCell<Vec<DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
+    let workspace_details: Rc<RefCell<Vec<WorkspaceDetailHandle>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let sidebar_scroll = ScrolledWindow::builder()
         .child(&workspaces)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -2529,6 +2630,8 @@ fn build_ui(application: &Application) {
     {
         let screens = Rc::clone(&screens);
         let attention = Rc::clone(&attention);
+        let terminal_cwds = Rc::clone(&terminal_cwds);
+        let home = Rc::clone(&home);
         let screen_terminals = Rc::clone(&screen_terminals);
         let terminal = terminal.clone();
         let toast = toast.clone();
@@ -2541,6 +2644,7 @@ fn build_ui(application: &Application) {
         let rename_prompt = Rc::clone(&rename_prompt);
         let drop_indicators = Rc::clone(&drop_indicators);
         let attention_indicators = Rc::clone(&attention_indicators);
+        let workspace_details = Rc::clone(&workspace_details);
         let search_state = Rc::clone(&search_state);
         let search_count = search_count.clone();
         let search_bar = search_bar.clone();
@@ -2590,11 +2694,13 @@ fn build_ui(application: &Application) {
                         reset_session_view(
                             &screens,
                             &attention,
+                            &terminal_cwds,
                             &screen_terminals,
                             &entries,
                             &workspaces,
                             &drop_indicators,
                             &attention_indicators,
+                            &workspace_details,
                             &search_state,
                             &search_bar,
                             &search_entry,
@@ -2613,11 +2719,13 @@ fn build_ui(application: &Application) {
                         reset_session_view(
                             &screens,
                             &attention,
+                            &terminal_cwds,
                             &screen_terminals,
                             &entries,
                             &workspaces,
                             &drop_indicators,
                             &attention_indicators,
+                            &workspace_details,
                             &search_state,
                             &search_bar,
                             &search_entry,
@@ -2666,6 +2774,7 @@ fn build_ui(application: &Application) {
                         if changed {
                             drop_indicators.borrow_mut().clear();
                             attention_indicators.borrow_mut().clear();
+                            workspace_details.borrow_mut().clear();
                             while let Some(child) = workspaces.first_child() {
                                 workspaces.remove(&child);
                             }
@@ -2675,10 +2784,13 @@ fn build_ui(application: &Application) {
                                     WorkspaceRowHandles {
                                         theme: Rc::clone(&theme),
                                         attention: Rc::clone(&attention),
+                                        terminal_cwds: Rc::clone(&terminal_cwds),
+                                        home: Rc::clone(&home),
                                         worker: Rc::clone(&worker),
                                         rename_prompt: Rc::clone(&rename_prompt),
                                         drop_indicators: Rc::clone(&drop_indicators),
                                         attention_indicators: Rc::clone(&attention_indicators),
+                                        workspace_details: Rc::clone(&workspace_details),
                                     },
                                     list.len(),
                                 );
@@ -2726,10 +2838,25 @@ fn build_ui(application: &Application) {
                     }
                     Update::Attention(next) => {
                         *attention.borrow_mut() = next;
+                        refresh_workspace_details(
+                            &workspace_details.borrow(),
+                            &attention.borrow(),
+                            &terminal_cwds.borrow(),
+                            home.as_ref().as_deref(),
+                        );
                         terminal.queue_draw();
                         for indicator in attention_indicators.borrow().iter() {
                             indicator.queue_draw();
                         }
+                    }
+                    Update::TerminalCwds(next) => {
+                        *terminal_cwds.borrow_mut() = next;
+                        refresh_workspace_details(
+                            &workspace_details.borrow(),
+                            &attention.borrow(),
+                            &terminal_cwds.borrow(),
+                            home.as_ref().as_deref(),
+                        );
                     }
                     Update::Attached { terminal: id } => {
                         eprintln!("viewer attached to {id:?}");
