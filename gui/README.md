@@ -43,6 +43,18 @@ them. So there is no VT parser here, no libghostty, no VTE - only a cell grid,
 Pango text, Pixbuf/cairo image drawing and a key mapper. Everything that would
 normally be terminal-emulation complexity stays server-side.
 
+## Git branch exception
+
+The frontend speaks the cmux protocol for terminal, topology, focus, status and
+working-directory state, and it still contains no VT parser. The one deliberate
+exception is the workspace git-branch line: the protocol carries no git state,
+so a background GUI worker runs
+`git -C <cwd> status --porcelain=v2 --branch` for each active terminal working
+directory. Results, including failures, are cached per directory for five
+seconds and return through the same update channel as protocol work. Each child
+has a one-second deadline and is killed and reaped on timeout, so Git never
+blocks the GTK thread.
+
 ## Layout
 
 | File | Responsibility |
@@ -50,6 +62,7 @@ normally be terminal-emulation complexity stays server-side.
 | `src/main.rs` | GTK application, window, sidebar, wiring |
 | `src/attention.rs` | pure notification severity and agent-state rollups by terminal |
 | `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
+| `src/git_branch.rs` | timed Git status worker and per-directory branch cache |
 | `src/search.rs` | case-insensitive scrollback matching, result navigation and pure search geometry |
 | `src/session.rs` | protocol worker supervisor, session socket enumeration and joined control/attachment runtimes; render payloads reach GTK without blocking it on a socket |
 | `src/screen.rs` | cell and image state, with snapshot/patch merge semantics |
@@ -89,7 +102,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
 | Agent state | terminal tabs show a static 9px task-status ring, while workspace rows show the highest-priority reported state across their terminals |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
-| Workspaces | macOS-parity sidebar rows with optional agent-status and active-terminal working-directory details, switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
+| Workspaces | macOS-parity sidebar rows with optional agent-status, git-branch and active-terminal working-directory details, switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
 | Scrollback | the mouse wheel scrolls the viewport; a rounded 4px overlay thumb appears off-bottom, widens on hover, and supports direct dragging |
 | Scrollback search | `Ctrl+Shift+F` opens a prompt-themed search bar; literal case-insensitive matches cover retained history plus the current viewport, Enter/Shift+Enter navigate them, and visible hits use accent at 25% opacity |
@@ -224,11 +237,6 @@ The following were checked against live sessions:
   does not prevent startup.
 
 ## Known gaps
-
-Workspace rows omit the official app's git-branch line (for example, `main*`).
-The Linux server's workspace snapshot exposes no git metadata and its `extra`
-map is empty for real workspaces, so GTK does not invent a branch, shell out to
-Git, or infer one from the working directory.
 
 The upstream 12-spoke activity spinner remains deliberately omitted. It needs
 an animation timer, while this pass keeps the static agent-state ring and the

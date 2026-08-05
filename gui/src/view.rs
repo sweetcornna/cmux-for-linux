@@ -1569,11 +1569,20 @@ fn draw_screen_bar(
     let _ = cr.stroke();
 }
 
-pub fn build_sidebar_scrims(theme: Rc<Theme>) -> DrawingArea {
+pub fn sidebar_scrim_visibility(value: f64, upper: f64, page_size: f64) -> (bool, bool) {
+    let scrollable = upper > page_size;
+    (
+        scrollable && value > 0.0,
+        scrollable && value < upper - page_size,
+    )
+}
+
+pub fn build_sidebar_scrims(theme: Rc<Theme>, adjustment: &gtk4::Adjustment) -> DrawingArea {
     let scrims = DrawingArea::new();
     scrims.set_hexpand(true);
     scrims.set_vexpand(true);
     scrims.set_can_target(false);
+    let draw_adjustment = adjustment.clone();
     scrims.set_draw_func(move |_, cr, width, height| {
         let colors = theme.chrome();
         let (red, green, blue) = colors.sidebar_background.cairo();
@@ -1583,20 +1592,45 @@ pub fn build_sidebar_scrims(theme: Rc<Theme>) -> DrawingArea {
             return;
         }
 
-        let top = gtk4::cairo::LinearGradient::new(0.0, 0.0, 0.0, scrim_height);
-        top.add_color_stop_rgba(0.0, red, green, blue, 1.0);
-        top.add_color_stop_rgba(1.0, red, green, blue, 0.0);
-        let _ = cr.set_source(&top);
-        cr.rectangle(0.0, 0.0, f64::from(width), scrim_height);
-        let _ = cr.fill();
+        let (show_top, show_bottom) = sidebar_scrim_visibility(
+            draw_adjustment.value(),
+            draw_adjustment.upper(),
+            draw_adjustment.page_size(),
+        );
+        if show_top {
+            let top = gtk4::cairo::LinearGradient::new(0.0, 0.0, 0.0, scrim_height);
+            top.add_color_stop_rgba(0.0, red, green, blue, 1.0);
+            top.add_color_stop_rgba(1.0, red, green, blue, 0.0);
+            let _ = cr.set_source(&top);
+            cr.rectangle(0.0, 0.0, f64::from(width), scrim_height);
+            let _ = cr.fill();
+        }
 
-        let bottom = gtk4::cairo::LinearGradient::new(0.0, height - scrim_height, 0.0, height);
-        bottom.add_color_stop_rgba(0.0, red, green, blue, 0.0);
-        bottom.add_color_stop_rgba(1.0, red, green, blue, 1.0);
-        let _ = cr.set_source(&bottom);
-        cr.rectangle(0.0, height - scrim_height, f64::from(width), scrim_height);
-        let _ = cr.fill();
+        if show_bottom {
+            let bottom = gtk4::cairo::LinearGradient::new(0.0, height - scrim_height, 0.0, height);
+            bottom.add_color_stop_rgba(0.0, red, green, blue, 0.0);
+            bottom.add_color_stop_rgba(1.0, red, green, blue, 1.0);
+            let _ = cr.set_source(&bottom);
+            cr.rectangle(0.0, height - scrim_height, f64::from(width), scrim_height);
+            let _ = cr.fill();
+        }
     });
+    {
+        let scrims = scrims.downgrade();
+        adjustment.connect_value_changed(move |_| {
+            if let Some(scrims) = scrims.upgrade() {
+                scrims.queue_draw();
+            }
+        });
+    }
+    {
+        let scrims = scrims.downgrade();
+        adjustment.connect_changed(move |_| {
+            if let Some(scrims) = scrims.upgrade() {
+                scrims.queue_draw();
+            }
+        });
+    }
     scrims
 }
 
@@ -2569,6 +2603,26 @@ mod tests {
             .iter()
             .map(|grapheme| grapheme.column)
             .collect()
+    }
+
+    #[test]
+    fn sidebar_scrims_are_hidden_when_list_is_shorter_than_viewport() {
+        assert_eq!(sidebar_scrim_visibility(0.0, 80.0, 100.0), (false, false));
+    }
+
+    #[test]
+    fn sidebar_scrims_show_only_bottom_at_scroll_top() {
+        assert_eq!(sidebar_scrim_visibility(0.0, 300.0, 100.0), (false, true));
+    }
+
+    #[test]
+    fn sidebar_scrims_show_both_mid_scroll() {
+        assert_eq!(sidebar_scrim_visibility(75.0, 300.0, 100.0), (true, true));
+    }
+
+    #[test]
+    fn sidebar_scrims_show_only_top_at_scroll_bottom() {
+        assert_eq!(sidebar_scrim_visibility(200.0, 300.0, 100.0), (true, false));
     }
 
     #[test]

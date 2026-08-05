@@ -206,6 +206,10 @@ pub enum Update {
     Workspaces(Vec<WorkspaceEntry>),
     Attention(AttentionState),
     TerminalCwds(HashMap<TerminalId, String>),
+    GitBranch {
+        directory: PathBuf,
+        branch: Option<String>,
+    },
     Attached {
         terminal: TerminalId,
     },

@@ -10,6 +10,7 @@
 
 mod attention;
 mod config;
+mod git_branch;
 mod screen;
 mod search;
 mod session;
@@ -17,7 +18,7 @@ mod view;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,11 @@ fn trace_update(generation: u64, update: &Update) {
         Update::TerminalCwds(cwds) => eprintln!(
             "cmux-gtk trace: generation={generation} update=TerminalCwds count={}",
             cwds.len()
+        ),
+        Update::GitBranch { directory, branch } => eprintln!(
+            "cmux-gtk trace: generation={generation} update=GitBranch directory={} present={}",
+            directory.display(),
+            branch.is_some()
         ),
         Update::Attached { terminal } => eprintln!(
             "cmux-gtk trace: generation={generation} update=Attached terminal={terminal:?}"
@@ -688,6 +694,7 @@ fn reset_session_view(
     screens: &RefCell<ScreenSet>,
     attention: &RefCell<attention::AttentionState>,
     terminal_cwds: &RefCell<HashMap<TerminalId, String>>,
+    git_branches: &RefCell<HashMap<PathBuf, Option<String>>>,
     screen_terminals: &RefCell<HashMap<ScreenId, Vec<TerminalId>>>,
     entries: &RefCell<Vec<session::WorkspaceEntry>>,
     workspaces: &ListBox,
@@ -706,6 +713,7 @@ fn reset_session_view(
     *screens.borrow_mut() = ScreenSet::default();
     *attention.borrow_mut() = attention::AttentionState::default();
     terminal_cwds.borrow_mut().clear();
+    git_branches.borrow_mut().clear();
     screen_terminals.borrow_mut().clear();
     entries.borrow_mut().clear();
     drop_indicators.borrow_mut().clear();
@@ -908,6 +916,7 @@ struct WorkspaceRowHandles {
     theme: Rc<view::Theme>,
     attention: Rc<RefCell<attention::AttentionState>>,
     terminal_cwds: Rc<RefCell<HashMap<TerminalId, String>>>,
+    git_branches: Rc<RefCell<HashMap<PathBuf, Option<String>>>>,
     home: Rc<Option<String>>,
     worker: Rc<Worker>,
     rename_prompt: Rc<RenamePrompt>,
@@ -937,6 +946,7 @@ fn refresh_workspace_detail(
     handle: &WorkspaceDetailHandle,
     attention: &attention::AttentionState,
     terminal_cwds: &HashMap<TerminalId, String>,
+    git_branches: &HashMap<PathBuf, Option<String>>,
     home: Option<&str>,
 ) {
     while let Some(child) = handle.title_line.next_sibling() {
@@ -954,6 +964,11 @@ fn refresh_workspace_detail(
         .as_ref()
         .and_then(|terminal| terminal_cwds.get(terminal))
     {
+        if let Some(Some(branch)) = git_branches.get(Path::new(cwd)) {
+            handle
+                .container
+                .append(&detail_label(branch, "workspace-description"));
+        }
         handle.container.append(&detail_label(
             &attention::abbreviate_home(cwd, home),
             "workspace-subtitle",
@@ -965,10 +980,28 @@ fn refresh_workspace_details(
     handles: &[WorkspaceDetailHandle],
     attention: &attention::AttentionState,
     terminal_cwds: &HashMap<TerminalId, String>,
+    git_branches: &HashMap<PathBuf, Option<String>>,
     home: Option<&str>,
 ) {
     for handle in handles {
-        refresh_workspace_detail(handle, attention, terminal_cwds, home);
+        refresh_workspace_detail(handle, attention, terminal_cwds, git_branches, home);
+    }
+}
+
+fn request_workspace_branches(
+    handles: &[WorkspaceDetailHandle],
+    terminal_cwds: &HashMap<TerminalId, String>,
+    resolver: &git_branch::Resolver,
+    generation: u64,
+) {
+    for handle in handles {
+        if let Some(cwd) = handle
+            .active_terminal
+            .as_ref()
+            .and_then(|terminal| terminal_cwds.get(terminal))
+        {
+            resolver.request(Path::new(cwd), generation);
+        }
     }
 }
 
@@ -981,6 +1014,7 @@ fn workspace_row(
         theme,
         attention,
         terminal_cwds,
+        git_branches,
         home,
         worker,
         rename_prompt,
@@ -1063,6 +1097,7 @@ fn workspace_row(
         &detail_handle,
         &attention.borrow(),
         &terminal_cwds.borrow(),
+        &git_branches.borrow(),
         home.as_ref().as_deref(),
     );
     workspace_details.borrow_mut().push(detail_handle);
@@ -1245,6 +1280,7 @@ fn build_ui(application: &Application) {
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let attention = Rc::new(RefCell::new(attention::AttentionState::default()));
     let terminal_cwds = Rc::new(RefCell::new(HashMap::<TerminalId, String>::new()));
+    let git_branches = Rc::new(RefCell::new(HashMap::<PathBuf, Option<String>>::new()));
     let home = Rc::new(
         std::env::var_os("HOME")
             .and_then(|value| value.into_string().ok())
@@ -1253,6 +1289,7 @@ fn build_ui(application: &Application) {
     let screen_terminals = Rc::new(RefCell::new(HashMap::new()));
     let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let (update_tx, update_rx) = async_channel::unbounded::<StampedUpdate>();
+    let git_resolver = Rc::new(git_branch::spawn(update_tx.clone()));
     let worker = Rc::new(session::spawn(
         args.session.clone(),
         args.socket.clone(),
@@ -1346,7 +1383,8 @@ fn build_ui(application: &Application) {
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .build();
     sidebar_scroll.add_css_class("sidebar-surface");
-    let sidebar_scrims = view::build_sidebar_scrims(Rc::clone(&theme));
+    let sidebar_scrims =
+        view::build_sidebar_scrims(Rc::clone(&theme), &sidebar_scroll.vadjustment());
     let sidebar = Overlay::new();
     sidebar.add_css_class("sidebar-surface");
     sidebar.set_child(Some(&sidebar_scroll));
@@ -1511,6 +1549,25 @@ fn build_ui(application: &Application) {
                 blink.set(state);
                 terminal.queue_draw();
             }
+            gtk4::glib::ControlFlow::Continue
+        });
+    }
+    {
+        let git_resolver = Rc::clone(&git_resolver);
+        let terminal_cwds = Rc::clone(&terminal_cwds);
+        let update_generation = Rc::clone(&update_generation);
+        let workspace_details = Rc::clone(&workspace_details);
+        let workspaces = workspaces.downgrade();
+        gtk4::glib::timeout_add_local(git_branch::CACHE_TTL, move || {
+            if workspaces.upgrade().is_none() {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            request_workspace_branches(
+                &workspace_details.borrow(),
+                &terminal_cwds.borrow(),
+                &git_resolver,
+                update_generation.get(),
+            );
             gtk4::glib::ControlFlow::Continue
         });
     }
@@ -2642,6 +2699,8 @@ fn build_ui(application: &Application) {
         let screens = Rc::clone(&screens);
         let attention = Rc::clone(&attention);
         let terminal_cwds = Rc::clone(&terminal_cwds);
+        let git_branches = Rc::clone(&git_branches);
+        let git_resolver = Rc::clone(&git_resolver);
         let home = Rc::clone(&home);
         let screen_terminals = Rc::clone(&screen_terminals);
         let terminal = terminal.clone();
@@ -2706,6 +2765,7 @@ fn build_ui(application: &Application) {
                             &screens,
                             &attention,
                             &terminal_cwds,
+                            &git_branches,
                             &screen_terminals,
                             &entries,
                             &workspaces,
@@ -2731,6 +2791,7 @@ fn build_ui(application: &Application) {
                             &screens,
                             &attention,
                             &terminal_cwds,
+                            &git_branches,
                             &screen_terminals,
                             &entries,
                             &workspaces,
@@ -2796,6 +2857,7 @@ fn build_ui(application: &Application) {
                                         theme: Rc::clone(&theme),
                                         attention: Rc::clone(&attention),
                                         terminal_cwds: Rc::clone(&terminal_cwds),
+                                        git_branches: Rc::clone(&git_branches),
                                         home: Rc::clone(&home),
                                         worker: Rc::clone(&worker),
                                         rename_prompt: Rc::clone(&rename_prompt),
@@ -2809,6 +2871,12 @@ fn build_ui(application: &Application) {
                             }
                             *entries.borrow_mut() = list;
                         }
+                        request_workspace_branches(
+                            &workspace_details.borrow(),
+                            &terminal_cwds.borrow(),
+                            &git_resolver,
+                            update_generation.get(),
+                        );
 
                         if let Some(entry) = focused {
                             let target = entry
@@ -2853,6 +2921,7 @@ fn build_ui(application: &Application) {
                             &workspace_details.borrow(),
                             &attention.borrow(),
                             &terminal_cwds.borrow(),
+                            &git_branches.borrow(),
                             home.as_ref().as_deref(),
                         );
                         terminal.queue_draw();
@@ -2866,6 +2935,23 @@ fn build_ui(application: &Application) {
                             &workspace_details.borrow(),
                             &attention.borrow(),
                             &terminal_cwds.borrow(),
+                            &git_branches.borrow(),
+                            home.as_ref().as_deref(),
+                        );
+                        request_workspace_branches(
+                            &workspace_details.borrow(),
+                            &terminal_cwds.borrow(),
+                            &git_resolver,
+                            update_generation.get(),
+                        );
+                    }
+                    Update::GitBranch { directory, branch } => {
+                        git_branches.borrow_mut().insert(directory, branch);
+                        refresh_workspace_details(
+                            &workspace_details.borrow(),
+                            &attention.borrow(),
+                            &terminal_cwds.borrow(),
+                            &git_branches.borrow(),
                             home.as_ref().as_deref(),
                         );
                     }

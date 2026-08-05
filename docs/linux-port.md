@@ -196,11 +196,19 @@ and agent resources on that same session event stream. Unread severity rolls
 up from terminal tabs to screen tabs and workspace rows; agent reports drive a
 static task-status ring on terminal tabs and a highest-priority status line on
 workspace rows. The same event thread maintains terminal working directories
-from the resource snapshot and terminal deltas; each workspace row shows the
-active terminal's cwd with the local home prefix abbreviated to `~`. Missing
-agent reports and cwd values omit their respective row lines. Snapshot events
-replace the resource maps and deltas update them in place, so these details add
-no protocol round-trips and never trigger a topology tree walk. The server
+from the resource snapshot and terminal deltas. Rows follow the official
+title, status, git branch and path order; missing values omit their respective
+lines, and the local home prefix in the path is abbreviated to `~`.
+
+The git branch is a documented frontend exception because the workspace
+protocol carries no git state. A dedicated worker runs
+`git -C <cwd> status --porcelain=v2 --branch`, formats dirty branches as
+`main*`, and uses the short commit for detached HEAD. Successes and failures are
+cached per directory for five seconds and returned over the existing UI update
+channel. Git is killed and reaped after a one-second timeout, so it never blocks
+GTK. All other row details remain protocol-derived; snapshot events replace the
+resource maps and deltas update them in place, so they add no protocol
+round-trips and never trigger a topology tree walk. The server
 clears a viewed surface only after publishing its focus resource change and
 does not publish a notification upsert for the new read state, so GTK clears
 that terminal's marker locally after a successful focus operation and trusts
