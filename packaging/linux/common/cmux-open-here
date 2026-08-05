@@ -69,15 +69,29 @@ session_is_running() {
 }
 
 start_session() {
-  local polls=0
+  local polls=0 startup_log
+  startup_log="$(mktemp -t cmux-open-here.XXXXXX)"
 
-  spawn / "$cmux_bin" --headless --session "$session"
+  # Keep the daemon's own diagnostics: a failure to start is usually specific
+  # and actionable - a session whose lock is still held by a daemon whose socket
+  # has gone, say - and reporting only a timeout hides the actual cause.
+  ( cd / && setsid "$cmux_bin" --headless --session "$session" \
+      >"$startup_log" 2>&1 < /dev/null & )
+
   while ! session_is_running; do
-    [ "$polls" -lt 50 ] \
-      || fail "cmux session '$session' did not start within 5 seconds"
+    if [ "$polls" -ge 50 ]; then
+      local reason
+      reason="$(head -c 400 "$startup_log" 2>/dev/null | tr '\n' ' ')"
+      rm -f "$startup_log"
+      if [ -n "$reason" ]; then
+        fail "cmux session '$session' did not start: $reason"
+      fi
+      fail "cmux session '$session' did not start within 5 seconds"
+    fi
     polls=$((polls + 1))
     sleep 0.1
   done
+  rm -f "$startup_log"
 }
 
 # Direct cmux-gtk launches still auto-start a missing session. This helper
