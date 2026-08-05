@@ -99,8 +99,7 @@ in the `upstream` remote.
 | `/usr/bin/cmux-tui` | the multiplexer and public CLI |
 | `/usr/bin/cmux-relay` | stdio-to-socket transport primitive |
 | `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session automatically when needed |
-| `/usr/share/applications/cmux.desktop` | TUI desktop entry (`Terminal=true`) |
-| `/usr/share/applications/cmux-gtk.desktop` | GUI desktop entry (`Terminal=false`) |
+| `/usr/share/applications/cmux.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons |
 | `/usr/share/man/man1/cmux.1.gz` | man page |
 | `/usr/share/{bash-completion,zsh,fish}/...` | shell completions |

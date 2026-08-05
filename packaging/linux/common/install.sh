@@ -30,7 +30,7 @@ fi
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 FILES="bin/cmux bin/cmux-tui bin/cmux-relay bin/cmux-gtk bin/cmux-open-here
-share/applications/cmux.desktop share/applications/cmux-gtk.desktop
+share/applications/cmux.desktop
 share/man/man1/cmux.1.gz
 share/bash-completion/completions/cmux
 share/zsh/site-functions/_cmux

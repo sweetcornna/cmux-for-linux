@@ -12,8 +12,7 @@ through npm and PyPI; nothing here modifies upstream code.
 | `/usr/bin/cmux-relay` | stdio↔socket transport primitive |
 | `/usr/bin/cmux-gtk` | GTK4 frontend; starts its target session when needed |
 | `/usr/bin/cmux` | symlink to `cmux-tui`, matching the upstream npm command name |
-| `/usr/share/applications/cmux.desktop` | TUI desktop entry (`Terminal=true`) |
-| `/usr/share/applications/cmux-gtk.desktop` | GUI desktop entry (`Terminal=false`) |
+| `/usr/share/applications/cmux.desktop` | GUI desktop entry (`Terminal=false`) |
 | `/usr/share/icons/hicolor/*/apps/cmux.png` | icons from `common/icons/` |
 | `/usr/share/man/man1/cmux.1.gz` | man page generated from `common/cmux.1.in` |
 | `/usr/share/{bash-completion,zsh,fish}/…` | shell completions |
@@ -22,6 +21,15 @@ through npm and PyPI; nothing here modifies upstream code.
 Every format consumes this full payload. The Debian package conflicts with,
 replaces and provides `cmux-gtk`, and the RPM obsoletes and provides it, so the
 old split package is removed during an upgrade.
+
+The package deliberately installs one application launcher: clicking a
+launcher icon should open a window. The TUI remains available as the `cmux`
+command from a shell, which is how a terminal multiplexer is normally started;
+a `Terminal=true` launcher would instead spawn whichever terminal emulator the
+desktop environment happens to use by default. There is intentionally no TUI
+desktop Action because `Terminal` is not a per-action key in the freedesktop
+desktop-entry specification. Such an action would have to hardcode a terminal
+emulator and would fail silently on systems where that binary is unavailable.
 
 ## Build requirements
 

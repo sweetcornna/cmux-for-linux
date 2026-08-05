@@ -52,8 +52,6 @@ package() {
 
   install -Dm0644 "$src/share/applications/cmux.desktop" \
     "$pkgdir/usr/share/applications/cmux.desktop"
-  install -Dm0644 "$src/share/applications/cmux-gtk.desktop" \
-    "$pkgdir/usr/share/applications/cmux-gtk.desktop"
   install -Dm0644 "$src/share/man/man1/cmux.1.gz" \
     "$pkgdir/usr/share/man/man1/cmux.1.gz"
 

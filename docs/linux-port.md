@@ -16,7 +16,7 @@ against the upstream tree at cmux 0.64.21 (preserved at the
 | `cmux-gtk` GTK4 frontend | Rust | **shipping** - included in the same full `cmux` package |
 
 Verified on Ubuntu 26.04 x86_64: the single `.deb` installs `cmux`,
-`cmux-relay` and `cmux-gtk`, registers both desktop entries and the man page,
+`cmux-relay` and `cmux-gtk`, registers the desktop entry and the man page,
 starts a headless session, and drives a real PTY through `libghostty-vt`. The
 `.rpm` installs the same full payload in a `fedora:42` container.
 

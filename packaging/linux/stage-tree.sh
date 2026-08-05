@@ -56,10 +56,8 @@ for action in cmux-window cmux-workspace; do
     "$STAGE/usr/share/nemo/actions/$action.nemo_action"
 done
 
-# TUI and GUI desktop entries + shared icons.
+# GUI desktop entry + shared icons. The TUI remains available from a shell.
 install -m 0644 "$PKG_DIR/common/cmux.desktop" "$STAGE/usr/share/applications/cmux.desktop"
-install -m 0644 "$PKG_DIR/common/cmux-gtk.desktop" \
-  "$STAGE/usr/share/applications/cmux-gtk.desktop"
 for size in 16 32 128 256 512; do
   src="$PKG_DIR/common/icons/cmux-$size.png"
   [ -f "$src" ] || continue

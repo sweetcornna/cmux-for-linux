@@ -45,7 +45,7 @@ cp -a "$STAGE/usr" "$appdir/usr"
 # Its launcher selects the GUI while the AppImage's CLI default remains the TUI.
 sed -e 's/^Exec=.*/Exec=cmux --gtk/' \
     -e 's/^TryExec=.*/TryExec=cmux/' \
-    "$STAGE/usr/share/applications/cmux-gtk.desktop" > "$appdir/cmux.desktop"
+    "$STAGE/usr/share/applications/cmux.desktop" > "$appdir/cmux.desktop"
 if [ -f "$STAGE/usr/share/icons/hicolor/256x256/apps/cmux.png" ]; then
   install -m 0644 "$STAGE/usr/share/icons/hicolor/256x256/apps/cmux.png" "$appdir/cmux.png"
   cp "$appdir/cmux.png" "$appdir/.DirIcon"

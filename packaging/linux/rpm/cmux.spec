@@ -79,7 +79,6 @@ test -x %{buildroot}%{_bindir}/cmux-gtk
 %{_datadir}/nemo/actions/cmux-window.nemo_action
 %{_datadir}/nemo/actions/cmux-workspace.nemo_action
 %{_datadir}/applications/cmux.desktop
-%{_datadir}/applications/cmux-gtk.desktop
 %{_datadir}/icons/hicolor/*/apps/cmux.png
 %{_mandir}/man1/cmux.1*
 %{_datadir}/bash-completion/completions/cmux
