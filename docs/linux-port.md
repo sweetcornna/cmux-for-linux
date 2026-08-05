@@ -154,15 +154,16 @@ dims images and text together to 70%.
 
 The GTK lifecycle pass now exposes both tab-like protocol levels without
 conflating them. Workspace `ScreenId` entries form the workspace-level screen
-strip and support focus, create, close and rename. Pane `TabId` entries retain
-their own strip and support focus, terminal-tab creation, close and rename.
-Hover close controls, middle-click close, double-click rename and action-lane
-creation all enqueue Rust binding mutations; the frontend waits for topology
-changes from the server resource event stream before redrawing. The default
-`Ctrl+B` keymap matches the TUI:
-`t`, `x`, `Tab`, `Shift+Tab`, `,`, `$` and `&` retain their distinct
-NewTab, CloseTab, tab-navigation, RenameScreen, RenameWorkspace and CloseScreen
-semantics.
+strip and support focus, create, close and rename; the strip is hidden for one
+screen and appears once a second screen exists. Pane `TabId` entries retain
+their always-visible strip and support focus, terminal-tab creation, close and
+rename. Hover close controls, middle-click close, double-click rename and
+action-lane creation all enqueue Rust binding mutations; the frontend waits for
+topology changes from the server resource event stream before redrawing. The
+default `Ctrl+B` keymap matches the TUI: `c`, `t`, `x`, `Tab`, `Shift+Tab`, `,`,
+`$` and `&` retain their distinct NewScreen, NewTab, CloseTab, tab-navigation,
+RenameScreen, RenameWorkspace and CloseScreen semantics. In particular,
+`Ctrl+B c` keeps screen creation reachable while the screen strip is hidden.
 
 Workspace rows now expose hover close and double-click rename controls. A
 20x20 titlebar button creates workspaces, and an adjacent 20x20 button opens the
@@ -207,11 +208,14 @@ the next snapshot as the resync boundary.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a
-240px resizable workspace sidebar, always-visible 28px screen and pane tab strips,
-derived 1px separators, inactive-pane dimming, and overlay error toasts in
-place of a status bar. Chrome colors are recomputed from the active terminal's
-resolved background, with auto/light/dark semantics and explicit
-`cmux-tui.json` theme values taking precedence. This remains a presentation
+240px resizable workspace sidebar, a screen strip shown only for multiple
+screens, an always-visible 28px pane tab strip, derived 1px separators,
+inactive-pane dimming, and overlay error toasts in place of a status bar.
+Automatic chrome colors are recomputed from the active terminal's resolved
+background. Explicit light/dark modes use the terminal background when its
+luminance agrees and otherwise rebase chrome surfaces on `#feffff`/`#1e1e1e`;
+terminal grid background and foreground colors remain server-resolved. Explicit
+`cmux-tui.json` theme values still take precedence. This remains a presentation
 change only; render state, input, mouse reporting and PTY sizing still cross
 `cmux.protocol/1`, and the server remains the sole VT implementation.
 Pane, tab, screen and workspace lifecycle operations plus divider ratios all

@@ -80,12 +80,12 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 
 | | |
 | --- | --- |
-| Window chrome | custom draggable 28px titlebar with GTK-configured double-, middle- and right-click actions, terminal-background-derived colors, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
+| Window chrome | custom draggable 28px titlebar with GTK-configured double-, middle- and right-click actions, terminal-derived automatic colors with explicit light/dark bases, resizable 240px workspace sidebar, overlay error toasts, and no status bar |
 | Sessions | titlebar selector for live sibling sockets, current-session highlighting, in-place switching with rollback, and prompt-based headless session creation |
 | Panes | server-owned split layouts with per-pane PTY sizing, click-to-focus, split-right/split-down creation and pane close from the keyboard or context menu |
 | Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |
-| Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |
-| Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
+| Screen tabs | a workspace with multiple screens uses a 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade; the strip is hidden for one screen |
+| Pane tabs | each always-visible pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
 | Agent state | terminal tabs show a static 9px task-status ring, while workspace rows show the highest-priority reported state across their terminals |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
@@ -96,7 +96,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Selection | drag to select; Shift overrides application mouse handling; `Ctrl+Shift+C` copies to the clipboard |
 | Blink | protocol-provided text and cursor blink attributes, with a stable hollow block cursor while the window is unfocused |
 | Inline images | server-decoded Kitty RGB/RGBA pixels with source cropping, cell-relative scaling, scroll-aware viewport placement and z-order; inactive panes use the same 70% dimming as text |
-| Theme | runtime chrome colors from the active terminal background plus explicit `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT`, with non-persistent 6pt-32pt runtime zoom |
+| Theme | automatic runtime chrome colors from the active terminal background, explicit light/dark chrome bases and `cmux-tui.json` overrides; GTK font from `cmux-gtk.json` or `CMUX_GTK_FONT`, with non-persistent 6pt-32pt runtime zoom |
 
 The visual metrics and color rules follow
 [`../docs/gtk-design-parity.md`](../docs/gtk-design-parity.md).
@@ -114,6 +114,7 @@ then press the action key:
 | `Ctrl++` / `Ctrl+=` | Increase the terminal font size by 1pt, up to 32pt |
 | `Ctrl+-` | Decrease the terminal font size by 1pt, down to 6pt |
 | `Ctrl+0` | Reset the terminal font to the configured default |
+| `Ctrl+B c` | Create a workspace screen (`NewScreen`) |
 | `Ctrl+B t` | Create a terminal tab in the focused pane (`NewTab`) |
 | `Ctrl+B x` | Close the focused pane tab (`CloseTab`); the server collapses a pane when this was its last tab |
 | `Ctrl+B Tab` / `Ctrl+B Shift+Tab` | Focus the next / previous pane tab, wrapping at either end |
@@ -123,18 +124,23 @@ then press the action key:
 | `Ctrl+B %` / `Ctrl+B "` | Split the focused pane right / down |
 | `Ctrl+B X` | Close the focused pane |
 
-The screen strip's `+` button creates a workspace screen. The titlebar `+`
-button creates a workspace. Those operations have separate TUI actions and are
-not remapped onto `NewTab`.
+`Ctrl+B c` keeps screen creation reachable while a one-screen workspace hides
+the screen strip. Once the strip appears, its `+` button also creates a screen.
+The titlebar `+` button creates a workspace. Those operations have separate TUI
+actions and are not remapped onto `NewTab`.
 
 ## Theme
 
 Window chrome is recomputed whenever the active terminal's resolved background
 changes. The separator uses the upstream lightness offset, the sidebar is a
 solid approximation of the macOS sidebar material, and `theme.chrome` accepts
-`auto`, `light`, or `dark`. `auto` uses the same luminance threshold as the
-TUI. Before the first render state arrives, fallback backgrounds are `#1e1e1e`
-for dark/auto and `#feffff` for light.
+`auto`, `light`, or `dark`. `auto` derives every chrome surface from the
+terminal background using the TUI luminance threshold. An explicit `light` or
+`dark` mode continues using that terminal background when its luminance agrees;
+when it disagrees, chrome surfaces instead use the mode fallback (`#feffff` for
+light or `#1e1e1e` for dark). Terminal cells retain their own resolved
+background and foreground in every mode. Before the first render state arrives,
+dark/auto uses `#1e1e1e` and light uses `#feffff`.
 
 The GTK frontend honors these keys under `theme` in `cmux-tui.json`:
 

@@ -152,6 +152,7 @@ struct NewSessionPrompt {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefixAction {
+    NewScreen,
     NewTab,
     NextTab,
     PrevTab,
@@ -434,6 +435,7 @@ fn send_focus_tab(worker: &Worker, target: &TabTarget) {
 
 fn prefix_action(key: gdk::Key) -> Option<PrefixAction> {
     match key {
+        gdk::Key::c => Some(PrefixAction::NewScreen),
         gdk::Key::t => Some(PrefixAction::NewTab),
         gdk::Key::Tab => Some(PrefixAction::NextTab),
         gdk::Key::ISO_Left_Tab => Some(PrefixAction::PrevTab),
@@ -1689,6 +1691,15 @@ fn build_ui(application: &Application) {
                 let action = prefix_action(key);
                 let screens_ref = screens.borrow();
                 match action {
+                    Some(PrefixAction::NewScreen) => {
+                        if let Some(workspace) = screens_ref.workspace.as_ref() {
+                            let _ = worker.input.send(Input::CreateScreen {
+                                workspace: workspace.workspace_id.clone(),
+                            });
+                        } else {
+                            set_toast(&toast, "No focused workspace for a new screen");
+                        }
+                    }
                     Some(PrefixAction::NewTab) => {
                         if let Some(target) = focused_pane_target(&screens_ref) {
                             let _ = worker.input.send(Input::CreateTab {
@@ -3020,6 +3031,7 @@ mod tests {
 
     #[test]
     fn prefix_actions_match_the_tui_default_keymap() {
+        assert_eq!(prefix_action(gdk::Key::c), Some(PrefixAction::NewScreen));
         assert_eq!(prefix_action(gdk::Key::t), Some(PrefixAction::NewTab));
         assert_eq!(prefix_action(gdk::Key::Tab), Some(PrefixAction::NextTab));
         assert_eq!(

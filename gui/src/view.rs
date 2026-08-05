@@ -521,7 +521,7 @@ pub fn pane_geometries(
     let Some(workspace) = screens.workspace.as_ref() else {
         return Vec::new();
     };
-    let area = workspace_content_rect(width, height);
+    let area = workspace_content_rect(workspace.screen_tabs.len(), width, height);
     let mut panes = Vec::new();
     if let Some(zoomed) = workspace.layout.zoomed_pane_id.as_ref() {
         push_pane(workspace, zoomed, area, false, metrics, &mut panes);
@@ -531,13 +531,22 @@ pub fn pane_geometries(
     panes
 }
 
-fn workspace_content_rect(width: i32, height: i32) -> Rect {
+fn workspace_content_rect(screen_count: usize, width: i32, height: i32) -> Rect {
+    let screen_bar_height = if screen_bar_visible(screen_count) {
+        TAB_HEIGHT.min(f64::from(height.max(0)))
+    } else {
+        0.0
+    };
     Rect {
         x: 0.0,
-        y: TAB_HEIGHT.min(f64::from(height.max(0))),
+        y: screen_bar_height,
         width: f64::from(width.max(0)),
-        height: (f64::from(height.max(0)) - TAB_HEIGHT).max(0.0),
+        height: (f64::from(height.max(0)) - screen_bar_height).max(0.0),
     }
+}
+
+pub fn screen_bar_visible(screen_count: usize) -> bool {
+    screen_count > 1
 }
 
 pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<SplitDivider> {
@@ -547,7 +556,7 @@ pub fn split_dividers(screens: &ScreenSet, width: i32, height: i32) -> Vec<Split
     if workspace.layout.zoomed_pane_id.is_some() {
         return Vec::new();
     }
-    let area = workspace_content_rect(width, height);
+    let area = workspace_content_rect(workspace.screen_tabs.len(), width, height);
     let mut dividers = Vec::new();
     walk_dividers(
         &workspace.layout.root,
@@ -564,6 +573,9 @@ pub fn screen_bar_geometry(
     height: i32,
 ) -> Option<ScreenBarGeometry> {
     let workspace = screens.workspace.as_ref()?;
+    if !screen_bar_visible(workspace.screen_tabs.len()) {
+        return None;
+    }
     let bar_height = TAB_HEIGHT.min(f64::from(height.max(0)));
     let width = f64::from(width.max(0));
     let action_width = SCREEN_ACTION_WIDTH.min(width);
@@ -2756,25 +2768,25 @@ mod tests {
             panes[0].rect,
             Rect {
                 x: 0.0,
-                y: 28.0,
+                y: 0.0,
                 width: 500.0,
-                height: 572.0
+                height: 600.0
             }
         );
         assert_eq!(
             panes[1].rect,
             Rect {
                 x: 500.0,
-                y: 28.0,
+                y: 0.0,
                 width: 500.0,
-                height: 572.0
+                height: 600.0
             }
         );
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
         assert_eq!(sizes.len(), 2);
         assert!(sizes
             .iter()
-            .all(|(_, size)| *size == Size { cols: 50, rows: 27 }));
+            .all(|(_, size)| *size == Size { cols: 50, rows: 28 }));
     }
 
     #[test]
@@ -2854,9 +2866,10 @@ mod tests {
         };
         let panes = pane_geometries(&screens, metrics, 1000, 600);
         assert_eq!(panes[0].tabs.len(), 2);
-        assert_eq!(panes[0].content.y, 56.0);
+        assert_eq!(panes[0].rect.y, 0.0);
+        assert_eq!(panes[0].content.y, 28.0);
         assert_eq!(panes[0].tabs[1].terminal, None);
-        assert!(panes[0].tabs[1].rect.contains(375.0, 38.0));
+        assert!(panes[0].tabs[1].rect.contains(375.0, 14.0));
         assert_eq!(panes[0].new_tab_button.unwrap().width, 28.0);
         assert_eq!(
             pane_tab_trailing_width(
@@ -2868,7 +2881,7 @@ mod tests {
             ),
             28.0
         );
-        assert_eq!(pane_bar_hit(&panes[0], 486.0, 38.0), Some(PaneBarHit::New));
+        assert_eq!(pane_bar_hit(&panes[0], 486.0, 14.0), Some(PaneBarHit::New));
         let second_close = panes[0].tabs[1].close_rect;
         assert_eq!(
             pane_bar_hit(
@@ -2879,8 +2892,16 @@ mod tests {
             Some(PaneBarHit::Close(panes[0].tabs[1].id.clone()))
         );
         let sizes = visible_terminal_sizes(&screens, metrics, 1000, 600);
-        assert_eq!(sizes[0].1, Size { cols: 50, rows: 27 });
-        assert_eq!(sizes[1].1, Size { cols: 50, rows: 27 });
+        assert_eq!(sizes[0].1, Size { cols: 50, rows: 28 });
+        assert_eq!(sizes[1].1, Size { cols: 50, rows: 28 });
+    }
+
+    #[test]
+    fn screen_bar_is_visible_if_and_only_if_workspace_has_multiple_screens() {
+        assert!(!screen_bar_visible(0));
+        assert!(!screen_bar_visible(1));
+        assert!(screen_bar_visible(2));
+        assert!(screen_bar_visible(10));
     }
 
     #[test]
@@ -2895,6 +2916,17 @@ mod tests {
         });
 
         let geometry = screen_bar_geometry(&screens, 428, 600).unwrap();
+        let panes = pane_geometries(
+            &screens,
+            CellMetrics {
+                width: 10.0,
+                height: 20.0,
+                baseline: 15.0,
+            },
+            428,
+            600,
+        );
+        assert_eq!(panes[0].rect.y, 28.0);
         assert_eq!(geometry.rect.height, 28.0);
         assert_eq!(geometry.new_button.width, 28.0);
         assert_eq!(geometry.tabs.len(), 2);

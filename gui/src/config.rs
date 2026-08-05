@@ -139,12 +139,27 @@ pub struct ChromeColors {
 
 impl ChromeColors {
     pub fn derive(background: Rgb, mode: ChromeMode, overrides: ThemeOverrides) -> Self {
-        let is_light = match mode {
-            ChromeMode::Auto => is_light_background(background),
-            ChromeMode::Light => true,
-            ChromeMode::Dark => false,
+        let terminal_is_light = is_light_background(background);
+        let (is_light, chrome_background) = match mode {
+            ChromeMode::Auto => (terminal_is_light, background),
+            ChromeMode::Light => (
+                true,
+                if terminal_is_light {
+                    background
+                } else {
+                    DEFAULT_LIGHT_BACKGROUND
+                },
+            ),
+            ChromeMode::Dark => (
+                false,
+                if terminal_is_light {
+                    DEFAULT_DARK_BACKGROUND
+                } else {
+                    background
+                },
+            ),
         };
-        let separator = separator_color(background);
+        let separator = separator_color(chrome_background);
         let pane_separator = overrides
             .border_inactive
             .map(|color| Rgba { color, alpha: 1.0 })
@@ -152,12 +167,12 @@ impl ChromeColors {
 
         let mut colors = if is_light {
             Self {
-                background,
+                background: chrome_background,
                 foreground: Rgb(0x00, 0x00, 0x00),
                 cursor: DEFAULT_CURSOR,
                 separator,
                 pane_separator,
-                sidebar_background: sidebar_background(background),
+                sidebar_background: sidebar_background(chrome_background),
                 selection_background: DEFAULT_LIGHT_SELECTION_BACKGROUND,
                 chrome_selection_background: Rgb(0xcc, 0xdd, 0xf5),
                 selection_foreground: Some(Rgb(0x00, 0x00, 0x00)),
@@ -209,12 +224,12 @@ impl ChromeColors {
             }
         } else {
             Self {
-                background,
+                background: chrome_background,
                 foreground: Rgb(0xff, 0xff, 0xff),
                 cursor: DEFAULT_CURSOR,
                 separator,
                 pane_separator,
-                sidebar_background: sidebar_background(background),
+                sidebar_background: sidebar_background(chrome_background),
                 selection_background: DEFAULT_DARK_SELECTION_BACKGROUND,
                 chrome_selection_background: Rgb(0x3a, 0x3a, 0x3a),
                 selection_foreground: Some(Rgb(0xff, 0xff, 0xff)),
@@ -284,11 +299,6 @@ impl ChromeColors {
             colors.tab_active_background = color;
             colors.tab_active_unfocused_background = color;
         }
-        colors.foreground = if is_light_background(background) {
-            Rgb(0x00, 0x00, 0x00)
-        } else {
-            Rgb(0xff, 0xff, 0xff)
-        };
         colors
     }
 
@@ -387,13 +397,21 @@ window.cmux-window * {{ transition: none; }}
   min-height: 12px;
 }}
 .sidebar-surface,
-.workspace-list {{ background-color: @sidebar_bg; }}
+.workspace-list {{
+  background-color: @sidebar_bg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}}
 .workspace-list {{ padding-top: 2px; }}
 .workspace-row {{
   margin: 0 6px 2px 6px;
   padding: 0;
   border-radius: 6px;
   background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @chrome_fg;
 }}
 .workspace-row:hover {{ background-color: transparent; }}
@@ -484,9 +502,15 @@ paned.cmux-split > separator:active {{
 }}
 popover.cmux-menu > contents {{
   background-color: @menu_bg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @menu_fg;
 }}
 popover.cmux-menu modelbutton {{
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @menu_fg;
 }}
 popover.cmux-menu modelbutton:hover {{
@@ -523,6 +547,9 @@ popover.session-menu > contents {{
 popover.session-menu separator {{
   margin: 4px 2px;
   background-color: @chrome_separator;
+  background-image: none;
+  border: none;
+  box-shadow: none;
 }}
 popover.rename-prompt > contents {{
   padding: 6px;
@@ -534,6 +561,9 @@ popover.rename-prompt > contents {{
   padding: 2px 6px;
   border-radius: 4px;
   background-color: @selection_bg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @menu_fg;
 }}
 .toast {{
@@ -541,14 +571,20 @@ popover.rename-prompt > contents {{
   padding: 6px 10px;
   border-radius: 6px;
   background-color: @toast_bg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @toast_fg;
 }}
 .search-bar {{
   min-height: 28px;
   padding: 3px 6px;
-  border-bottom: 1px solid @prompt_border;
   border-spacing: 6px;
   background-color: @prompt_bg;
+  background-image: none;
+  border: none;
+  border-bottom: 1px solid @prompt_border;
+  box-shadow: none;
   color: @prompt_fg;
 }}
 .search-entry {{
@@ -556,6 +592,9 @@ popover.rename-prompt > contents {{
   padding: 1px 6px;
   border-radius: 4px;
   background-color: @prompt_input_bg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
   color: @prompt_input_fg;
 }}
 .search-count {{
@@ -579,6 +618,9 @@ popover.rename-prompt > contents {{
   min-width: 4px;
   min-height: 24px;
   background-color: @scrollbar_thumb_fg;
+  background-image: none;
+  border: none;
+  box-shadow: none;
 }}
 "#,
             chrome_bg = self.background.css(),
@@ -1130,7 +1172,8 @@ mod tests {
         };
         let colors = ChromeColors::derive(DEFAULT_DARK_BACKGROUND, ChromeMode::Light, overrides);
         assert!(colors.is_light);
-        assert_eq!(colors.foreground, Rgb(0xff, 0xff, 0xff));
+        assert_eq!(colors.background, DEFAULT_LIGHT_BACKGROUND);
+        assert_eq!(colors.foreground, Rgb(0x00, 0x00, 0x00));
         assert_eq!(colors.border_active_foreground, Rgb(1, 2, 3));
         assert!(colors.draw_active_border);
         assert_eq!(colors.pane_separator.color, Rgb(4, 5, 6));
@@ -1140,6 +1183,87 @@ mod tests {
         assert_eq!(colors.notification_info, DEFAULT_NOTIFICATION_INFO);
         assert_eq!(colors.notification_warning, DEFAULT_NOTIFICATION_WARNING);
         assert_eq!(colors.notification_error, DEFAULT_NOTIFICATION_ERROR);
+    }
+
+    #[test]
+    fn explicit_chrome_mode_rebases_only_when_terminal_luminance_disagrees() {
+        let light_on_dark = ChromeColors::derive(
+            Rgb(0x05, 0x06, 0x07),
+            ChromeMode::Light,
+            ThemeOverrides::default(),
+        );
+        assert_eq!(light_on_dark.background, DEFAULT_LIGHT_BACKGROUND);
+        assert_eq!(
+            light_on_dark.sidebar_background,
+            sidebar_background(DEFAULT_LIGHT_BACKGROUND)
+        );
+        assert_eq!(
+            light_on_dark.separator,
+            separator_color(DEFAULT_LIGHT_BACKGROUND)
+        );
+        assert_eq!(light_on_dark.pane_separator, light_on_dark.separator);
+
+        let dark_on_light = ChromeColors::derive(
+            Rgb(0xfa, 0xfb, 0xfc),
+            ChromeMode::Dark,
+            ThemeOverrides::default(),
+        );
+        assert_eq!(dark_on_light.background, DEFAULT_DARK_BACKGROUND);
+        assert_eq!(dark_on_light.foreground, Rgb(0xff, 0xff, 0xff));
+        assert_eq!(
+            dark_on_light.sidebar_background,
+            sidebar_background(DEFAULT_DARK_BACKGROUND)
+        );
+
+        let matching_light = Rgb(0xf0, 0xe8, 0xe0);
+        let light =
+            ChromeColors::derive(matching_light, ChromeMode::Light, ThemeOverrides::default());
+        assert_eq!(light.background, matching_light);
+
+        let auto_background = Rgb(0x05, 0x06, 0x07);
+        let auto =
+            ChromeColors::derive(auto_background, ChromeMode::Auto, ThemeOverrides::default());
+        assert_eq!(auto.background, auto_background);
+        assert_eq!(auto.sidebar_background, sidebar_background(auto_background));
+    }
+
+    #[test]
+    fn flat_widget_css_clears_theme_paint_layers() {
+        let css = ChromeColors::derive(
+            DEFAULT_DARK_BACKGROUND,
+            ChromeMode::Auto,
+            ThemeOverrides::default(),
+        )
+        .css();
+        let assert_flat = |selector: &str| {
+            let rule = css
+                .split_once(selector)
+                .unwrap_or_else(|| panic!("missing CSS selector {selector}"))
+                .1
+                .split_once('}')
+                .unwrap()
+                .0;
+            assert!(rule.contains("background-image: none;"), "{selector}");
+            assert!(rule.contains("border: none;"), "{selector}");
+            assert!(rule.contains("box-shadow: none;"), "{selector}");
+        };
+
+        for selector in [
+            ".workspace-list {",
+            ".workspace-row {",
+            "popover.cmux-menu > contents {",
+            "popover.cmux-menu modelbutton {",
+            ".session-item,\n.session-new {",
+            "popover.session-menu separator {",
+            ".rename-entry {",
+            ".toast {",
+            ".search-bar {",
+            ".search-entry {",
+            ".search-close {",
+            ".sidebar-surface scrollbar slider {",
+        ] {
+            assert_flat(selector);
+        }
     }
 
     #[test]
