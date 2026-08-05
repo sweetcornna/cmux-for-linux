@@ -33,6 +33,13 @@ log "building cmux-tui and cmux-relay (profile=$PROFILE${TARGET:+, target=$TARGE
 cargo_args=(build --profile "$PROFILE" -p cmux-tui -p cmux-relay)
 [ -n "$TARGET" ] && cargo_args+=(--target "$TARGET")
 
+# `cmux --version` otherwise reports the upstream crate version alone, which is
+# pinned at 0.1.0 and says nothing about which package a user installed. The
+# upstream binary already reads these at compile time, so the package version
+# and the commits it was built from are supplied here rather than patched in.
+export CMUX_TUI_BUILD_COMMIT="${CMUX_TUI_BUILD_COMMIT:-$(build_commit_stamp)}"
+export CMUX_TUI_GHOSTTY_COMMIT="${CMUX_TUI_GHOSTTY_COMMIT:-$(ghostty_commit_stamp)}"
+
 ( cd "$TUI_DIR" && cargo "${cargo_args[@]}" )
 
 # `--profile release` lands in target/release, not target/profile-name.

@@ -109,6 +109,19 @@ eventually collide.
 `CMUX_VERSION` overrides it. The `.deb` appends `-1` as the Debian revision;
 the `.rpm` replaces any `-` with `.` because RPM forbids it in `Version`.
 
+That version is also compiled into the binary. `cmux --version` reports the
+upstream crate version, which is pinned at `0.1.0` and tells a user nothing
+about what they installed, so `build-binaries.sh` fills the parenthesised build
+stamp the upstream binary already reads from `CMUX_TUI_BUILD_COMMIT` and
+`CMUX_TUI_GHOSTTY_COMMIT`:
+
+```
+cmux 0.1.0 (cmux-for-linux 0.6.2; 1a4285bee4; ghostty 6143bac77)
+```
+
+Setting either variable before the build overrides that stamp. This needs no
+patch against `cmux-tui/` because upstream reads both with `option_env!`.
+
 Pushing a `linux-v*` tag is what publishes a release: CI builds both
 architectures, renders the AUR `PKGBUILD` with the real digests for each, and
 creates the GitHub Release. Keep tag versions free of `-` and `+` — Arch

@@ -100,7 +100,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Screen tabs | a workspace with multiple screens uses a 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade; the strip is hidden for one screen |
 | Pane tabs | each always-visible pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
-| Agent state | terminal tabs show a static 9px task-status ring, while workspace rows show the highest-priority reported state across their terminals |
+| Agent state | terminal tabs show the upstream 12-spoke spinner while an agent is working and a static 9px ring for blocked, idle and done; the spinner turns only while the window is focused. Workspace rows show the highest-priority reported state across their terminals |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
 | Workspaces | macOS-parity sidebar rows with optional agent-status, git-branch and active-terminal working-directory details, switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
@@ -280,10 +280,6 @@ The following were checked against live sessions:
   does not prevent startup.
 
 ## Known gaps
-
-The upstream 12-spoke activity spinner remains deliberately omitted. It needs
-an animation timer, while this pass keeps the static agent-state ring and the
-upstream no-animation geometry policy.
 
 The server clears a focused surface's in-memory unread marker after its
 resource focus publication and emits no notification lifecycle change. GTK

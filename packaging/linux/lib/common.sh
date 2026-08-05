@@ -51,6 +51,26 @@ resolve_version() {
   printf '0.0.0+g%s' "$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 }
 
+# What `cmux --version` shows in parentheses after the crate version. The
+# package version is what a user can act on - it matches what their package
+# manager reports - and the commit disambiguates rebuilds of the same release.
+build_commit_stamp() {
+  local version commit
+  version="$(resolve_version)"
+  commit="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+  if [ -n "$commit" ]; then
+    printf 'cmux-for-linux %s; %s' "$version" "$commit"
+  else
+    printf 'cmux-for-linux %s' "$version"
+  fi
+}
+
+# The ghostty submodule commit, so a binary can be tied to the VT it was built
+# against. Empty when the submodule is absent; the upstream binary filters that.
+ghostty_commit_stamp() {
+  git -C "$REPO_ROOT/ghostty" rev-parse --short HEAD 2>/dev/null || true
+}
+
 # Map `uname -m` to the Debian, RPM and Rust names for the same arch.
 detect_arch() {
   case "$(uname -m)" in

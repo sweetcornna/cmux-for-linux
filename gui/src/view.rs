@@ -54,6 +54,9 @@ const FONT_ZOOM_STEP: f64 = 1.0;
 pub struct BlinkState {
     window_active: bool,
     phase_visible: bool,
+    /// Monotonic tick count driving the activity spinner. Blink is a two-state
+    /// toggle, so a spinner needs its own advancing phase.
+    spin_phase: usize,
 }
 
 impl BlinkState {
@@ -61,6 +64,7 @@ impl BlinkState {
         Self {
             window_active,
             phase_visible: true,
+            spin_phase: 0,
         }
     }
 
@@ -72,6 +76,15 @@ impl BlinkState {
     }
 
     pub fn tick(&mut self, has_blinking_content: bool) -> bool {
+        // Spinners keep turning independently of blinking content, but only
+        // while the window is focused: an unfocused window animating in the
+        // background is the kind of motion the parity contract rules out.
+        let spun = if self.window_active {
+            self.spin_phase = self.spin_phase.wrapping_add(1);
+            true
+        } else {
+            false
+        };
         if self.window_active && has_blinking_content {
             self.phase_visible = !self.phase_visible;
             true
@@ -79,8 +92,12 @@ impl BlinkState {
             self.phase_visible = true;
             true
         } else {
-            false
+            spun
         }
+    }
+
+    pub fn spin_phase(self) -> usize {
+        self.spin_phase
     }
 
     fn window_active(self) -> bool {
@@ -1393,6 +1410,7 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                         cr,
                         colors: &chrome,
                         window_active: blink.get().window_active(),
+                        spin_phase: blink.get().spin_phase(),
                         attention: &attention,
                     },
                     workspace.pane(&geometry.pane),
@@ -1429,6 +1447,7 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                     cr,
                     colors: &chrome,
                     window_active: blink.get().window_active(),
+                    spin_phase: blink.get().spin_phase(),
                     attention: &attention,
                 },
                 workspace,
@@ -1516,6 +1535,7 @@ struct TabStripDrawContext<'a> {
     cr: &'a gtk4::cairo::Context,
     colors: &'a ChromeColors,
     window_active: bool,
+    spin_phase: usize,
     attention: &'a AttentionState,
 }
 
@@ -1532,6 +1552,9 @@ fn draw_screen_bar(
         colors,
         window_active,
         attention,
+        // Screen tabs roll up notification severity only; agent activity, and so
+        // the spinner, belongs to the terminal tab that owns it.
+        ..
     } = context;
     let background = if colors.tab_bar_is_opaque {
         colors.tab_bar_background
@@ -1800,7 +1823,6 @@ fn draw_notification_marker(
     pangocairo::functions::show_layout(cr, &layout);
 }
 
-#[allow(dead_code)]
 pub fn draw_spokes_spinner(
     cr: &gtk4::cairo::Context,
     center_x: f64,
@@ -2387,6 +2409,7 @@ fn draw_tabs(
         cr,
         colors,
         window_active,
+        spin_phase,
         attention,
     } = context;
     let Some(pane) = pane else { return };
@@ -2457,13 +2480,15 @@ fn draw_tabs(
                 6.0
             };
         if let Some(status) = indicator.agent.and_then(task_status) {
-            draw_task_status_ring(
-                cr,
-                indicator_right - ATTENTION_SLOT_SIZE / 2.0,
-                hit.rect.y + hit.rect.height / 2.0,
-                status,
-                colors,
-            );
+            let center_x = indicator_right - ATTENTION_SLOT_SIZE / 2.0;
+            let center_y = hit.rect.y + hit.rect.height / 2.0;
+            // The parity contract shows activity through the spokes spinner and
+            // reserves the static ring for settled states.
+            if status == TaskStatus::Running {
+                draw_spokes_spinner(cr, center_x, center_y, spin_phase, colors.accent);
+            } else {
+                draw_task_status_ring(cr, center_x, center_y, status, colors);
+            }
             indicator_right -= ATTENTION_SLOT_SIZE;
         }
         if let Some(level) = indicator.notification {
@@ -3013,6 +3038,23 @@ mod tests {
         assert!(!throttle.should_send(Duration::from_millis(60), 0.7, false));
         assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
         assert!(throttle.should_send(Duration::from_millis(60), 0.7, true));
+    }
+
+    #[test]
+    fn spin_phase_advances_only_while_the_window_is_focused() {
+        let mut blink = BlinkState::new(true);
+        let start = blink.spin_phase();
+        blink.tick(false);
+        blink.tick(false);
+        assert_eq!(blink.spin_phase(), start + 2);
+        // A tick with no blinking content still redraws, because the spinner
+        // moved even though nothing blinked.
+        assert!(blink.tick(false));
+
+        let mut unfocused = BlinkState::new(false);
+        let idle = unfocused.spin_phase();
+        unfocused.tick(true);
+        assert_eq!(unfocused.spin_phase(), idle);
     }
 
     #[test]

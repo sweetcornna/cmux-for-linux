@@ -168,3 +168,30 @@ legacy spellings.
 
 This affects any CLI user reporting agent state or creating notifications,
 not just this fork, and is worth reporting upstream.
+
+## 0007 — create the fallback runtime directory before binding into it
+
+`platform::fallback_runtime_dir()` returns `/tmp/cmux-tui-<uid>` and nothing
+creates it, so every caller that binds a socket there fails when the directory
+is absent. Three server tests bind straight into it and fail on a machine that
+has never had one:
+
+```
+$ rm -rf /tmp/cmux-tui-1000
+$ cargo test --release -p cmux-tui-core
+server::tests::clear_history_does_not_block_unrelated_surface_input_on_one_connection
+server::tests::lifecycle_command_waits_for_active_clear_history_on_one_connection
+server::tests::write_side_eof_drains_accepted_surface_requests
+test result: FAILED. 838 passed; 3 failed
+```
+
+The failure is `Os { code: 2, kind: NotFound }` from `transport::listen`, not an
+assertion, because the path's parent does not exist.
+
+The patch creates the directory in that one accessor at 0o700, which is what
+`XDG_RUNTIME_DIR` would have provided. Fixing the accessor rather than each
+test also covers the production path, which reaches this fallback whenever
+`XDG_RUNTIME_DIR` is unset. With the patch the suite is 841 passed, 0 failed.
+
+Any consumer of this crate on a host without `XDG_RUNTIME_DIR` hits the same
+missing directory, so this is worth reporting upstream.

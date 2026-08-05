@@ -1,0 +1,30 @@
+diff --git a/cmux-tui/crates/cmux-tui-core/src/platform.rs b/cmux-tui/crates/cmux-tui-core/src/platform.rs
+index 91c8bd2e02..c564701bac 100644
+--- a/cmux-tui/crates/cmux-tui-core/src/platform.rs
++++ b/cmux-tui/crates/cmux-tui-core/src/platform.rs
+@@ -1,5 +1,8 @@
+ //! Platform decisions for cmux-tui.
+ 
++use std::fs;
++#[cfg(unix)]
++use std::os::unix::fs::PermissionsExt;
+ use std::path::{Path, PathBuf};
+ 
+ pub mod transport {
+@@ -140,7 +143,15 @@ pub fn runtime_dir() -> PathBuf {
+ /// fallback without first connecting to the server.
+ #[cfg(unix)]
+ pub fn fallback_runtime_dir() -> PathBuf {
+-    PathBuf::from("/tmp").join(format!("cmux-tui-{}", user_id_component()))
++    let path = PathBuf::from("/tmp").join(format!("cmux-tui-{}", user_id_component()));
++    // Callers bind sockets straight into this directory, so returning a path
++    // whose parent does not exist just moves the failure to their `listen`.
++    // 0o700 keeps it private, matching what XDG_RUNTIME_DIR would provide.
++    if !path.exists() {
++        let _ = fs::create_dir_all(&path);
++        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
++    }
++    path
+ }
+ 
+ /// Default root for durable workspace/session state. Runtime sockets stay in

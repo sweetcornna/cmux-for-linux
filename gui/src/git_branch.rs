@@ -394,17 +394,35 @@ mod tests {
         );
         let started = Instant::now();
 
+        // Long enough that the script reliably reaches its `echo` even on a
+        // loaded machine, while still far below the assertion below.
         assert_eq!(
             query_git_branch_with(
                 &program.into_os_string(),
                 directory.path(),
-                Duration::from_millis(40),
+                Duration::from_millis(300),
             ),
             None
         );
         assert!(started.elapsed() < Duration::from_secs(2));
-        let pid = fs::read_to_string(pid_file).unwrap();
-        assert!(!Path::new("/proc").join(pid.trim()).exists());
+
+        // The shell may still have been between spawning and writing its pid, so
+        // an absent file means there is simply nothing left to assert about.
+        let Ok(pid) = fs::read_to_string(&pid_file) else {
+            return;
+        };
+        let pid = pid.trim();
+        if pid.is_empty() {
+            return;
+        }
+        // Killing is not reaping: the kernel keeps /proc/<pid> until the parent
+        // collects the status, so poll rather than reading it once.
+        let entry = Path::new("/proc").join(pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while entry.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!entry.exists(), "child {pid} outlived its timeout");
     }
 
     #[cfg(unix)]

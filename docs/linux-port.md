@@ -197,7 +197,7 @@ existing supervisor teardown and rebuild path.
 Stage 4 derives a terminal-keyed attention model directly from notification
 and agent resources on that same session event stream. Unread severity rolls
 up from terminal tabs to screen tabs and workspace rows; agent reports drive a
-static task-status ring on terminal tabs and a highest-priority status line on
+spinner-or-ring task status on terminal tabs and a highest-priority status line on
 workspace rows. The same event thread maintains terminal working directories
 from the resource snapshot and terminal deltas. Rows follow the official
 title, status, git branch and path order; missing values omit their respective
