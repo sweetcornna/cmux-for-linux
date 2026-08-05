@@ -21,14 +21,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use cmux::{
-    Client, Config, CreateScreenOptions, Direction, EventStreamOptions, LayoutNode, PaneId,
-    ReadHistoryOptions, RenderPatch, RenderSnapshot, ResourceChange, ResourceKind, ScreenId,
-    ScrollOptions, Selector, SessionEvent, SessionEventStream, Size, SplitId, SplitOptions,
-    SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
+    AgentId, AgentSnapshot, Client, Config, CreateScreenOptions, Direction, EventStreamOptions,
+    LayoutNode, NotificationId, NotificationSnapshot, PaneId, ReadHistoryOptions, RenderPatch,
+    RenderSnapshot, ResourceChange, ResourceEntitySnapshot, ResourceKind, ResourceReference,
+    ScreenId, ScrollOptions, Selector, SessionEvent, SessionEventStream, Size, SplitId,
+    SplitOptions, SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
     TerminalAttachmentItem, TerminalCreateOptions, TerminalId, TerminalMouseOptions,
     TextInputOptions, WorkspaceId,
 };
 
+use crate::attention::AttentionState;
 use crate::screen::{PaneView, ScreenTabView, TabContent, TabView, WorkspaceView};
 use crate::search::{self, SearchRequest, SearchResults};
 
@@ -163,6 +165,19 @@ fn resource_change_affects_topology(change: &ResourceChange) -> bool {
     }
 }
 
+fn resource_kind_affects_attention(resource: ResourceKind) -> bool {
+    matches!(resource, ResourceKind::Notification | ResourceKind::Agent)
+}
+
+fn resource_change_affects_attention(change: &ResourceChange) -> bool {
+    match change {
+        ResourceChange::Upsert { resource, .. } | ResourceChange::Delete { resource, .. } => {
+            resource_kind_affects_attention(*resource)
+        }
+        ResourceChange::Unknown { .. } => false,
+    }
+}
+
 fn session_event_affects_topology(event: &SessionEvent) -> bool {
     match event {
         SessionEvent::Snapshot(_) => true,
@@ -189,6 +204,7 @@ pub enum Update {
         message: String,
     },
     Workspaces(Vec<WorkspaceEntry>),
+    Attention(AttentionState),
     Attached {
         terminal: TerminalId,
     },
@@ -254,6 +270,7 @@ pub enum Input {
     FocusScreen {
         workspace: WorkspaceId,
         screen: ScreenId,
+        target: Option<TerminalId>,
     },
     RenameScreen {
         workspace: WorkspaceId,
@@ -339,7 +356,15 @@ pub struct WorkspaceEntry {
     pub color: Option<String>,
     pub focused: bool,
     pub terminals: Vec<TerminalId>,
+    pub screens: Vec<ScreenEntry>,
     pub view: Option<WorkspaceView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenEntry {
+    pub id: ScreenId,
+    pub terminals: Vec<TerminalId>,
+    pub active_terminal: Option<TerminalId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -783,10 +808,17 @@ fn start_runtime(
     let (input_tx, input_rx) = mpsc::channel::<Input>();
     let (control_tx, control_rx) = mpsc::channel::<Control>();
     let (session_event_stop_tx, session_event_stop_rx) = mpsc::channel();
+    let (attention_clear_tx, attention_clear_rx) = mpsc::channel();
     let control_client = client.clone();
     let control_updates = sink.clone();
-    let control_join =
-        thread::spawn(move || control_loop(control_client, control_updates, input_rx));
+    let control_join = thread::spawn(move || {
+        control_loop(
+            control_client,
+            control_updates,
+            input_rx,
+            attention_clear_tx,
+        )
+    });
     let session_event_client = client.clone();
     let session_event_updates = sink.clone();
     let session_event_runtime_events = runtime_events.clone();
@@ -796,6 +828,7 @@ fn start_runtime(
             session_events,
             session_event_updates,
             session_event_stop_rx,
+            attention_clear_rx,
             generation,
             session_event_runtime_events,
         )
@@ -833,10 +866,14 @@ fn session_event_loop(
     mut stream: SessionEventStream,
     updates: UpdateSink,
     stop: mpsc::Receiver<()>,
+    attention_clears: mpsc::Receiver<TerminalId>,
     generation: u64,
     runtime_events: mpsc::Sender<SupervisorCommand>,
 ) {
     let mut refreshes = TopologyRefreshSchedule::new(TOPOLOGY_REFRESH_INTERVAL);
+    let mut notifications = HashMap::<NotificationId, NotificationSnapshot>::new();
+    let mut agents = HashMap::<AgentId, AgentSnapshot>::new();
+    let mut published_attention = None;
 
     loop {
         if session_event_stop_requested(&stop) {
@@ -847,10 +884,20 @@ fn session_event_loop(
         if refreshes.take_due(now) {
             publish_event_topology(&client, &updates, &mut refreshes);
         }
+        let mut cleared = false;
+        while let Ok(terminal) = attention_clears.try_recv() {
+            cleared |= clear_terminal_notifications(&mut notifications, &terminal);
+        }
+        if cleared {
+            publish_attention(&notifications, &agents, &mut published_attention, &updates);
+        }
 
         let timeout = refreshes.poll_timeout(Instant::now(), POLL_INTERVAL);
         match stream.next_timeout(timeout) {
             Ok(StreamPoll::Item(item)) => {
+                if apply_attention_event(&item.value, &mut notifications, &mut agents) {
+                    publish_attention(&notifications, &agents, &mut published_attention, &updates);
+                }
                 if session_event_affects_topology(&item.value) && refreshes.request(Instant::now())
                 {
                     if session_event_stop_requested(&stop) {
@@ -876,6 +923,111 @@ fn session_event_loop(
             }
         }
     }
+}
+
+fn apply_attention_event(
+    event: &SessionEvent,
+    notifications: &mut HashMap<NotificationId, NotificationSnapshot>,
+    agents: &mut HashMap<AgentId, AgentSnapshot>,
+) -> bool {
+    match event {
+        SessionEvent::Snapshot(event) => {
+            notifications.clear();
+            notifications.extend(
+                event
+                    .snapshot
+                    .notifications
+                    .iter()
+                    .cloned()
+                    .map(|notification| (notification.id.clone(), notification)),
+            );
+            agents.clear();
+            agents.extend(
+                event
+                    .snapshot
+                    .agents
+                    .iter()
+                    .cloned()
+                    .map(|agent| (agent.id.clone(), agent)),
+            );
+            true
+        }
+        SessionEvent::Delta(delta) => {
+            let mut affected = false;
+            for change in &delta.changes {
+                affected |= apply_attention_change(change, notifications, agents);
+            }
+            affected
+        }
+        SessionEvent::Unknown { .. } => false,
+    }
+}
+
+fn apply_attention_change(
+    change: &ResourceChange,
+    notifications: &mut HashMap<NotificationId, NotificationSnapshot>,
+    agents: &mut HashMap<AgentId, AgentSnapshot>,
+) -> bool {
+    if !resource_change_affects_attention(change) {
+        return false;
+    }
+    match change {
+        ResourceChange::Upsert {
+            resource: ResourceKind::Notification,
+            value: ResourceEntitySnapshot::Notification(notification),
+            ..
+        } => {
+            notifications.insert(notification.id.clone(), notification.clone());
+            true
+        }
+        ResourceChange::Upsert {
+            resource: ResourceKind::Agent,
+            value: ResourceEntitySnapshot::Agent(agent),
+            ..
+        } => {
+            agents.insert(agent.id.clone(), agent.clone());
+            true
+        }
+        ResourceChange::Delete {
+            resource: ResourceKind::Notification,
+            id: ResourceReference::Notification(notification),
+            ..
+        } => notifications.remove(notification).is_some(),
+        ResourceChange::Delete {
+            resource: ResourceKind::Agent,
+            id: ResourceReference::Agent(agent),
+            ..
+        } => agents.remove(agent).is_some(),
+        _ => false,
+    }
+}
+
+fn clear_terminal_notifications(
+    notifications: &mut HashMap<NotificationId, NotificationSnapshot>,
+    terminal: &TerminalId,
+) -> bool {
+    let mut changed = false;
+    for notification in notifications.values_mut() {
+        if notification.unread && notification.terminal_id.as_ref() == Some(terminal) {
+            notification.unread = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn publish_attention(
+    notifications: &HashMap<NotificationId, NotificationSnapshot>,
+    agents: &HashMap<AgentId, AgentSnapshot>,
+    published: &mut Option<AttentionState>,
+    updates: &UpdateSink,
+) {
+    let next = AttentionState::from_resources(notifications.values(), agents.values());
+    if published.as_ref() == Some(&next) {
+        return;
+    }
+    *published = Some(next.clone());
+    let _ = updates.send_blocking(Update::Attention(next));
 }
 
 fn session_event_stop_requested(stop: &mpsc::Receiver<()>) -> bool {
@@ -1328,7 +1480,12 @@ fn open_attachment(
     Ok(stream)
 }
 
-fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Input>) {
+fn control_loop(
+    client: Client,
+    updates: UpdateSink,
+    inputs: mpsc::Receiver<Input>,
+    attention_clears: mpsc::Sender<TerminalId>,
+) {
     let session = client.session(Selector::current());
     let mut target: Option<TerminalId> = None;
     let mut history_cache: HashMap<TerminalId, Vec<String>> = HashMap::new();
@@ -1392,6 +1549,8 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 if let Err(error) = session.workspace(Selector::id(workspace)).focus() {
                     let _ = updates
                         .send_blocking(Update::Error(format!("workspace focus failed: {error}")));
+                } else if let Some(terminal) = target.clone() {
+                    let _ = attention_clears.send(terminal);
                 }
             }
             Input::CreateWorkspace => {
@@ -1428,8 +1587,12 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                         .send_blocking(Update::Error(format!("screen creation failed: {error}")));
                 }
             }
-            Input::FocusScreen { workspace, screen } => {
-                target = None;
+            Input::FocusScreen {
+                workspace,
+                screen,
+                target: next,
+            } => {
+                target = next;
                 if let Err(error) = session
                     .workspace(Selector::id(workspace))
                     .screen(Selector::id(screen))
@@ -1437,6 +1600,8 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 {
                     let _ = updates
                         .send_blocking(Update::Error(format!("screen focus failed: {error}")));
+                } else if let Some(terminal) = target.clone() {
+                    let _ = attention_clears.send(terminal);
                 }
             }
             Input::RenameScreen {
@@ -1477,6 +1642,8 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 if let Err(error) = handle.focus() {
                     let _ =
                         updates.send_blocking(Update::Error(format!("pane focus failed: {error}")));
+                } else if let Some(terminal) = target.clone() {
+                    let _ = attention_clears.send(terminal);
                 }
             }
             Input::FocusTab {
@@ -1495,6 +1662,8 @@ fn control_loop(client: Client, updates: UpdateSink, inputs: mpsc::Receiver<Inpu
                 if let Err(error) = handle.focus() {
                     let _ =
                         updates.send_blocking(Update::Error(format!("tab focus failed: {error}")));
+                } else if let Some(terminal) = target.clone() {
+                    let _ = attention_clears.send(terminal);
                 }
             }
             Input::CreateTab {
@@ -1672,6 +1841,7 @@ fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), Strin
         let mut terminals = Vec::new();
         let mut views = Vec::new();
         let mut screen_tabs = Vec::new();
+        let mut screens = Vec::new();
 
         for screen_handle in workspace
             .screens()
@@ -1687,6 +1857,7 @@ fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), Strin
                 focused: screen_snapshot.focused,
             });
             let mut panes = Vec::new();
+            let mut screen_terminals = Vec::new();
             for pane_handle in screen_handle
                 .panes()
                 .map_err(|error| format!("could not list panes: {error}"))?
@@ -1706,6 +1877,9 @@ fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), Strin
                         TabContentId::Terminal(terminal) => {
                             if !terminals.contains(&terminal) {
                                 terminals.push(terminal.clone());
+                            }
+                            if !screen_terminals.contains(&terminal) {
+                                screen_terminals.push(terminal.clone());
                             }
                             TabContent::Terminal(terminal)
                         }
@@ -1735,16 +1909,27 @@ fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), Strin
                     tabs,
                 });
             }
-            views.push((
-                screen_snapshot.focused,
-                WorkspaceView {
-                    workspace_id: snapshot.id.clone(),
-                    screen_id: screen_snapshot.id,
-                    screen_tabs: Vec::new(),
-                    layout: screen_snapshot.layout,
-                    panes,
-                },
-            ));
+            let view = WorkspaceView {
+                workspace_id: snapshot.id.clone(),
+                screen_id: screen_snapshot.id.clone(),
+                screen_tabs: Vec::new(),
+                layout: screen_snapshot.layout,
+                panes,
+            };
+            let active_terminal = view.active_terminal().cloned();
+            if let Some(index) = active_terminal.as_ref().and_then(|active| {
+                screen_terminals
+                    .iter()
+                    .position(|terminal| terminal == active)
+            }) {
+                screen_terminals.swap(0, index);
+            }
+            screens.push(ScreenEntry {
+                id: screen_snapshot.id,
+                terminals: screen_terminals,
+                active_terminal,
+            });
+            views.push((screen_snapshot.focused, view));
         }
 
         screen_tabs.sort_by_key(|screen| screen.index);
@@ -1767,6 +1952,7 @@ fn publish_workspaces(client: &Client, updates: &UpdateSink) -> Result<(), Strin
             color,
             focused: snapshot.focused,
             terminals,
+            screens,
             view,
         });
     }
@@ -1791,13 +1977,14 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_socket_candidates, resource_change_affects_topology, resource_kind_affects_topology,
-        session_event_affects_topology, session_socket_path, RebuildPlan, RetrySchedule,
-        RoutedSender, SessionEntry, TopologyRefreshSchedule,
+        parse_socket_candidates, resource_change_affects_attention,
+        resource_change_affects_topology, resource_kind_affects_attention,
+        resource_kind_affects_topology, session_event_affects_topology, session_socket_path,
+        RebuildPlan, RetrySchedule, RoutedSender, SessionEntry, TopologyRefreshSchedule,
     };
     use cmux::{
-        Cursor, Document, MachineId, ResourceChange, ResourceKind, ResourceReference,
-        SessionDeltaEvent, SessionEvent, WorkspaceId,
+        AgentId, Cursor, Document, MachineId, NotificationId, ResourceChange, ResourceKind,
+        ResourceReference, SessionDeltaEvent, SessionEvent, WorkspaceId,
     };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
@@ -1917,6 +2104,32 @@ mod tests {
         ] {
             assert!(!resource_kind_affects_topology(resource));
         }
+    }
+
+    #[test]
+    fn attention_classification_is_separate_from_topology() {
+        let notification = ResourceChange::Delete {
+            sequence: 1,
+            resource: ResourceKind::Notification,
+            id: ResourceReference::Notification(
+                NotificationId::parse("notification_00000000000000000000000000000001").unwrap(),
+            ),
+        };
+        let agent = ResourceChange::Delete {
+            sequence: 2,
+            resource: ResourceKind::Agent,
+            id: ResourceReference::Agent(
+                AgentId::parse("agent_00000000000000000000000000000001").unwrap(),
+            ),
+        };
+
+        assert!(resource_kind_affects_attention(ResourceKind::Notification));
+        assert!(resource_kind_affects_attention(ResourceKind::Agent));
+        assert!(!resource_kind_affects_attention(ResourceKind::Tab));
+        assert!(resource_change_affects_attention(&notification));
+        assert!(resource_change_affects_attention(&agent));
+        assert!(!resource_change_affects_topology(&notification));
+        assert!(!resource_change_affects_topology(&agent));
     }
 
     #[test]

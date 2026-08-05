@@ -48,6 +48,7 @@ normally be terminal-emulation complexity stays server-side.
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | GTK application, window, sidebar, wiring |
+| `src/attention.rs` | pure notification severity and agent-state rollups by terminal |
 | `src/config.rs` | runtime chrome palette, TUI theme overrides and GTK font loading |
 | `src/search.rs` | case-insensitive scrollback matching, result navigation and pure search geometry |
 | `src/session.rs` | protocol worker supervisor, session socket enumeration and joined control/attachment runtimes; render payloads reach GTK without blocking it on a socket |
@@ -76,6 +77,8 @@ cargo run --release -- --probe --session main
 | Pane chrome | derived 1px separators with 6px resize hit regions, resize cursors, optional configured 2px active borders, and 70% dimming for inactive panes |
 | Screen tabs | workspace screens use an always-visible 28px strip with focused/unfocused states, hover close, middle-click close, double-click rename and a new-screen button in the upstream action-lane fade |
 | Pane tabs | each pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
+| Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
+| Agent state | terminal tabs show a static 9px task-status ring for working, blocked, idle and done reports |
 | Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
 | Workspaces | macOS-parity sidebar rows with switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
@@ -142,6 +145,9 @@ The GTK frontend honors these keys under `theme` in `cmux-tui.json`:
 - `prompt_border`
 - `prompt_input_bg`
 - `prompt_input_fg`
+- `notification_info`
+- `notification_warning`
+- `notification_error`
 
 Explicit theme colors take precedence over the parity defaults. In particular,
 the 2px active-pane border is off unless `border_active` is configured.
@@ -204,4 +210,11 @@ The following were checked against live sessions:
 
 ## Known gaps
 
-No remaining stage 2 gaps are currently tracked.
+The upstream 12-spoke activity spinner remains deliberately omitted. It needs
+an animation timer, while this pass keeps the static agent-state ring and the
+upstream no-animation geometry policy.
+
+The server clears a focused surface's in-memory unread marker after its
+resource focus publication and emits no notification lifecycle change. GTK
+therefore clears matching notification markers locally after a successful
+terminal focus; the next session snapshot remains the authoritative resync.

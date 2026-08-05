@@ -129,6 +129,7 @@ previous connection and surface the error through the existing toast path.
 | 1 | GTK4 window driven over `cmux.protocol/1`: workspace sidebar, terminal rendering, keyboard, resize, scrollback, selection | **done** - see [`../gui/README.md`](../gui/README.md) |
 | 2 | Parity pass: pane layouts, tabs, mouse input, themes, macOS visual parity and input behavior | **done** |
 | 3 | Package the GUI alongside the TUI | **done** - both frontends ship in the full `cmux` package |
+| 4 | Agent and notification awareness in GTK | **in progress** - tab/sidebar markers and static agent rings are implemented |
 
 The stage 2 work verified against live sessions includes pane splits with
 per-pane PTY sizing, tab strips, click-to-focus, mouse forwarding to terminal
@@ -188,6 +189,17 @@ with a guaranteed trailing publication. A failed non-atomic tree walk is
 re-armed for the next interval instead of tearing down the runtime, with an
 error reported after three consecutive failures. Stream end or error uses the
 existing supervisor teardown and rebuild path.
+
+Stage 4 derives a terminal-keyed attention model directly from notification
+and agent resources on that same session event stream. Unread severity rolls
+up from terminal tabs to screen tabs and workspace rows; agent reports drive a
+static task-status ring on terminal tabs. Snapshot events replace the resource
+maps and deltas update them in place, so attention changes add no protocol
+round-trips and never trigger a topology tree walk. The server clears a viewed
+surface only after publishing its focus resource change and does not publish a
+notification upsert for the new read state, so GTK clears that terminal's
+marker locally after a successful focus operation and trusts the next snapshot
+as the resync boundary.
 
 The GTK window chrome now follows the extracted upstream design contract in
 [`gtk-design-parity.md`](gtk-design-parity.md): a custom 28px titlebar, a

@@ -8,6 +8,7 @@
 //! and forwards input; it contains no VT parser and links no terminal
 //! emulation library.
 
+mod attention;
 mod config;
 mod screen;
 mod search;
@@ -15,6 +16,7 @@ mod session;
 mod view;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -623,9 +625,12 @@ fn populate_session_menu(
 #[allow(clippy::too_many_arguments)]
 fn reset_session_view(
     screens: &RefCell<ScreenSet>,
+    attention: &RefCell<attention::AttentionState>,
+    screen_terminals: &RefCell<HashMap<ScreenId, Vec<TerminalId>>>,
     entries: &RefCell<Vec<session::WorkspaceEntry>>,
     workspaces: &ListBox,
     drop_indicators: &RefCell<Vec<GtkBox>>,
+    attention_indicators: &RefCell<Vec<DrawingArea>>,
     search_state: &RefCell<search::SearchUiState>,
     search_bar: &GtkBox,
     search_entry: &Entry,
@@ -636,8 +641,11 @@ fn reset_session_view(
     terminal: &DrawingArea,
 ) {
     *screens.borrow_mut() = ScreenSet::default();
+    *attention.borrow_mut() = attention::AttentionState::default();
+    screen_terminals.borrow_mut().clear();
     entries.borrow_mut().clear();
     drop_indicators.borrow_mut().clear();
+    attention_indicators.borrow_mut().clear();
     workspaces.unselect_all();
     while let Some(child) = workspaces.first_child() {
         workspaces.remove(&child);
@@ -834,9 +842,11 @@ fn refresh_chrome(
 fn workspace_row(
     entry: &session::WorkspaceEntry,
     theme: Rc<view::Theme>,
+    attention: Rc<RefCell<attention::AttentionState>>,
     worker: Rc<Worker>,
     rename_prompt: Rc<RenamePrompt>,
     drop_indicators: Rc<RefCell<Vec<GtkBox>>>,
+    attention_indicators: Rc<RefCell<Vec<DrawingArea>>>,
     workspace_count: usize,
 ) -> ListBoxRow {
     let title = if entry.name.is_empty() {
@@ -853,6 +863,41 @@ fn workspace_row(
 
     let content = GtkBox::new(Orientation::Horizontal, 8);
     content.add_css_class("workspace-content");
+    let unread = DrawingArea::new();
+    unread.set_content_width(11);
+    unread.set_content_height(11);
+    unread.set_can_target(false);
+    unread.set_valign(Align::Center);
+    {
+        let attention = Rc::clone(&attention);
+        let terminals = entry.terminals.clone();
+        let theme = Rc::clone(&theme);
+        unread.set_draw_func(move |_, cr, width, height| {
+            let Some(level) =
+                attention::workspace_indicator(&attention.borrow(), &terminals).notification
+            else {
+                return;
+            };
+            let colors = theme.chrome();
+            let color = match level {
+                cmux::NotificationLevel::Info => colors.notification_info,
+                cmux::NotificationLevel::Warning => colors.notification_warning,
+                cmux::NotificationLevel::Error => colors.notification_error,
+            };
+            let (red, green, blue) = color.cairo();
+            cr.set_source_rgb(red, green, blue);
+            cr.arc(
+                f64::from(width) / 2.0,
+                f64::from(height) / 2.0,
+                3.0,
+                0.0,
+                std::f64::consts::TAU,
+            );
+            let _ = cr.fill();
+        });
+    }
+    content.append(&unread);
+    attention_indicators.borrow_mut().push(unread);
     content.append(&label);
     if entry.terminals.len() > 1 {
         let count = Label::new(Some(&entry.terminals.len().to_string()));
@@ -1036,6 +1081,8 @@ fn build_ui(application: &Application) {
     let args = parse_args();
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
+    let attention = Rc::new(RefCell::new(attention::AttentionState::default()));
+    let screen_terminals = Rc::new(RefCell::new(HashMap::new()));
     let entries: Rc<RefCell<Vec<session::WorkspaceEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let (update_tx, update_rx) = async_channel::unbounded::<StampedUpdate>();
     let worker = Rc::new(session::spawn(
@@ -1122,6 +1169,7 @@ fn build_ui(application: &Application) {
     workspaces.set_selection_mode(SelectionMode::Single);
     workspaces.add_css_class("workspace-list");
     let drop_indicators: Rc<RefCell<Vec<GtkBox>>> = Rc::new(RefCell::new(Vec::new()));
+    let attention_indicators: Rc<RefCell<Vec<DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
     let sidebar_scroll = ScrolledWindow::builder()
         .child(&workspaces)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -1134,6 +1182,8 @@ fn build_ui(application: &Application) {
     sidebar.add_overlay(&sidebar_scrims);
     let terminal = view::build(
         Rc::clone(&screens),
+        Rc::clone(&attention),
+        Rc::clone(&screen_terminals),
         Rc::clone(&theme),
         Rc::clone(&blink),
         Rc::clone(&tab_strip),
@@ -1870,6 +1920,7 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
+        let entries_for_click = Rc::clone(&entries);
         let theme = Rc::clone(&theme);
         let worker_for_release = Rc::clone(&worker);
         let screens_for_release = Rc::clone(&screens);
@@ -1957,9 +2008,19 @@ fn build_ui(application: &Application) {
                             }
                         }
                         view::ScreenBarHit::Tab(screen) if button_number == 1 => {
+                            let target = entries_for_click
+                                .borrow()
+                                .iter()
+                                .find(|entry| entry.id == workspace.workspace_id)
+                                .and_then(|entry| {
+                                    entry.screens.iter().find(|entry| entry.id == screen)
+                                })
+                                .and_then(|entry| entry.active_terminal.as_ref())
+                                .cloned();
                             let _ = worker.input.send(Input::FocusScreen {
                                 workspace: workspace.workspace_id.clone(),
                                 screen,
+                                target,
                             });
                         }
                         _ => {}
@@ -2398,6 +2459,8 @@ fn build_ui(application: &Application) {
     // --- updates ----------------------------------------------------------
     {
         let screens = Rc::clone(&screens);
+        let attention = Rc::clone(&attention);
+        let screen_terminals = Rc::clone(&screen_terminals);
         let terminal = terminal.clone();
         let toast = toast.clone();
         let workspaces = workspaces.clone();
@@ -2408,6 +2471,7 @@ fn build_ui(application: &Application) {
         let sidebar_scrims = sidebar_scrims.clone();
         let rename_prompt = Rc::clone(&rename_prompt);
         let drop_indicators = Rc::clone(&drop_indicators);
+        let attention_indicators = Rc::clone(&attention_indicators);
         let search_state = Rc::clone(&search_state);
         let search_count = search_count.clone();
         let search_bar = search_bar.clone();
@@ -2440,9 +2504,12 @@ fn build_ui(application: &Application) {
                     Update::Switching { session_name } => {
                         reset_session_view(
                             &screens,
+                            &attention,
+                            &screen_terminals,
                             &entries,
                             &workspaces,
                             &drop_indicators,
+                            &attention_indicators,
                             &search_state,
                             &search_bar,
                             &search_entry,
@@ -2460,9 +2527,12 @@ fn build_ui(application: &Application) {
                     } => {
                         reset_session_view(
                             &screens,
+                            &attention,
+                            &screen_terminals,
                             &entries,
                             &workspaces,
                             &drop_indicators,
+                            &attention_indicators,
                             &search_state,
                             &search_bar,
                             &search_entry,
@@ -2497,6 +2567,11 @@ fn build_ui(application: &Application) {
                     ),
                     Update::Workspaces(list) => {
                         let empty = list.is_empty();
+                        *screen_terminals.borrow_mut() = list
+                            .iter()
+                            .flat_map(|workspace| &workspace.screens)
+                            .map(|screen| (screen.id.clone(), screen.terminals.clone()))
+                            .collect();
                         let focused = list
                             .iter()
                             .find(|entry| entry.focused)
@@ -2505,6 +2580,7 @@ fn build_ui(application: &Application) {
                         let changed = *entries.borrow() != list;
                         if changed {
                             drop_indicators.borrow_mut().clear();
+                            attention_indicators.borrow_mut().clear();
                             while let Some(child) = workspaces.first_child() {
                                 workspaces.remove(&child);
                             }
@@ -2512,9 +2588,11 @@ fn build_ui(application: &Application) {
                                 let row = workspace_row(
                                     entry,
                                     Rc::clone(&theme),
+                                    Rc::clone(&attention),
                                     Rc::clone(&worker),
                                     Rc::clone(&rename_prompt),
                                     Rc::clone(&drop_indicators),
+                                    Rc::clone(&attention_indicators),
                                     list.len(),
                                 );
                                 workspaces.append(&row);
@@ -2559,6 +2637,13 @@ fn build_ui(application: &Application) {
                         }
                         terminal.queue_draw();
                     }
+                    Update::Attention(next) => {
+                        *attention.borrow_mut() = next;
+                        terminal.queue_draw();
+                        for indicator in attention_indicators.borrow().iter() {
+                            indicator.queue_draw();
+                        }
+                    }
                     Update::Attached { terminal: id } => {
                         eprintln!("viewer attached to {id:?}");
                         clear_toast(&toast);
@@ -2590,7 +2675,8 @@ fn build_ui(application: &Application) {
                         render,
                     } => {
                         if screens.borrow().contains_terminal(&id) {
-                            match screens.borrow_mut().apply_patch(&id, *render) {
+                            let result = screens.borrow_mut().apply_patch(&id, *render);
+                            match result {
                                 Ok(()) => {
                                     refresh_chrome(
                                         &screens.borrow(),

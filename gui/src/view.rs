@@ -10,14 +10,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use cmux::{
-    ColorHex, LayoutDirection, LayoutNode, LayoutViewport, PaneId, RenderCursorStyle,
-    RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline, ScreenId, Size,
-    SplitId, TabId, TerminalId,
+    AgentState, ColorHex, LayoutDirection, LayoutNode, LayoutViewport, NotificationLevel, PaneId,
+    RenderCursorStyle, RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline,
+    ScreenId, Size, SplitId, TabId, TerminalId,
 };
 use gtk4::pango;
 use gtk4::prelude::*;
 use gtk4::{gdk, gdk_pixbuf, DrawingArea};
 
+use crate::attention::{self, AttentionIndicator, AttentionState};
 use crate::config::{
     ChromeColors, ChromeMode, Rgb, Settings, ThemeOverrides, DEFAULT_DARK_BACKGROUND,
     DEFAULT_LIGHT_BACKGROUND,
@@ -29,6 +30,8 @@ const TAB_HEIGHT: f64 = 28.0;
 const TAB_FADE_WIDTH: f64 = 100.0;
 const SCREEN_ACTION_WIDTH: f64 = 28.0;
 const SCREEN_CLOSE_SIZE: f64 = 20.0;
+const ATTENTION_SLOT_SIZE: f64 = 11.0;
+const NOTIFICATION_MARKER_SIZE: f64 = 11.0;
 const SIDEBAR_SCRIM_HEIGHT: f64 = 50.0;
 const UNFOCUSED_PANE_OPACITY: f64 = 0.70;
 const DIVIDER_HIT_SIZE: f64 = 6.0;
@@ -1167,6 +1170,8 @@ fn run_colors(
 
 pub fn build(
     screens: Rc<RefCell<ScreenSet>>,
+    attention: Rc<RefCell<AttentionState>>,
+    screen_terminals: Rc<RefCell<HashMap<ScreenId, Vec<TerminalId>>>>,
     theme: Rc<Theme>,
     blink: Rc<Cell<BlinkState>>,
     tab_strip: Rc<TabStripState>,
@@ -1186,6 +1191,8 @@ pub fn build(
         let _ = cr.paint();
 
         let screens = screens.borrow();
+        let attention = attention.borrow();
+        let screen_terminals = screen_terminals.borrow();
         let mut image_cache = image_cache.borrow_mut();
         image_cache.retain(|(terminal, image_id, generation), _| {
             screens
@@ -1272,6 +1279,7 @@ pub fn build(
                     &chrome,
                     blink.get().window_active(),
                     tab_strip.hovered_tab().as_ref(),
+                    &attention,
                 );
             }
             let focused = geometry.pane == workspace.layout.active_pane_id;
@@ -1305,6 +1313,8 @@ pub fn build(
                 tab_strip.hovered_screen().as_ref(),
                 &chrome,
                 blink.get().window_active(),
+                &attention,
+                &screen_terminals,
             );
         }
     });
@@ -1389,6 +1399,8 @@ fn draw_screen_bar(
     hovered: Option<&ScreenId>,
     colors: &ChromeColors,
     window_active: bool,
+    attention: &AttentionState,
+    screen_terminals: &HashMap<ScreenId, Vec<TerminalId>>,
 ) {
     let background = if colors.tab_bar_is_opaque {
         colors.tab_bar_background
@@ -1425,11 +1437,12 @@ fn draw_screen_bar(
         }
 
         let close_visible = hovered == Some(&screen.id);
-        let trailing = if close_visible {
-            SCREEN_CLOSE_SIZE + 6.0
-        } else {
-            8.0
-        };
+        let indicator = screen_terminals
+            .get(&screen.id)
+            .map_or_else(AttentionIndicator::default, |terminals| {
+                attention::screen_indicator(attention, terminals)
+            });
+        let trailing = screen_tab_trailing_width(close_visible, indicator);
         layout.set_width(
             ((hit.rect.width - trailing - 8.0).max(1.0) * f64::from(pango::SCALE)) as i32,
         );
@@ -1456,7 +1469,24 @@ fn draw_screen_bar(
         cr.move_to(hit.rect.x + 8.0, text_y);
         pangocairo::functions::show_layout(cr, &layout);
 
+        let indicator_right = hit.rect.x + hit.rect.width
+            - if close_visible {
+                SCREEN_CLOSE_SIZE + 6.0
+            } else {
+                8.0
+            };
+        if let Some(level) = indicator.notification {
+            draw_notification_marker(
+                area,
+                cr,
+                indicator_right - ATTENTION_SLOT_SIZE / 2.0,
+                hit.rect.y + hit.rect.height / 2.0,
+                notification_color(colors, level),
+            );
+        }
+
         if close_visible {
+            cr.set_source_rgb(red, green, blue);
             let center_x = hit.close_rect.x + hit.close_rect.width / 2.0;
             let center_y = hit.close_rect.y + hit.close_rect.height / 2.0;
             cr.set_line_width(1.25);
@@ -1527,12 +1557,82 @@ pub fn build_sidebar_scrims(theme: Rc<Theme>) -> DrawingArea {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TaskStatus {
     Neutral,
     Running,
     Attention,
     Done,
+}
+
+fn task_status(state: AgentState) -> Option<TaskStatus> {
+    match state {
+        AgentState::Working => Some(TaskStatus::Running),
+        AgentState::Blocked => Some(TaskStatus::Attention),
+        AgentState::Idle => Some(TaskStatus::Neutral),
+        AgentState::Done => Some(TaskStatus::Done),
+        AgentState::Unknown => None,
+    }
+}
+
+fn notification_color(colors: &ChromeColors, level: NotificationLevel) -> Rgb {
+    match level {
+        NotificationLevel::Info => colors.notification_info,
+        NotificationLevel::Warning => colors.notification_warning,
+        NotificationLevel::Error => colors.notification_error,
+    }
+}
+
+fn pane_tab_trailing_width(close_visible: bool, indicator: AttentionIndicator) -> f64 {
+    let base = if close_visible {
+        SCREEN_CLOSE_SIZE + 6.0
+    } else {
+        6.0
+    };
+    let notification = if indicator.notification.is_some() {
+        ATTENTION_SLOT_SIZE
+    } else {
+        0.0
+    };
+    let agent = if indicator.agent.and_then(task_status).is_some() {
+        ATTENTION_SLOT_SIZE
+    } else {
+        0.0
+    };
+    base + notification + agent
+}
+
+fn screen_tab_trailing_width(close_visible: bool, indicator: AttentionIndicator) -> f64 {
+    let base = if close_visible {
+        SCREEN_CLOSE_SIZE + 6.0
+    } else {
+        8.0
+    };
+    base + if indicator.notification.is_some() {
+        ATTENTION_SLOT_SIZE
+    } else {
+        0.0
+    }
+}
+
+fn draw_notification_marker(
+    area: &DrawingArea,
+    cr: &gtk4::cairo::Context,
+    center_x: f64,
+    center_y: f64,
+    color: Rgb,
+) {
+    let layout = area.create_pango_layout(Some("\u{2022}"));
+    let mut font = pango::FontDescription::from_string("Sans");
+    font.set_absolute_size(NOTIFICATION_MARKER_SIZE * f64::from(pango::SCALE));
+    layout.set_font_description(Some(&font));
+    let (_, logical) = layout.pixel_extents();
+    let (red, green, blue) = color.cairo();
+    cr.set_source_rgb(red, green, blue);
+    cr.move_to(
+        center_x - f64::from(logical.width()) / 2.0 - f64::from(logical.x()),
+        center_y - f64::from(logical.height()) / 2.0 - f64::from(logical.y()),
+    );
+    pangocairo::functions::show_layout(cr, &layout);
 }
 
 #[allow(dead_code)]
@@ -1546,6 +1646,7 @@ pub fn draw_spokes_spinner(
     let (red, green, blue) = foreground.cairo();
     cr.set_line_width(1.25);
     cr.set_line_cap(gtk4::cairo::LineCap::Round);
+    cr.new_path();
     for spoke in 0..12 {
         let angle = std::f64::consts::TAU * spoke as f64 / 12.0;
         let age = (spoke + 12 - phase % 12) % 12;
@@ -1557,7 +1658,6 @@ pub fn draw_spokes_spinner(
     }
 }
 
-#[allow(dead_code)]
 pub fn draw_task_status_ring(
     cr: &gtk4::cairo::Context,
     center_x: f64,
@@ -1574,6 +1674,7 @@ pub fn draw_task_status_ring(
     let (red, green, blue) = color.cairo();
     cr.set_source_rgba(red, green, blue, alpha);
     cr.set_line_width(1.5);
+    cr.new_path();
     cr.arc(center_x, center_y, 3.75, 0.0, std::f64::consts::TAU);
     let _ = cr.stroke();
 }
@@ -2032,6 +2133,7 @@ fn draw_tabs(
     colors: &ChromeColors,
     window_active: bool,
     hovered: Option<&(PaneId, TabId)>,
+    attention: &AttentionState,
 ) {
     let Some(pane) = pane else { return };
     let layout = area.create_pango_layout(None);
@@ -2065,11 +2167,8 @@ fn draw_tabs(
         }
         let close_visible =
             hovered.is_some_and(|(pane_id, tab_id)| pane_id == &geometry.pane && tab_id == &tab.id);
-        let trailing = if close_visible {
-            SCREEN_CLOSE_SIZE + 6.0
-        } else {
-            6.0
-        };
+        let indicator = attention::tab_indicator(attention, &tab.content);
+        let trailing = pane_tab_trailing_width(close_visible, indicator);
         layout.set_width(
             ((hit.rect.width - trailing - 6.0).max(1.0) * f64::from(pango::SCALE)) as i32,
         );
@@ -2096,7 +2195,34 @@ fn draw_tabs(
             - f64::from(logical.y());
         cr.move_to(hit.rect.x + 6.0, text_y);
         pangocairo::functions::show_layout(cr, &layout);
+
+        let mut indicator_right = hit.rect.x + hit.rect.width
+            - if close_visible {
+                SCREEN_CLOSE_SIZE + 6.0
+            } else {
+                6.0
+            };
+        if let Some(status) = indicator.agent.and_then(task_status) {
+            draw_task_status_ring(
+                cr,
+                indicator_right - ATTENTION_SLOT_SIZE / 2.0,
+                hit.rect.y + hit.rect.height / 2.0,
+                status,
+                colors,
+            );
+            indicator_right -= ATTENTION_SLOT_SIZE;
+        }
+        if let Some(level) = indicator.notification {
+            draw_notification_marker(
+                area,
+                cr,
+                indicator_right - ATTENTION_SLOT_SIZE / 2.0,
+                hit.rect.y + hit.rect.height / 2.0,
+                notification_color(colors, level),
+            );
+        }
         if close_visible {
+            cr.set_source_rgb(red, green, blue);
             let center_x = hit.close_rect.x + hit.close_rect.width / 2.0;
             let center_y = hit.close_rect.y + hit.close_rect.height / 2.0;
             cr.set_line_width(1.25);
@@ -2555,7 +2681,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_strip_is_always_28_points_and_exposes_browser_hitbox() {
+    fn tab_strip_is_always_28_pixels_and_exposes_browser_hitbox() {
         let screens = split_workspace(true);
         let metrics = CellMetrics {
             width: 10.0,
@@ -2568,6 +2694,16 @@ mod tests {
         assert_eq!(panes[0].tabs[1].terminal, None);
         assert!(panes[0].tabs[1].rect.contains(375.0, 38.0));
         assert_eq!(panes[0].new_tab_button.unwrap().width, 28.0);
+        assert_eq!(
+            pane_tab_trailing_width(
+                false,
+                AttentionIndicator {
+                    notification: Some(NotificationLevel::Error),
+                    agent: Some(AgentState::Working),
+                },
+            ),
+            28.0
+        );
         assert_eq!(pane_bar_hit(&panes[0], 486.0, 38.0), Some(PaneBarHit::New));
         let second_close = panes[0].tabs[1].close_rect;
         assert_eq!(
@@ -2599,6 +2735,16 @@ mod tests {
         assert_eq!(geometry.new_button.width, 28.0);
         assert_eq!(geometry.tabs.len(), 2);
         assert_eq!(geometry.tabs[0].rect.width, 200.0);
+        assert_eq!(
+            screen_tab_trailing_width(
+                false,
+                AttentionIndicator {
+                    notification: Some(NotificationLevel::Warning),
+                    agent: None,
+                },
+            ),
+            19.0
+        );
         assert_eq!(
             screen_bar_hit(&geometry, 414.0, 14.0),
             Some(ScreenBarHit::New)

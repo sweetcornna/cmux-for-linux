@@ -141,3 +141,30 @@ required by `spec/resource-operations-v1.json`, so no spec or catalog
 fingerprint changes are needed. This affects any protocol client consuming
 session resource events or typed `terminal.move` results, not just this fork,
 and is worth reporting upstream.
+
+## 0006 — align CLI resource enums with the protocol spec
+
+The CLI validated notification levels and agent states against vocabularies
+that disagree with the public resource schema. It accepted notification level
+`success` and agent states `running`, `waiting` and `error`, but the server
+rejects those values with:
+
+```
+value is outside the allowed enum
+```
+
+Reproduce without the patch:
+
+```bash
+cmux agent report --terminal <terminal-id> --state running --source socket
+cmux notification create --title status --body updated --level success --terminal <terminal-id>
+```
+
+`spec/resource-operations-v1.json` defines `AgentState` as `working`,
+`blocked`, `idle`, `done` or `unknown`, and `NotificationLevel` as `info`,
+`warning` or `error`. The patch makes both CLI validators use those exact
+enums and adds parser coverage for every canonical value and the rejected
+legacy spellings.
+
+This affects any CLI user reporting agent state or creating notifications,
+not just this fork, and is worth reporting upstream.

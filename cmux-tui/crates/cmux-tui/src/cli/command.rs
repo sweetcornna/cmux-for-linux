@@ -1120,7 +1120,7 @@ fn parse_notification(words: &[String], flags: &mut Flags) -> Result<CommandPlan
             params.insert("title".into(), Value::String(title));
             params.insert("body".into(), Value::String(flags.required("body")?));
             if let Some(level) = flags.take("level") {
-                validate_one_of("--level", &level, &["info", "success", "warning", "error"])?;
+                validate_one_of("--level", &level, &["info", "warning", "error"])?;
                 params.insert("level".into(), Value::String(level));
             }
             if let Some(terminal) = flags.take("terminal") {
@@ -1146,7 +1146,7 @@ fn parse_agent(words: &[String], flags: &mut Flags) -> Result<CommandPlan, Usage
                 validate_one_of(
                     "--state",
                     &state,
-                    &["idle", "running", "waiting", "done", "error"],
+                    &["working", "blocked", "idle", "done", "unknown"],
                 )?;
                 params.insert("state".into(), Value::String(state));
             }
@@ -1156,7 +1156,7 @@ fn parse_agent(words: &[String], flags: &mut Flags) -> Result<CommandPlan, Usage
             let terminal = flags.required("terminal")?;
             validate_prefixed_id("terminal", "term", &terminal)?;
             let state = flags.required("state")?;
-            validate_one_of("--state", &state, &["idle", "running", "waiting", "done", "error"])?;
+            validate_one_of("--state", &state, &["working", "blocked", "idle", "done", "unknown"])?;
             let source = flags.required("source")?;
             validate_one_of("--source", &source, &["hook", "socket"])?;
             let mut params = json!({
@@ -2524,6 +2524,73 @@ mod tests {
     }
 
     #[test]
+    fn resource_enum_flags_match_the_protocol_catalog() {
+        const TERMINAL: &str = "term_00000000000000000000000000000008";
+
+        for level in ["info", "warning", "error"] {
+            let plan = protocol(&[
+                "notification",
+                "create",
+                "--title",
+                "status",
+                "--body",
+                "updated",
+                "--level",
+                level,
+                "--terminal",
+                TERMINAL,
+            ]);
+            assert_eq!(plan.params["level"], level);
+        }
+        assert!(
+            parse(&strings(&[
+                "notification",
+                "create",
+                "--title",
+                "status",
+                "--body",
+                "updated",
+                "--level",
+                "success",
+            ]))
+            .is_err()
+        );
+
+        for state in ["working", "blocked", "idle", "done", "unknown"] {
+            let list = protocol(&["agent", "list", "--terminal", TERMINAL, "--state", state]);
+            assert_eq!(list.params["state"], state);
+
+            let report = protocol(&[
+                "agent",
+                "report",
+                "--terminal",
+                TERMINAL,
+                "--state",
+                state,
+                "--source",
+                "socket",
+            ]);
+            assert_eq!(report.params["state"], state);
+        }
+        for state in ["running", "waiting", "error"] {
+            assert!(
+                parse(&strings(&[
+                    "agent",
+                    "report",
+                    "--terminal",
+                    TERMINAL,
+                    "--state",
+                    state,
+                    "--source",
+                    "socket",
+                ]))
+                .is_err(),
+                "legacy state {state:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn idempotency_is_only_for_mutations() {
         let mutation = protocol(&["workspace", "create"]);
         assert_eq!(mutation.operation.class(), OperationClass::Mutation);
@@ -3167,13 +3234,13 @@ mod tests {
                     "--body",
                     "tests passed",
                     "--level",
-                    "success",
+                    "warning",
                     "--terminal",
                     TERMINAL,
                 ],
                 "notification.create",
             ),
-            (vec!["agent", "list", "--terminal", TERMINAL, "--state", "running"], "agent.list"),
+            (vec!["agent", "list", "--terminal", TERMINAL, "--state", "blocked"], "agent.list"),
             (
                 vec![
                     "agent",
@@ -3181,7 +3248,7 @@ mod tests {
                     "--terminal",
                     TERMINAL,
                     "--state",
-                    "running",
+                    "working",
                     "--source",
                     "socket",
                     "--source-session",

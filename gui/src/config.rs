@@ -15,6 +15,9 @@ pub const DEFAULT_LIGHT_BACKGROUND: Rgb = Rgb(0xfe, 0xff, 0xff);
 pub const DEFAULT_CURSOR: Rgb = Rgb(0x98, 0x98, 0x9d);
 pub const DEFAULT_DARK_SELECTION_BACKGROUND: Rgb = Rgb(0x3f, 0x63, 0x8b);
 pub const DEFAULT_LIGHT_SELECTION_BACKGROUND: Rgb = Rgb(0xab, 0xd8, 0xff);
+pub const DEFAULT_NOTIFICATION_INFO: Rgb = Rgb(0x87, 0xaf, 0xd7);
+pub const DEFAULT_NOTIFICATION_WARNING: Rgb = Rgb(0xd7, 0xaf, 0x5f);
+pub const DEFAULT_NOTIFICATION_ERROR: Rgb = Rgb(0xd7, 0x5f, 0x5f);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -62,6 +65,9 @@ pub struct ThemeOverrides {
     pub prompt_border: Option<Rgb>,
     pub prompt_input_background: Option<Rgb>,
     pub prompt_input_foreground: Option<Rgb>,
+    pub notification_info: Option<Rgb>,
+    pub notification_warning: Option<Rgb>,
+    pub notification_error: Option<Rgb>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +130,9 @@ pub struct ChromeColors {
     pub prompt_border: Rgb,
     pub prompt_input_background: Rgb,
     pub prompt_input_foreground: Rgb,
+    pub notification_info: Rgb,
+    pub notification_warning: Rgb,
+    pub notification_error: Rgb,
     pub workspace_rail: Option<Rgb>,
     pub is_light: bool,
 }
@@ -186,6 +195,15 @@ impl ChromeColors {
                 prompt_input_foreground: overrides
                     .prompt_input_foreground
                     .unwrap_or(Rgb(0x1c, 0x1c, 0x1c)),
+                notification_info: overrides
+                    .notification_info
+                    .unwrap_or(DEFAULT_NOTIFICATION_INFO),
+                notification_warning: overrides
+                    .notification_warning
+                    .unwrap_or(DEFAULT_NOTIFICATION_WARNING),
+                notification_error: overrides
+                    .notification_error
+                    .unwrap_or(DEFAULT_NOTIFICATION_ERROR),
                 workspace_rail: overrides.sidebar_rail,
                 is_light,
             }
@@ -234,6 +252,15 @@ impl ChromeColors {
                 prompt_input_foreground: overrides
                     .prompt_input_foreground
                     .unwrap_or(Rgb(0xee, 0xee, 0xee)),
+                notification_info: overrides
+                    .notification_info
+                    .unwrap_or(DEFAULT_NOTIFICATION_INFO),
+                notification_warning: overrides
+                    .notification_warning
+                    .unwrap_or(DEFAULT_NOTIFICATION_WARNING),
+                notification_error: overrides
+                    .notification_error
+                    .unwrap_or(DEFAULT_NOTIFICATION_ERROR),
                 workspace_rail: overrides.sidebar_rail,
                 is_light,
             }
@@ -824,6 +851,18 @@ fn apply_tui_theme(settings: &mut Settings, document: &Value) {
         theme.get("prompt_input_fg"),
         &mut settings.theme.prompt_input_foreground,
     );
+    apply_optional_color(
+        theme.get("notification_info"),
+        &mut settings.theme.notification_info,
+    );
+    apply_optional_color(
+        theme.get("notification_warning"),
+        &mut settings.theme.notification_warning,
+    );
+    apply_optional_color(
+        theme.get("notification_error"),
+        &mut settings.theme.notification_error,
+    );
 }
 
 fn apply_gtk_config(settings: &mut Settings, document: &Value) {
@@ -1025,6 +1064,9 @@ mod tests {
                 "border_inactive": 999,
                 "selection_background": false,
                 "selection_foreground": "196",
+                "notification_info": 110,
+                "notification_warning": "179",
+                "notification_error": false,
                 "future_tui_key": {"anything": true}
             },
             "unknown_section": [1, 2, 3]
@@ -1037,6 +1079,15 @@ mod tests {
             settings.theme.selection_foreground,
             Some(Some(Rgb(255, 0, 0)))
         );
+        assert_eq!(
+            settings.theme.notification_info,
+            Some(DEFAULT_NOTIFICATION_INFO)
+        );
+        assert_eq!(
+            settings.theme.notification_warning,
+            Some(DEFAULT_NOTIFICATION_WARNING)
+        );
+        assert_eq!(settings.theme.notification_error, None);
     }
 
     #[test]
@@ -1077,6 +1128,9 @@ mod tests {
         assert_eq!(colors.pane_separator.alpha, 1.0);
         assert_eq!(colors.tab_active_background, Rgb(7, 8, 9));
         assert_eq!(colors.tab_active_unfocused_background, Rgb(7, 8, 9));
+        assert_eq!(colors.notification_info, DEFAULT_NOTIFICATION_INFO);
+        assert_eq!(colors.notification_warning, DEFAULT_NOTIFICATION_WARNING);
+        assert_eq!(colors.notification_error, DEFAULT_NOTIFICATION_ERROR);
     }
 
     #[test]
