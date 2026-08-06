@@ -91,6 +91,9 @@ chmod 0644 "$work/DEBIAN/md5sums"
 cat > "$work/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
+if [ "$1" = configure ] && [ -n "$2" ]; then
+  printf '%s\n' 'cmux: sessions already running keep using the previous binary until restarted.' || true
+fi
 if [ "$1" = configure ]; then
   if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications || true

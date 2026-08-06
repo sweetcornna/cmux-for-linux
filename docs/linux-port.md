@@ -300,6 +300,21 @@ the public typed render decoder instead of discarding it. Patch 0005 makes tab
 and terminal resource-event values satisfy their existing public snapshot
 schemas; it changes no spec field or catalog fingerprint.
 
+Packaging added one more. A terminal host is spawned through
+`std::env::current_exe()`, and Linux answers `/proc/self/exe` with the original
+path plus a ` (deleted)` suffix once the file behind a running process has been
+replaced. A session that was running during a package upgrade could therefore
+never start another terminal - new tabs, new panes and the file-manager menu
+all failed with `spawn terminal-host process` - until it was restarted. Patch
+0008 resolves that path in order: the running executable while it exists, then
+the replacement at the same install path, then `cmux-tui` on `PATH`, keeping
+the original path when nothing exists so the spawn error stays truthful.
+Verified by replacing a running daemon's binary in place: patched creates panes
+as usual, unpatched reproduces the failure exactly. `cmux-open-here` recognises
+that message and prints the restart command for the session rather than a
+generic failure, and the `.deb` says on upgrade that running sessions keep the
+previous binary until restarted.
+
 ## Tracking upstream
 
 Because this fork deleted most of the upstream tree, `git rebase upstream/main`

@@ -195,3 +195,41 @@ test also covers the production path, which reaches this fallback whenever
 
 Any consumer of this crate on a host without `XDG_RUNTIME_DIR` hits the same
 missing directory, so this is worth reporting upstream.
+
+## 0008 — resolve terminal hosts after in-place executable upgrades
+
+On Linux, replacing `/usr/bin/cmux-tui` while a headless daemon is running
+makes `/proc/<daemon-pid>/exe` point to `/usr/bin/cmux-tui (deleted)`. Every
+subsequent pane or tab creation in that session then fails with:
+
+```
+{"code":"operation.failed","details":{"extra":{"attempt":1,...},"operation":"pane.create",
+ "reason":"spawn terminal-host process"},"message":"spawn terminal-host process","retryable":false}
+```
+
+This is upstream's self-spawn path, not a packaging defect. Linux reports the
+deleted backing file through `current_exe()`, and `terminal_host_runtime.rs`
+passes that nonexistent path straight to `Command::new`. Atomic replacement
+is normal for package upgrades and can happen with any installer.
+
+The patch keeps the current executable in the normal case. When it no longer
+exists and ends in ` (deleted)`, it tries the same install path without that
+suffix, which now contains the upgraded binary. It then falls back to
+`cmux-tui` on `PATH` and finally to the original path so an unresolved spawn
+still reports the truthful filename. The terminal-host bootstrap handshake
+already reports a protocol version mismatch if the new binary is incompatible.
+
+Reproduce without the patch:
+
+```bash
+/usr/bin/cmux-tui --headless --session upgrade-repro &
+daemon_pid=$!
+sudo dpkg -i ./cmux_*.deb
+ls -l "/proc/$daemon_pid/exe"
+# ... -> /usr/bin/cmux-tui (deleted)
+/usr/bin/cmux-tui --session upgrade-repro pane create --cwd "$PWD" --json
+# ... "reason":"spawn terminal-host process" ...
+```
+
+Any Linux user who updates a running cmux-tui daemon can hit this, so it is
+worth reporting upstream.

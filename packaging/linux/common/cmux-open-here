@@ -126,9 +126,18 @@ create_workspace_here() {
   [ -n "$workspace_id" ] \
     || fail "cmux returned an incomplete empty workspace creation result"
 
-  pane_created="$("$cmux_bin" --session "$session" pane create \
-    --cwd "$dir" --json)" \
-    || fail "could not create a pane rooted at '$dir'"
+  if ! pane_created="$("$cmux_bin" --session "$session" pane create \
+    --cwd "$dir" --json 2>&1)"; then
+    case "$pane_created" in
+      *"spawn terminal-host process"*)
+        fail "cmux session '$session' is running an older cmux that was replaced on disk; restart it with:
+  cmux --session $session session current shutdown
+
+Terminals are re-adopted with their contents when the session restarts."
+        ;;
+    esac
+    fail "could not create a pane rooted at '$dir'"
+  fi
   pane_id="$(printf '%s' "$pane_created" \
     | sed -n 's/.*"pane_id":"\([^"]*\)".*/\1/p')"
   terminal_id="$(printf '%s' "$pane_created" \

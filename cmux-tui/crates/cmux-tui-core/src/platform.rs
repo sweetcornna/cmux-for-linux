@@ -644,6 +644,31 @@ pub fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+/// Executable to use when launching a terminal host.
+///
+/// Prefer the running executable while it still exists. After an in-place
+/// Linux upgrade, `/proc/self/exe` names the removed file with a ` (deleted)`
+/// suffix, so try the replacement at the same install path before PATH.
+/// Preserve the original path when no candidate exists so spawn reports it.
+pub fn host_binary() -> std::io::Result<PathBuf> {
+    let current_exe = std::env::current_exe()?;
+    Ok(existing_current_executable_path(&current_exe, Path::is_file)
+        .or_else(|| find_on_path(&["cmux-tui"]))
+        .unwrap_or(current_exe))
+}
+
+fn existing_current_executable_path(
+    current_exe: &Path,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if is_file(current_exe) {
+        return Some(current_exe.to_path_buf());
+    }
+    let replacement =
+        current_exe.to_str().and_then(|path| path.strip_suffix(" (deleted)")).map(Path::new)?;
+    is_file(replacement).then(|| replacement.to_path_buf())
+}
+
 #[cfg(not(windows))]
 fn runtime_base_dir() -> PathBuf {
     env_path("XDG_RUNTIME_DIR")
@@ -806,6 +831,23 @@ fn restrict_permissions(_path: &Path, _mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_binary_derives_replaced_executable_path() {
+        let current = Path::new("/opt/cmux/bin/cmux-tui");
+        assert_eq!(
+            existing_current_executable_path(current, |_| true),
+            Some(current.to_path_buf())
+        );
+
+        let deleted = Path::new("/usr/bin/cmux-tui (deleted)");
+        let replacement = Path::new("/usr/bin/cmux-tui");
+        assert_eq!(
+            existing_current_executable_path(deleted, |path| path == replacement),
+            Some(replacement.to_path_buf())
+        );
+        assert_eq!(existing_current_executable_path(deleted, |_| false), None);
+    }
 
     fn position(candidates: &[GhosttyInstallation], expected: impl AsRef<Path>) -> usize {
         let expected = expected.as_ref();

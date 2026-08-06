@@ -1536,7 +1536,7 @@ mod unix {
             kitty_graphics_limits,
         };
 
-        let binary = std::env::current_exe().context("resolve cmux-tui terminal-host binary")?;
+        let binary = crate::platform::host_binary().context("resolve terminal-host binary")?;
         let mut command = Command::new(binary);
         command
             .args(["__terminal-host", "--bootstrap-stdio"])
