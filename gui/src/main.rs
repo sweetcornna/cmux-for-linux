@@ -36,8 +36,10 @@ use gtk4::{
     WindowControls, WindowHandle,
 };
 
-use screen::ScreenSet;
-use session::{AttachmentSpec, Control, Input, SessionEntry, StampedUpdate, Update, Worker};
+use screen::{ScreenSet, TabContent};
+use session::{
+    AttachmentSpec, Control, Input, SessionEntry, StampedUpdate, TerminalStatus, Update, Worker,
+};
 
 const APP_ID: &str = "com.github.sweetcornna.cmux-gtk";
 const SCROLL_ROWS: i32 = 3;
@@ -45,6 +47,7 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const UPDATE_WATCHDOG_INTERVAL: Duration = BLINK_INTERVAL;
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_MAX_WIDTH: i32 = 600;
+const EXITED_INPUT_TOAST: &str = "This terminal has exited. Ctrl+B t opens a new tab.";
 
 struct MouseTarget {
     terminal: TerminalId,
@@ -84,6 +87,10 @@ fn trace_update(generation: u64, update: &Update) {
         Update::Attention(_) => {
             eprintln!("cmux-gtk trace: generation={generation} update=Attention")
         }
+        Update::TerminalStatuses(statuses) => eprintln!(
+            "cmux-gtk trace: generation={generation} update=TerminalStatuses count={}",
+            statuses.len()
+        ),
         Update::TerminalCwds(cwds) => eprintln!(
             "cmux-gtk trace: generation={generation} update=TerminalCwds count={}",
             cwds.len()
@@ -693,6 +700,7 @@ fn populate_session_menu(
 fn reset_session_view(
     screens: &RefCell<ScreenSet>,
     attention: &RefCell<attention::AttentionState>,
+    terminal_statuses: &RefCell<HashMap<TerminalId, TerminalStatus>>,
     terminal_cwds: &RefCell<HashMap<TerminalId, String>>,
     git_branches: &RefCell<HashMap<PathBuf, Option<String>>>,
     screen_terminals: &RefCell<HashMap<ScreenId, Vec<TerminalId>>>,
@@ -712,6 +720,7 @@ fn reset_session_view(
 ) {
     *screens.borrow_mut() = ScreenSet::default();
     *attention.borrow_mut() = attention::AttentionState::default();
+    terminal_statuses.borrow_mut().clear();
     terminal_cwds.borrow_mut().clear();
     git_branches.borrow_mut().clear();
     screen_terminals.borrow_mut().clear();
@@ -815,6 +824,79 @@ fn set_toast(toast: &Label, message: &str) {
 
 fn clear_toast(toast: &Label) {
     toast.set_visible(false);
+}
+
+fn terminal_has_exited(
+    statuses: &HashMap<TerminalId, TerminalStatus>,
+    terminal: &TerminalId,
+) -> bool {
+    matches!(statuses.get(terminal), Some(TerminalStatus::Exited { .. }))
+}
+
+fn send_input_unless_exited(
+    worker: &Worker,
+    statuses: &HashMap<TerminalId, TerminalStatus>,
+    terminal: Option<&TerminalId>,
+    input: Input,
+) -> bool {
+    if terminal.is_some_and(|terminal| terminal_has_exited(statuses, terminal)) {
+        return false;
+    }
+    let _ = worker.input.send(input);
+    true
+}
+
+fn send_input_or_notify_exited(
+    worker: &Worker,
+    statuses: &HashMap<TerminalId, TerminalStatus>,
+    terminal: Option<&TerminalId>,
+    toast: &Label,
+    input: Input,
+) {
+    if !send_input_unless_exited(worker, statuses, terminal, input) {
+        set_toast(toast, EXITED_INPUT_TOAST);
+    }
+}
+
+fn position_im_cursor(
+    im: &impl IsA<gtk4::IMContext>,
+    cursor_location: &Cell<Option<gdk::Rectangle>>,
+) {
+    if let Some(rectangle) = cursor_location.get() {
+        im.set_cursor_location(&rectangle);
+    }
+}
+
+fn refresh_preedit(
+    im: &impl IsA<gtk4::IMContext>,
+    preedit: &RefCell<Option<view::PreeditState>>,
+    cursor_location: &Cell<Option<gdk::Rectangle>>,
+    terminal: &DrawingArea,
+) {
+    position_im_cursor(im, cursor_location);
+    let (text, attributes, cursor_offset) = im.preedit_string();
+    *preedit.borrow_mut() = Some(view::PreeditState::new(
+        text.to_string(),
+        attributes,
+        cursor_offset,
+    ));
+    terminal.queue_draw();
+}
+
+fn clear_preedit(preedit: &RefCell<Option<view::PreeditState>>, terminal: &DrawingArea) {
+    preedit.borrow_mut().take();
+    terminal.queue_draw();
+}
+
+fn terminal_tab_name<'a>(screens: &'a ScreenSet, terminal: &TerminalId) -> Option<&'a str> {
+    screens
+        .workspace
+        .iter()
+        .flat_map(|workspace| &workspace.panes)
+        .flat_map(|pane| &pane.tabs)
+        .find(|tab| matches!(&tab.content, TabContent::Terminal(id) if id == terminal))
+        .and_then(|tab| tab.name.as_deref())
+        .filter(|name| !name.is_empty())
 }
 
 fn make_search_request(
@@ -1279,6 +1361,7 @@ fn build_ui(application: &Application) {
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let attention = Rc::new(RefCell::new(attention::AttentionState::default()));
+    let terminal_statuses = Rc::new(RefCell::new(HashMap::<TerminalId, TerminalStatus>::new()));
     let terminal_cwds = Rc::new(RefCell::new(HashMap::<TerminalId, String>::new()));
     let git_branches = Rc::new(RefCell::new(HashMap::<PathBuf, Option<String>>::new()));
     let home = Rc::new(
@@ -1300,6 +1383,8 @@ fn build_ui(application: &Application) {
     let tab_strip = Rc::new(view::TabStripState::default());
     let scrollbar = Rc::new(view::ScrollbarState::default());
     let search_state = Rc::new(RefCell::new(search::SearchUiState::default()));
+    let preedit = Rc::new(RefCell::new(None::<view::PreeditState>));
+    let im_cursor_location = Rc::new(Cell::new(None::<gdk::Rectangle>));
     let update_generation = Rc::new(Cell::new(0_u64));
     let current_session = Rc::new(RefCell::new(None::<SessionEntry>));
 
@@ -1392,12 +1477,15 @@ fn build_ui(application: &Application) {
     let view_handles = view::ViewHandles {
         screens: Rc::clone(&screens),
         attention: Rc::clone(&attention),
+        terminal_statuses: Rc::clone(&terminal_statuses),
         screen_terminals: Rc::clone(&screen_terminals),
         theme: Rc::clone(&theme),
         blink: Rc::clone(&blink),
         tab_strip: Rc::clone(&tab_strip),
         scrollbar: Rc::clone(&scrollbar),
         search_state: Rc::clone(&search_state),
+        preedit: Rc::clone(&preedit),
+        im_cursor_location: Rc::clone(&im_cursor_location),
     };
     let terminal = view::build(view_handles);
 
@@ -1654,85 +1742,73 @@ fn build_ui(application: &Application) {
 
     // --- keyboard ---------------------------------------------------------
     let key_controller = EventControllerKey::new();
+    let im = gtk4::IMMulticontext::new();
+    im.set_client_widget(Some(&terminal));
+    im.set_input_purpose(gtk4::InputPurpose::Terminal);
+    key_controller.set_im_context(Some(&im));
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
-        let terminal_for_keys = terminal.clone();
+        let terminal_statuses = Rc::clone(&terminal_statuses);
+        let preedit = Rc::clone(&preedit);
+        let terminal = terminal.clone();
+        let toast = toast.clone();
+        im.connect_commit(move |_, text| {
+            if let Some(screen) = screens.borrow_mut().focused_screen_mut() {
+                screen.clear_selection();
+            }
+            preedit.borrow_mut().take();
+            terminal.queue_draw();
+            let focused = screens.borrow().focused_terminal().cloned();
+            send_input_or_notify_exited(
+                &worker,
+                &terminal_statuses.borrow(),
+                focused.as_ref(),
+                &toast,
+                Input::Bytes(text.as_bytes().to_vec()),
+            );
+        });
+    }
+    {
+        let preedit = Rc::clone(&preedit);
+        let im_cursor_location = Rc::clone(&im_cursor_location);
+        let terminal = terminal.clone();
+        im.connect_preedit_start(move |im| {
+            refresh_preedit(im, &preedit, &im_cursor_location, &terminal);
+        });
+    }
+    {
+        let preedit = Rc::clone(&preedit);
+        let im_cursor_location = Rc::clone(&im_cursor_location);
+        let terminal = terminal.clone();
+        im.connect_preedit_changed(move |im| {
+            refresh_preedit(im, &preedit, &im_cursor_location, &terminal);
+        });
+    }
+    {
+        let preedit = Rc::clone(&preedit);
+        let im_cursor_location = Rc::clone(&im_cursor_location);
+        let terminal = terminal.clone();
+        im.connect_preedit_end(move |im| {
+            position_im_cursor(im, &im_cursor_location);
+            clear_preedit(&preedit, &terminal);
+        });
+    }
+
+    let prefix_controller = EventControllerKey::new();
+    prefix_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let terminal_statuses = Rc::clone(&terminal_statuses);
+        let terminal_for_prefix = terminal.clone();
         let toast = toast.clone();
         let rename_prompt = Rc::clone(&rename_prompt);
         let entries = Rc::clone(&entries);
-        let search_state = Rc::clone(&search_state);
-        let search_bar = search_bar.clone();
-        let search_entry = search_entry.clone();
-        let search_count = search_count.clone();
-        let theme_for_keys = Rc::clone(&theme);
+        let im = im.clone();
+        let preedit = Rc::clone(&preedit);
         let prefix_armed = Cell::new(false);
-        key_controller.connect_key_pressed(move |_, key, _, state| {
-            let is_search = state
-                .contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
-                && !state.intersects(
-                    gdk::ModifierType::ALT_MASK
-                        | gdk::ModifierType::SUPER_MASK
-                        | gdk::ModifierType::META_MASK,
-                )
-                && matches!(key, gdk::Key::F | gdk::Key::f);
-            if is_search {
-                let Some(terminal) = screens.borrow().focused_terminal().cloned() else {
-                    set_toast(&toast, "No focused terminal to search");
-                    return gtk4::glib::Propagation::Stop;
-                };
-                search_state.borrow_mut().close();
-                search_entry.set_text("");
-                let mut search = search_state.borrow_mut();
-                search.begin(terminal);
-                search_count.set_text(&search.status());
-                request_search(&worker, &screens.borrow(), &mut search, true);
-                drop(search);
-                search_bar.set_visible(true);
-                search_entry.grab_focus();
-                terminal_for_keys.queue_draw();
-                return gtk4::glib::Propagation::Stop;
-            }
-            let font_action = if state.contains(gdk::ModifierType::CONTROL_MASK)
-                && !state.intersects(
-                    gdk::ModifierType::ALT_MASK
-                        | gdk::ModifierType::SUPER_MASK
-                        | gdk::ModifierType::META_MASK,
-                ) {
-                match key {
-                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(1),
-                    gdk::Key::minus | gdk::Key::KP_Subtract => Some(-1),
-                    gdk::Key::_0 | gdk::Key::KP_0 => Some(0),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some(direction) = font_action {
-                let changed = if direction == 0 {
-                    theme_for_keys.reset_font()
-                } else {
-                    theme_for_keys.zoom_font(direction)
-                };
-                if changed {
-                    sync_attachments(
-                        &worker,
-                        &screens.borrow(),
-                        &terminal_for_keys,
-                        &theme_for_keys,
-                    );
-                    terminal_for_keys.queue_draw();
-                }
-                set_toast(
-                    &toast,
-                    &format!(
-                        "Font {}% ({:.0} pt)",
-                        theme_for_keys.font_percent(),
-                        theme_for_keys.font_size()
-                    ),
-                );
-                return gtk4::glib::Propagation::Stop;
-            }
+        prefix_controller.connect_key_pressed(move |_, key, _, state| {
             let is_prefix = state.contains(gdk::ModifierType::CONTROL_MASK)
                 && !state.intersects(
                     gdk::ModifierType::SHIFT_MASK
@@ -1742,7 +1818,14 @@ fn build_ui(application: &Application) {
                 && matches!(key, gdk::Key::B | gdk::Key::b);
             if prefix_armed.replace(false) {
                 if is_prefix {
-                    let _ = worker.input.send(Input::Bytes(vec![0x02]));
+                    let focused = screens.borrow().focused_terminal().cloned();
+                    send_input_or_notify_exited(
+                        &worker,
+                        &terminal_statuses.borrow(),
+                        focused.as_ref(),
+                        &toast,
+                        Input::Bytes(vec![0x02]),
+                    );
                     return gtk4::glib::Propagation::Stop;
                 }
                 let action = prefix_action(key);
@@ -1820,8 +1903,8 @@ fn build_ui(application: &Application) {
                             if let Some(screen) = screen {
                                 let geometry = view::screen_bar_geometry(
                                     &screens_ref,
-                                    terminal_for_keys.width(),
-                                    terminal_for_keys.height(),
+                                    terminal_for_prefix.width(),
+                                    terminal_for_prefix.height(),
                                 );
                                 let rect = geometry
                                     .as_ref()
@@ -1839,7 +1922,7 @@ fn build_ui(application: &Application) {
                                     .unwrap_or_else(|| gdk::Rectangle::new(0, 0, 1, 1));
                                 open_rename_prompt(
                                     &rename_prompt,
-                                    &terminal_for_keys,
+                                    &terminal_for_prefix,
                                     rect,
                                     RenameTarget::Screen {
                                         workspace: workspace.workspace_id.clone(),
@@ -1860,7 +1943,7 @@ fn build_ui(application: &Application) {
                             if let Some(entry) = entry {
                                 open_rename_prompt(
                                     &rename_prompt,
-                                    &terminal_for_keys,
+                                    &terminal_for_prefix,
                                     gdk::Rectangle::new(0, 0, 1, 1),
                                     RenameTarget::Workspace(entry.id),
                                     &entry.name,
@@ -1883,7 +1966,91 @@ fn build_ui(application: &Application) {
                 return gtk4::glib::Propagation::Stop;
             }
             if is_prefix {
+                im.reset();
+                clear_preedit(&preedit, &terminal_for_prefix);
                 prefix_armed.set(true);
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    terminal.add_controller(prefix_controller);
+
+    {
+        let worker = Rc::clone(&worker);
+        let screens = Rc::clone(&screens);
+        let terminal_statuses = Rc::clone(&terminal_statuses);
+        let terminal_for_keys = terminal.clone();
+        let toast = toast.clone();
+        let search_state = Rc::clone(&search_state);
+        let search_bar = search_bar.clone();
+        let search_entry = search_entry.clone();
+        let search_count = search_count.clone();
+        let theme_for_keys = Rc::clone(&theme);
+        key_controller.connect_key_pressed(move |_, key, _, state| {
+            let is_search = state
+                .contains(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+                && !state.intersects(
+                    gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                )
+                && matches!(key, gdk::Key::F | gdk::Key::f);
+            if is_search {
+                let Some(terminal) = screens.borrow().focused_terminal().cloned() else {
+                    set_toast(&toast, "No focused terminal to search");
+                    return gtk4::glib::Propagation::Stop;
+                };
+                search_state.borrow_mut().close();
+                search_entry.set_text("");
+                let mut search = search_state.borrow_mut();
+                search.begin(terminal);
+                search_count.set_text(&search.status());
+                request_search(&worker, &screens.borrow(), &mut search, true);
+                drop(search);
+                search_bar.set_visible(true);
+                search_entry.grab_focus();
+                terminal_for_keys.queue_draw();
+                return gtk4::glib::Propagation::Stop;
+            }
+            let font_action = if state.contains(gdk::ModifierType::CONTROL_MASK)
+                && !state.intersects(
+                    gdk::ModifierType::ALT_MASK
+                        | gdk::ModifierType::SUPER_MASK
+                        | gdk::ModifierType::META_MASK,
+                ) {
+                match key {
+                    gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => Some(1),
+                    gdk::Key::minus | gdk::Key::KP_Subtract => Some(-1),
+                    gdk::Key::_0 | gdk::Key::KP_0 => Some(0),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(direction) = font_action {
+                let changed = if direction == 0 {
+                    theme_for_keys.reset_font()
+                } else {
+                    theme_for_keys.zoom_font(direction)
+                };
+                if changed {
+                    sync_attachments(
+                        &worker,
+                        &screens.borrow(),
+                        &terminal_for_keys,
+                        &theme_for_keys,
+                    );
+                    terminal_for_keys.queue_draw();
+                }
+                set_toast(
+                    &toast,
+                    &format!(
+                        "Font {}% ({:.0} pt)",
+                        theme_for_keys.font_percent(),
+                        theme_for_keys.font_size()
+                    ),
+                );
                 return gtk4::glib::Propagation::Stop;
             }
             if view::is_copy_shortcut(key, state) {
@@ -1896,7 +2063,9 @@ fn build_ui(application: &Application) {
                 let clipboard = terminal_for_keys.clipboard();
                 let worker = Rc::clone(&worker);
                 let screens = Rc::clone(&screens);
+                let terminal_statuses = Rc::clone(&terminal_statuses);
                 let terminal = terminal_for_keys.clone();
+                let toast = toast.clone();
                 gtk4::glib::spawn_future_local(async move {
                     let Ok(Some(text)) = clipboard.read_text_future().await else {
                         return;
@@ -1908,7 +2077,14 @@ fn build_ui(application: &Application) {
                         screen.clear_selection();
                     }
                     terminal.queue_draw();
-                    let _ = worker.input.send(Input::Paste(text.to_string()));
+                    let focused = screens.borrow().focused_terminal().cloned();
+                    send_input_or_notify_exited(
+                        &worker,
+                        &terminal_statuses.borrow(),
+                        focused.as_ref(),
+                        &toast,
+                        Input::Paste(text.to_string()),
+                    );
                 });
                 return gtk4::glib::Propagation::Stop;
             }
@@ -1925,7 +2101,14 @@ fn build_ui(application: &Application) {
                         }
                         terminal_for_keys.queue_draw();
                     }
-                    let _ = worker.input.send(Input::Bytes(bytes));
+                    let focused = screens.borrow().focused_terminal().cloned();
+                    send_input_or_notify_exited(
+                        &worker,
+                        &terminal_statuses.borrow(),
+                        focused.as_ref(),
+                        &toast,
+                        Input::Bytes(bytes),
+                    );
                     gtk4::glib::Propagation::Stop
                 }
                 None => gtk4::glib::Propagation::Proceed,
@@ -1933,6 +2116,23 @@ fn build_ui(application: &Application) {
         });
     }
     terminal.add_controller(key_controller);
+
+    let focus_controller = gtk4::EventControllerFocus::new();
+    {
+        let im = im.clone();
+        focus_controller.connect_enter(move |_| im.focus_in());
+    }
+    {
+        let im = im.clone();
+        let preedit = Rc::clone(&preedit);
+        let terminal = terminal.clone();
+        focus_controller.connect_leave(move |_| {
+            im.focus_out();
+            im.reset();
+            clear_preedit(&preedit, &terminal);
+        });
+    }
+    terminal.add_controller(focus_controller);
 
     let pointer = Rc::new(Cell::new(None::<(f64, f64)>));
     let move_throttle = Rc::new(RefCell::new(view::MouseMoveThrottle::default()));
@@ -1945,6 +2145,7 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
+        let terminal_statuses_for_motion = Rc::clone(&terminal_statuses);
         let theme_for_enter = Rc::clone(&theme);
         let theme_for_motion = Rc::clone(&theme);
         let pointer_for_enter = Rc::clone(&pointer);
@@ -2074,17 +2275,23 @@ fn build_ui(application: &Application) {
             {
                 return;
             }
-            let _ = worker.input.send(Input::Mouse {
-                terminal: target.terminal,
-                options: TerminalMouseOptions {
-                    kind: TerminalMouseKind::Move,
-                    row: target.row,
-                    column: target.column,
-                    button: None,
-                    delta_rows: None,
-                    modifiers: input_modifiers(state),
+            let target_terminal = target.terminal;
+            send_input_unless_exited(
+                &worker,
+                &terminal_statuses_for_motion.borrow(),
+                Some(&target_terminal),
+                Input::Mouse {
+                    terminal: target_terminal.clone(),
+                    options: TerminalMouseOptions {
+                        kind: TerminalMouseKind::Move,
+                        row: target.row,
+                        column: target.column,
+                        button: None,
+                        delta_rows: None,
+                        modifiers: input_modifiers(state),
+                    },
                 },
-            });
+            );
         });
         motion.connect_leave(move |_| {
             pointer_for_leave.set(None);
@@ -2105,6 +2312,7 @@ fn build_ui(application: &Application) {
     {
         let worker = Rc::clone(&worker);
         let screens = Rc::clone(&screens);
+        let terminal_statuses = Rc::clone(&terminal_statuses);
         let theme = Rc::clone(&theme);
         let pointer = Rc::clone(&pointer);
         let terminal_for_scroll = terminal.clone();
@@ -2137,17 +2345,23 @@ fn build_ui(application: &Application) {
                 // when mouse tracking is off. This client receives opaque VT
                 // state, so matching that fallback would require forbidden VT
                 // parsing; the server safely drops untracked wheel input.
-                let _ = worker.input.send(Input::Mouse {
-                    terminal: target.terminal,
-                    options: TerminalMouseOptions {
-                        kind: TerminalMouseKind::Wheel,
-                        row: target.row,
-                        column: target.column,
-                        button: None,
-                        delta_rows: Some(delta_rows),
-                        modifiers: input_modifiers(controller.current_event_state()),
+                let target_terminal = target.terminal;
+                send_input_unless_exited(
+                    &worker,
+                    &terminal_statuses.borrow(),
+                    Some(&target_terminal),
+                    Input::Mouse {
+                        terminal: target_terminal.clone(),
+                        options: TerminalMouseOptions {
+                            kind: TerminalMouseKind::Wheel,
+                            row: target.row,
+                            column: target.column,
+                            button: None,
+                            delta_rows: Some(delta_rows),
+                            modifiers: input_modifiers(controller.current_event_state()),
+                        },
                     },
-                });
+                );
             }
             gtk4::glib::Propagation::Stop
         });
@@ -2162,6 +2376,8 @@ fn build_ui(application: &Application) {
         let theme = Rc::clone(&theme);
         let worker_for_release = Rc::clone(&worker);
         let screens_for_release = Rc::clone(&screens);
+        let terminal_statuses_for_click = Rc::clone(&terminal_statuses);
+        let terminal_statuses_for_release = Rc::clone(&terminal_statuses);
         let theme_for_release = Rc::clone(&theme);
         let terminal_for_click = terminal.clone();
         let terminal_for_release = terminal.clone();
@@ -2388,17 +2604,23 @@ fn build_ui(application: &Application) {
             let Some(target) = mouse_target(&screens, &terminal_for_click, metrics, x, y) else {
                 return;
             };
-            let _ = worker.input.send(Input::Mouse {
-                terminal: target.terminal,
-                options: TerminalMouseOptions {
-                    kind: TerminalMouseKind::Down,
-                    row: target.row,
-                    column: target.column,
-                    button: Some(button),
-                    delta_rows: None,
-                    modifiers: input_modifiers(state),
+            let target_terminal = target.terminal;
+            send_input_unless_exited(
+                &worker,
+                &terminal_statuses_for_click.borrow(),
+                Some(&target_terminal),
+                Input::Mouse {
+                    terminal: target_terminal.clone(),
+                    options: TerminalMouseOptions {
+                        kind: TerminalMouseKind::Down,
+                        row: target.row,
+                        column: target.column,
+                        button: Some(button),
+                        delta_rows: None,
+                        modifiers: input_modifiers(state),
+                    },
                 },
-            });
+            );
         });
         click.connect_released(move |gesture, _, x, y| {
             let button_number = gesture.current_button();
@@ -2422,17 +2644,23 @@ fn build_ui(application: &Application) {
             ) else {
                 return;
             };
-            let _ = worker_for_release.input.send(Input::Mouse {
-                terminal: target.terminal,
-                options: TerminalMouseOptions {
-                    kind: TerminalMouseKind::Up,
-                    row: target.row,
-                    column: target.column,
-                    button: Some(button),
-                    delta_rows: None,
-                    modifiers: input_modifiers(state),
+            let target_terminal = target.terminal;
+            send_input_unless_exited(
+                &worker_for_release,
+                &terminal_statuses_for_release.borrow(),
+                Some(&target_terminal),
+                Input::Mouse {
+                    terminal: target_terminal.clone(),
+                    options: TerminalMouseOptions {
+                        kind: TerminalMouseKind::Up,
+                        row: target.row,
+                        column: target.column,
+                        button: Some(button),
+                        delta_rows: None,
+                        modifiers: input_modifiers(state),
+                    },
                 },
-            });
+            );
         });
         terminal.add_controller(click);
     }
@@ -2698,6 +2926,7 @@ fn build_ui(application: &Application) {
     {
         let screens = Rc::clone(&screens);
         let attention = Rc::clone(&attention);
+        let terminal_statuses = Rc::clone(&terminal_statuses);
         let terminal_cwds = Rc::clone(&terminal_cwds);
         let git_branches = Rc::clone(&git_branches);
         let git_resolver = Rc::clone(&git_resolver);
@@ -2723,6 +2952,8 @@ fn build_ui(application: &Application) {
         let scrollbar = Rc::clone(&scrollbar);
         let update_generation = Rc::clone(&update_generation);
         let current_session = Rc::clone(&current_session);
+        let im = im.clone();
+        let preedit = Rc::clone(&preedit);
         let session_list = session_list.clone();
         let session_popover = session_popover.clone();
         let title = title.clone();
@@ -2730,6 +2961,7 @@ fn build_ui(application: &Application) {
         let trace_updates = std::env::var_os("CMUX_GTK_TRACE")
             .is_some_and(|value| value == std::ffi::OsStr::new("1"));
         gtk4::glib::spawn_future_local(async move {
+            let mut im_target = None::<TerminalId>;
             loop {
                 let stamped = match gtk4::glib::future_with_timeout(
                     UPDATE_WATCHDOG_INTERVAL,
@@ -2761,9 +2993,13 @@ fn build_ui(application: &Application) {
                         clear_toast(&toast);
                     }
                     Update::Switching { session_name } => {
+                        im.reset();
+                        im_target = None;
+                        clear_preedit(&preedit, &terminal);
                         reset_session_view(
                             &screens,
                             &attention,
+                            &terminal_statuses,
                             &terminal_cwds,
                             &git_branches,
                             &screen_terminals,
@@ -2787,9 +3023,13 @@ fn build_ui(application: &Application) {
                         session_name,
                         message,
                     } => {
+                        im.reset();
+                        im_target = None;
+                        clear_preedit(&preedit, &terminal);
                         reset_session_view(
                             &screens,
                             &attention,
+                            &terminal_statuses,
                             &terminal_cwds,
                             &git_branches,
                             &screen_terminals,
@@ -2884,6 +3124,11 @@ fn build_ui(application: &Application) {
                                 .as_ref()
                                 .and_then(|view| view.active_terminal())
                                 .cloned();
+                            if im_target != target {
+                                im.reset();
+                                preedit.borrow_mut().take();
+                                im_target = target.clone();
+                            }
                             screens.borrow_mut().set_workspace(entry.view.clone());
                             let _ = worker.input.send(Input::SetTarget(target));
                             sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
@@ -2907,6 +3152,10 @@ fn build_ui(application: &Application) {
                                 }
                             }
                         } else {
+                            if im_target.take().is_some() {
+                                im.reset();
+                                preedit.borrow_mut().take();
+                            }
                             screens.borrow_mut().set_workspace(None);
                             sync_attachments(&worker, &screens.borrow(), &terminal, &theme);
                             if empty {
@@ -2928,6 +3177,10 @@ fn build_ui(application: &Application) {
                         for indicator in attention_indicators.borrow().iter() {
                             indicator.queue_draw();
                         }
+                    }
+                    Update::TerminalStatuses(next) => {
+                        *terminal_statuses.borrow_mut() = next;
+                        terminal.queue_draw();
                     }
                     Update::TerminalCwds(next) => {
                         *terminal_cwds.borrow_mut() = next;
@@ -3057,8 +3310,12 @@ fn build_ui(application: &Application) {
                         terminal.queue_draw();
                     }
                     Update::Detached { terminal: id } => {
-                        if screens.borrow().contains_terminal(&id) {
-                            set_toast(&toast, &format!("Detached from {id:?}"));
+                        let screens = screens.borrow();
+                        if screens.contains_terminal(&id)
+                            && !terminal_has_exited(&terminal_statuses.borrow(), &id)
+                        {
+                            let name = terminal_tab_name(&screens, &id).unwrap_or("terminal");
+                            set_toast(&toast, &format!("Detached from {name}"));
                         }
                     }
                     Update::Error(message) => set_toast(&toast, &message),

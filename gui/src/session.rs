@@ -26,8 +26,8 @@ use cmux::{
     RenderSnapshot, ResourceChange, ResourceEntitySnapshot, ResourceKind, ResourceReference,
     ScreenId, ScrollOptions, Selector, SessionEvent, SessionEventStream, Size, SplitId,
     SplitOptions, SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
-    TerminalAttachmentItem, TerminalCreateOptions, TerminalId, TerminalMouseOptions,
-    TextInputOptions, WorkspaceId,
+    TerminalAttachmentItem, TerminalCreateOptions, TerminalExit, TerminalExitOutcome, TerminalId,
+    TerminalLifecycle, TerminalMouseOptions, TerminalSnapshot, TextInputOptions, WorkspaceId,
 };
 
 use crate::attention::AttentionState;
@@ -187,6 +187,37 @@ fn session_event_affects_topology(event: &SessionEvent) -> bool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalStatus {
+    Launching,
+    Running,
+    Exited { summary: Option<String> },
+}
+
+fn exit_summary(exit: Option<&TerminalExit>) -> Option<String> {
+    exit.map(|exit| match &exit.outcome {
+        TerminalExitOutcome::Exit { code } => format!("status {code}"),
+        TerminalExitOutcome::Signal {
+            signal,
+            core_dumped,
+        } => {
+            let suffix = if *core_dumped { " (core dumped)" } else { "" };
+            format!("signal {signal}{suffix}")
+        }
+        TerminalExitOutcome::Unknown { reason } => reason.clone(),
+    })
+}
+
+fn terminal_status(terminal: &TerminalSnapshot) -> TerminalStatus {
+    match terminal.lifecycle {
+        TerminalLifecycle::Launching => TerminalStatus::Launching,
+        TerminalLifecycle::Running => TerminalStatus::Running,
+        TerminalLifecycle::Exited => TerminalStatus::Exited {
+            summary: exit_summary(terminal.exit.as_ref()),
+        },
+    }
+}
+
 #[derive(Debug)]
 pub enum Update {
     Connected {
@@ -206,6 +237,7 @@ pub enum Update {
     },
     Workspaces(Vec<WorkspaceEntry>),
     Attention(AttentionState),
+    TerminalStatuses(HashMap<TerminalId, TerminalStatus>),
     TerminalCwds(HashMap<TerminalId, String>),
     GitBranch {
         directory: PathBuf,
@@ -880,10 +912,11 @@ fn session_event_loop(
     let mut notifications = HashMap::<NotificationId, NotificationSnapshot>::new();
     let mut agents = HashMap::<AgentId, AgentSnapshot>::new();
     let mut terminal_cwds = HashMap::<TerminalId, String>::new();
-    // Whether each terminal is still running, so a stale agent record cannot
-    // claim work in a terminal that has exited.
-    let mut running_terminals = HashSet::<TerminalId>::new();
+    // Lifecycle comes from the resource stream, so it can both suppress stale
+    // agent activity and explain dead panes without another protocol request.
+    let mut terminal_statuses = HashMap::<TerminalId, TerminalStatus>::new();
     let mut published_attention = None;
+    let mut published_terminal_statuses = None;
 
     loop {
         if session_event_stop_requested(&stop) {
@@ -902,7 +935,7 @@ fn session_event_loop(
             publish_attention(
                 &notifications,
                 &agents,
-                &running_terminals,
+                &terminal_statuses,
                 &mut published_attention,
                 &updates,
             );
@@ -915,14 +948,21 @@ fn session_event_loop(
                 // can change in one delta, and the agent must be judged against
                 // the newer lifecycle rather than the previous one.
                 let liveness_changed =
-                    apply_terminal_liveness_event(&item.value, &mut running_terminals);
+                    apply_terminal_liveness_event(&item.value, &mut terminal_statuses);
+                if liveness_changed {
+                    publish_terminal_statuses(
+                        &terminal_statuses,
+                        &mut published_terminal_statuses,
+                        &updates,
+                    );
+                }
                 if apply_attention_event(&item.value, &mut notifications, &mut agents)
                     || liveness_changed
                 {
                     publish_attention(
                         &notifications,
                         &agents,
-                        &running_terminals,
+                        &terminal_statuses,
                         &mut published_attention,
                         &updates,
                     );
@@ -993,23 +1033,24 @@ fn apply_terminal_cwd_event(
     }
 }
 
-/// Tracks which terminals are still running, from the same resource stream the
-/// cwd map is built from. `TerminalSnapshot::running` is true exactly for the
-/// `running` lifecycle, so this needs no extra round-trip.
-fn apply_terminal_liveness_event(event: &SessionEvent, running: &mut HashSet<TerminalId>) -> bool {
+/// Tracks terminal lifecycle from the same resource stream the cwd map uses.
+/// The running subset is derived from this map for attention calculations.
+fn apply_terminal_liveness_event(
+    event: &SessionEvent,
+    statuses: &mut HashMap<TerminalId, TerminalStatus>,
+) -> bool {
     match event {
         SessionEvent::Snapshot(event) => {
             let next = event
                 .snapshot
                 .terminals
                 .iter()
-                .filter(|terminal| terminal.running)
-                .map(|terminal| terminal.id.clone())
-                .collect::<HashSet<_>>();
-            if *running == next {
+                .map(|terminal| (terminal.id.clone(), terminal_status(terminal)))
+                .collect::<HashMap<_, _>>();
+            if *statuses == next {
                 false
             } else {
-                *running = next;
+                *statuses = next;
                 true
             }
         }
@@ -1022,17 +1063,17 @@ fn apply_terminal_liveness_event(event: &SessionEvent, running: &mut HashSet<Ter
                         value: ResourceEntitySnapshot::Terminal(terminal),
                         ..
                     } => {
-                        if terminal.running {
-                            running.insert(terminal.id.clone())
-                        } else {
-                            running.remove(&terminal.id)
-                        }
+                        let status = terminal_status(terminal);
+                        statuses
+                            .insert(terminal.id.clone(), status.clone())
+                            .as_ref()
+                            != Some(&status)
                     }
                     ResourceChange::Delete {
                         resource: ResourceKind::Terminal,
                         id: ResourceReference::Terminal(terminal),
                         ..
-                    } => running.remove(terminal),
+                    } => statuses.remove(terminal).is_some(),
                     _ => false,
                 };
             }
@@ -1040,6 +1081,18 @@ fn apply_terminal_liveness_event(event: &SessionEvent, running: &mut HashSet<Ter
         }
         SessionEvent::Unknown { .. } => false,
     }
+}
+
+fn publish_terminal_statuses(
+    statuses: &HashMap<TerminalId, TerminalStatus>,
+    published: &mut Option<HashMap<TerminalId, TerminalStatus>>,
+    updates: &UpdateSink,
+) {
+    if published.as_ref() == Some(statuses) {
+        return;
+    }
+    *published = Some(statuses.clone());
+    let _ = updates.send_blocking(Update::TerminalStatuses(statuses.clone()));
 }
 
 fn apply_terminal_cwd_change(
@@ -1163,14 +1216,14 @@ fn clear_terminal_notifications(
 fn publish_attention(
     notifications: &HashMap<NotificationId, NotificationSnapshot>,
     agents: &HashMap<AgentId, AgentSnapshot>,
-    running: &HashSet<TerminalId>,
+    statuses: &HashMap<TerminalId, TerminalStatus>,
     published: &mut Option<AttentionState>,
     updates: &UpdateSink,
 ) {
     let next = AttentionState::from_resources_with_liveness(
         notifications.values(),
         agents.values(),
-        |terminal| running.contains(terminal),
+        |terminal| matches!(statuses.get(terminal), Some(TerminalStatus::Running)),
     );
     if published.as_ref() == Some(&next) {
         return;
@@ -2254,20 +2307,58 @@ fn active_tab_for_pane(node: &LayoutNode, pane: &PaneId) -> Option<TabId> {
 #[cfg(test)]
 mod tests {
     use super::{
-        attachment_outcome_action, next_attachment_overflow_retry, parse_socket_candidates,
-        resource_change_affects_attention, resource_change_affects_topology,
-        resource_kind_affects_attention, resource_kind_affects_topology,
-        session_event_affects_topology, session_socket_path, AttachmentOutcomeAction,
-        AttachmentStreamOutcome, RebuildPlan, RetrySchedule, RoutedSender, SessionEntry,
-        TopologyRefreshSchedule, MAX_ATTACHMENT_OVERFLOW_REATTACHES, RECONNECT_INTERVAL,
+        attachment_outcome_action, exit_summary, next_attachment_overflow_retry,
+        parse_socket_candidates, resource_change_affects_attention,
+        resource_change_affects_topology, resource_kind_affects_attention,
+        resource_kind_affects_topology, session_event_affects_topology, session_socket_path,
+        AttachmentOutcomeAction, AttachmentStreamOutcome, RebuildPlan, RetrySchedule, RoutedSender,
+        SessionEntry, TopologyRefreshSchedule, MAX_ATTACHMENT_OVERFLOW_REATTACHES,
+        RECONNECT_INTERVAL,
     };
     use cmux::{
         AgentId, Cursor, Document, MachineId, NotificationId, ResourceChange, ResourceKind,
-        ResourceReference, SessionDeltaEvent, SessionEvent, WorkspaceId,
+        ResourceReference, SessionDeltaEvent, SessionEvent, TerminalExit, TerminalExitOutcome,
+        WorkspaceId,
     };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
+
+    fn terminal_exit(outcome: TerminalExitOutcome) -> TerminalExit {
+        TerminalExit {
+            outcome,
+            exited_at: 1,
+            revision: 2,
+        }
+    }
+
+    #[test]
+    fn terminal_exit_summary_describes_status_signal_and_unknown_outcomes() {
+        let status = terminal_exit(TerminalExitOutcome::Exit { code: 17 });
+        let signal = terminal_exit(TerminalExitOutcome::Signal {
+            signal: 9,
+            core_dumped: false,
+        });
+        let core_dumped = terminal_exit(TerminalExitOutcome::Signal {
+            signal: 11,
+            core_dumped: true,
+        });
+        let unknown = terminal_exit(TerminalExitOutcome::Unknown {
+            reason: "host-process-ended-before-adoption".to_string(),
+        });
+
+        assert_eq!(exit_summary(Some(&status)).as_deref(), Some("status 17"));
+        assert_eq!(exit_summary(Some(&signal)).as_deref(), Some("signal 9"));
+        assert_eq!(
+            exit_summary(Some(&core_dumped)).as_deref(),
+            Some("signal 11 (core dumped)")
+        );
+        assert_eq!(
+            exit_summary(Some(&unknown)).as_deref(),
+            Some("host-process-ended-before-adoption")
+        );
+        assert_eq!(exit_summary(None), None);
+    }
 
     #[test]
     fn normal_attachment_end_while_desired_detaches_and_is_remembered() {

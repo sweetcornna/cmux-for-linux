@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use cmux::{
     AgentState, ColorHex, LayoutDirection, LayoutNode, LayoutViewport, NotificationLevel, PaneId,
-    RenderCursorStyle, RenderGraphicImage, RenderGraphicPlacement, RenderRun, RenderUnderline,
-    ScreenId, Size, SplitId, TabId, TerminalId,
+    RenderCursorStyle, RenderGraphicImage, RenderGraphicPlacement, RenderRow, RenderRun,
+    RenderUnderline, ScreenId, Size, SplitId, TabId, TerminalId,
 };
 use gtk4::pango;
 use gtk4::prelude::*;
@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::screen::{PaneView, Screen, ScreenSet, TabContent, WorkspaceView};
 use crate::search::{self, SearchUiState};
+use crate::session::TerminalStatus;
 
 const TAB_HEIGHT: f64 = 28.0;
 const TAB_FADE_WIDTH: f64 = 100.0;
@@ -234,12 +235,32 @@ impl MouseMoveThrottle {
 pub struct ViewHandles {
     pub screens: Rc<RefCell<ScreenSet>>,
     pub attention: Rc<RefCell<AttentionState>>,
+    pub terminal_statuses: Rc<RefCell<HashMap<TerminalId, TerminalStatus>>>,
     pub screen_terminals: Rc<RefCell<HashMap<ScreenId, Vec<TerminalId>>>>,
     pub theme: Rc<Theme>,
     pub blink: Rc<Cell<BlinkState>>,
     pub tab_strip: Rc<TabStripState>,
     pub scrollbar: Rc<ScrollbarState>,
     pub search_state: Rc<RefCell<SearchUiState>>,
+    pub preedit: Rc<RefCell<Option<PreeditState>>>,
+    pub im_cursor_location: Rc<Cell<Option<gdk::Rectangle>>>,
+}
+
+#[derive(Debug)]
+pub struct PreeditState {
+    text: String,
+    _attributes: pango::AttrList,
+    _cursor_offset: i32,
+}
+
+impl PreeditState {
+    pub fn new(text: String, attributes: pango::AttrList, cursor_offset: i32) -> Self {
+        Self {
+            text,
+            _attributes: attributes,
+            _cursor_offset: cursor_offset,
+        }
+    }
 }
 
 pub struct Theme {
@@ -532,7 +553,19 @@ pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetri
     let font = theme.font();
     context.set_font_description(Some(&font));
     let metrics = context.metrics(Some(&font), None);
-    let width = f64::from(metrics.approximate_digit_width()) / f64::from(pango::SCALE);
+    let layout = widget.as_ref().create_pango_layout(Some("0"));
+    layout.set_font_description(Some(&font));
+    let width = f64::from(layout.extents().1.width()) / f64::from(pango::SCALE);
+    let width = if width.is_finite() && width > 0.0 {
+        width
+    } else {
+        let width = f64::from(metrics.approximate_char_width()) / f64::from(pango::SCALE);
+        if width.is_finite() && width > 0.0 {
+            width
+        } else {
+            f64::from(metrics.approximate_digit_width()) / f64::from(pango::SCALE)
+        }
+    };
     let ascent = f64::from(metrics.ascent()) / f64::from(pango::SCALE);
     let descent = f64::from(metrics.descent()) / f64::from(pango::SCALE);
     apply_cell_overrides(
@@ -542,13 +575,23 @@ pub fn cell_metrics(widget: &impl IsA<gtk4::Widget>, theme: &Theme) -> CellMetri
             baseline: ascent,
         },
         theme.terminal(),
+        widget.as_ref().scale_factor(),
     )
+}
+
+fn snap_to_pixel_grid(value: f64, scale_factor: i32) -> f64 {
+    let scale = f64::from(scale_factor.max(1));
+    (value * scale).round() / scale
 }
 
 /// Scales a cell to the configured line height and letter spacing. Extra height
 /// is split above and below the glyphs so text stays optically centred rather
 /// than riding the top of a taller cell.
-fn apply_cell_overrides(metrics: CellMetrics, appearance: &TerminalAppearance) -> CellMetrics {
+fn apply_cell_overrides(
+    metrics: CellMetrics,
+    appearance: &TerminalAppearance,
+    scale_factor: i32,
+) -> CellMetrics {
     let scale = appearance
         .line_height
         .unwrap_or(1.0)
@@ -557,7 +600,8 @@ fn apply_cell_overrides(metrics: CellMetrics, appearance: &TerminalAppearance) -
         .letter_spacing
         .unwrap_or(0.0)
         .clamp(0.0, MAX_LETTER_SPACING);
-    let height = metrics.height * scale;
+    let device_scale = f64::from(scale_factor.max(1));
+    let height = snap_to_pixel_grid(metrics.height * scale, scale_factor).max(1.0 / device_scale);
     CellMetrics {
         width: metrics.width + spacing,
         height,
@@ -1298,12 +1342,15 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
     let ViewHandles {
         screens,
         attention,
+        terminal_statuses,
         screen_terminals,
         theme,
         blink,
         tab_strip,
         scrollbar,
         search_state,
+        preedit,
+        im_cursor_location,
     } = handles;
     let area = DrawingArea::new();
     area.set_focusable(true);
@@ -1312,6 +1359,7 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
     let image_cache = RefCell::new(ImageCache::new());
 
     area.set_draw_func(move |area, cr, width, height| {
+        im_cursor_location.set(None);
         let chrome = theme.chrome();
         let (red, green, blue) = chrome.background.cairo();
         cr.set_source_rgb(red, green, blue);
@@ -1319,6 +1367,7 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
 
         let screens = screens.borrow();
         let attention = attention.borrow();
+        let terminal_statuses = terminal_statuses.borrow();
         let screen_terminals = screen_terminals.borrow();
         let mut image_cache = image_cache.borrow_mut();
         image_cache.retain(|(terminal, image_id, generation), _| {
@@ -1356,6 +1405,20 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                 );
             } else if let Some(terminal) = geometry.terminal.as_ref() {
                 if let Some(screen) = screens.grids.get(terminal) {
+                    let focused = geometry.pane == workspace.layout.active_pane_id
+                        && screens.focused_terminal() == Some(terminal);
+                    if focused {
+                        if let Some(cursor) = screen.cursor.as_ref() {
+                            im_cursor_location.set(Some(gdk::Rectangle::new(
+                                (geometry.content.x + f64::from(cursor.x) * metrics.width).floor()
+                                    as i32,
+                                (geometry.content.y + f64::from(cursor.y) * metrics.height).floor()
+                                    as i32,
+                                metrics.width.ceil().max(1.0) as i32,
+                                metrics.height.ceil().max(1.0) as i32,
+                            )));
+                        }
+                    }
                     let search_query = search_state
                         .borrow()
                         .visible_query(terminal)
@@ -1392,11 +1455,17 @@ pub fn build(handles: ViewHandles) -> DrawingArea {
                             blink: blink.get(),
                         },
                         terminal,
+                        terminal_statuses.get(terminal),
                         search_query.as_deref(),
                         geometry.pane == workspace.layout.active_pane_id,
                         &theme,
                         &mut image_cache,
                     );
+                    if focused {
+                        if let Some(preedit) = preedit.borrow().as_ref() {
+                            draw_preedit(area, cr, screen, metrics, &theme, preedit);
+                        }
+                    }
                     let _ = cr.restore();
                 }
             } else {
@@ -1880,6 +1949,7 @@ struct GridDrawContext<'a> {
 fn draw_grid(
     context: GridDrawContext<'_>,
     terminal: &TerminalId,
+    status: Option<&TerminalStatus>,
     search_query: Option<&str>,
     draw_selection: bool,
     theme: &Theme,
@@ -1897,6 +1967,10 @@ fn draw_grid(
     if !screen.is_initialized() {
         return;
     }
+    let exit_summary = match status {
+        Some(TerminalStatus::Exited { summary }) => Some(summary.as_deref()),
+        _ => None,
+    };
     draw_grid_backgrounds(cr, screen, appearance, metrics, height);
     draw_graphics(
         cr,
@@ -1939,6 +2013,20 @@ fn draw_grid(
         theme.chrome().sidebar_dim_foreground,
     );
 
+    if screen.at_bottom {
+        if let Some(summary) = exit_summary {
+            draw_exited_marker(
+                context,
+                &font,
+                summary,
+                theme.chrome().sidebar_dim_foreground,
+            );
+        }
+    }
+    if exit_summary.is_some() {
+        return;
+    }
+
     if let Some(cursor) = &screen.cursor {
         if !cursor.visible {
             return;
@@ -1972,14 +2060,163 @@ fn draw_grid(
             return;
         }
         match style {
-            RenderCursorStyle::Block => cr.rectangle(x, y, metrics.width, metrics.height),
+            RenderCursorStyle::Block => device_aligned_rectangle(
+                cr,
+                x,
+                y,
+                (f64::from(cursor.x) + 1.0) * metrics.width,
+                (f64::from(cursor.y) + 1.0) * metrics.height,
+            ),
             RenderCursorStyle::Underline => {
-                cr.rectangle(x, y + metrics.height - 2.0, metrics.width, 2.0);
+                device_aligned_rectangle(
+                    cr,
+                    x,
+                    y + metrics.height - 2.0,
+                    (f64::from(cursor.x) + 1.0) * metrics.width,
+                    (f64::from(cursor.y) + 1.0) * metrics.height,
+                );
             }
-            RenderCursorStyle::Bar => cr.rectangle(x, y, 2.0, metrics.height),
+            RenderCursorStyle::Bar => device_aligned_rectangle(
+                cr,
+                x,
+                y,
+                x + 2.0,
+                (f64::from(cursor.y) + 1.0) * metrics.height,
+            ),
         }
         let _ = cr.fill();
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PreeditSlice<'a> {
+    text: &'a str,
+    columns: std::ops::Range<u32>,
+}
+
+fn drawable_preedit(cursor_column: u32, available_columns: u32, text: &str) -> PreeditSlice<'_> {
+    let mut byte_end = 0;
+    let mut columns = 0u32;
+    for (byte_index, grapheme) in text.grapheme_indices(true) {
+        let width = unicode_column_count(grapheme);
+        if columns.saturating_add(width) > available_columns {
+            break;
+        }
+        columns = columns.saturating_add(width);
+        byte_end = byte_index + grapheme.len();
+    }
+    PreeditSlice {
+        text: &text[..byte_end],
+        columns: cursor_column..cursor_column.saturating_add(columns),
+    }
+}
+
+fn draw_preedit(
+    area: &DrawingArea,
+    cr: &gtk4::cairo::Context,
+    screen: &Screen,
+    metrics: CellMetrics,
+    theme: &Theme,
+    preedit: &PreeditState,
+) {
+    let Some(cursor) = screen.cursor.as_ref() else {
+        return;
+    };
+    let cursor_column = u32::from(cursor.x);
+    let available_columns = u32::from(screen.size.cols).saturating_sub(cursor_column);
+    let drawable = drawable_preedit(cursor_column, available_columns, &preedit.text);
+    if drawable.text.is_empty() || drawable.columns.is_empty() {
+        return;
+    }
+
+    let y = f64::from(cursor.y) * metrics.height;
+    let background = theme
+        .terminal()
+        .background
+        .map_or_else(|| parse_color(screen.default_bg.as_str()), Rgb::cairo);
+    cr.set_source_rgb(background.0, background.1, background.2);
+    device_aligned_rectangle(
+        cr,
+        f64::from(drawable.columns.start) * metrics.width,
+        y,
+        f64::from(drawable.columns.end) * metrics.width,
+        y + metrics.height,
+    );
+    let _ = cr.fill();
+
+    let layout = area.create_pango_layout(None);
+    layout.set_font_description(Some(&theme.font()));
+    let attributes = pango::AttrList::new();
+    attributes.insert(pango::AttrInt::new_underline(pango::Underline::Single));
+    layout.set_attributes(Some(&attributes));
+    let foreground = theme
+        .terminal()
+        .foreground
+        .map_or_else(|| parse_color(screen.default_fg.as_str()), Rgb::cairo);
+    cr.set_source_rgb(foreground.0, foreground.1, foreground.2);
+
+    let placement = place_run_text(drawable.text, None);
+    let use_fast_path = if placement.use_fast_path {
+        layout.set_text(drawable.text);
+        let layout_width = f64::from(layout.extents().1.width()) / f64::from(pango::SCALE);
+        let grid_width = f64::from(placement.columns) * metrics.width;
+        (layout_width - grid_width).abs() <= 0.5
+    } else {
+        false
+    };
+    if use_fast_path {
+        cr.move_to(f64::from(drawable.columns.start) * metrics.width, y);
+        pangocairo::functions::show_layout(cr, &layout);
+    } else {
+        for grapheme in placement.graphemes {
+            layout.set_text(grapheme.text);
+            cr.move_to(
+                f64::from(drawable.columns.start.saturating_add(grapheme.column)) * metrics.width,
+                y,
+            );
+            pangocairo::functions::show_layout(cr, &layout);
+        }
+    }
+}
+
+fn exited_marker_row(rows: &[Option<RenderRow>]) -> usize {
+    let last_visible = rows.len().saturating_sub(1);
+    rows.iter()
+        .rposition(|row| {
+            row.as_ref().is_some_and(|row| {
+                row.runs
+                    .iter()
+                    .any(|run| run.text.chars().any(|character| !character.is_whitespace()))
+            })
+        })
+        .map_or(0, |row| row.saturating_add(1).min(last_visible))
+}
+
+fn draw_exited_marker(
+    context: GridDrawContext<'_>,
+    font: &pango::FontDescription,
+    summary: Option<&str>,
+    color: Rgb,
+) {
+    let text = summary.map_or_else(
+        || "[process exited]".to_string(),
+        |summary| format!("[process exited: {summary}]"),
+    );
+    let layout = context.area.create_pango_layout(Some(&text));
+    layout.set_font_description(Some(font));
+    layout.set_single_paragraph_mode(true);
+    layout.set_ellipsize(pango::EllipsizeMode::End);
+    layout.set_width(
+        (f64::from(context.screen.size.cols) * context.metrics.width * f64::from(pango::SCALE))
+            .floor() as i32,
+    );
+    let (red, green, blue) = color.cairo();
+    context.cr.set_source_rgb(red, green, blue);
+    context.cr.move_to(
+        0.0,
+        exited_marker_row(&context.screen.rows) as f64 * context.metrics.height,
+    );
+    pangocairo::functions::show_layout(context.cr, &layout);
 }
 
 fn draw_search_highlights(
@@ -2265,6 +2502,27 @@ fn place_run_text(text: &str, width_hint: Option<u16>) -> RunTextPlacement<'_> {
     }
 }
 
+fn snap_to_device(cr: &gtk4::cairo::Context, x: f64, y: f64) -> (f64, f64) {
+    let (device_x, device_y) = cr.user_to_device(x, y);
+    cr.device_to_user(
+        snap_to_pixel_grid(device_x, 1),
+        snap_to_pixel_grid(device_y, 1),
+    )
+    .unwrap_or((x, y))
+}
+
+fn device_aligned_rectangle(
+    cr: &gtk4::cairo::Context,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+) {
+    let (left, top) = snap_to_device(cr, left, top);
+    let (right, bottom) = snap_to_device(cr, right, bottom);
+    cr.rectangle(left, top, right - left, bottom - top);
+}
+
 fn draw_grid_backgrounds(
     cr: &gtk4::cairo::Context,
     screen: &Screen,
@@ -2274,8 +2532,8 @@ fn draw_grid_backgrounds(
 ) {
     for (index, row) in screen.rows.iter().enumerate() {
         let Some(row) = row else { continue };
-        let y = index as f64 * metrics.height;
-        if y >= height {
+        let top = index as f64 * metrics.height;
+        if top >= height {
             break;
         }
         let mut column = 0u32;
@@ -2283,13 +2541,20 @@ fn draw_grid_backgrounds(
             // The server's width hint wins whenever Unicode text does not map
             // one-to-one onto terminal grid columns.
             let cells = run_column_count(&run.text, run.width_hint);
-            let x = f64::from(column) * metrics.width;
-            let run_width = f64::from(cells) * metrics.width;
+            let end_column = column.saturating_add(cells);
             let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg, appearance);
             cr.set_source_rgb(bg.0, bg.1, bg.2);
-            cr.rectangle(x, y, run_width, metrics.height);
+            // Separate fills must share the same device-pixel edge or their
+            // antialiasing composites into a dark line between cells.
+            device_aligned_rectangle(
+                cr,
+                f64::from(column) * metrics.width,
+                top,
+                f64::from(end_column) * metrics.width,
+                (index + 1) as f64 * metrics.height,
+            );
             let _ = cr.fill();
-            column += cells;
+            column = end_column;
         }
     }
 }
@@ -2350,8 +2615,16 @@ fn draw_grid_text(
                     run_colors(run, &screen.default_fg, &screen.default_bg, appearance).0
                 });
                 cr.set_source_rgb(color.0, color.1, color.2);
-                if placement.use_fast_path {
+                let use_fast_path = if placement.use_fast_path {
                     layout.set_text(&run.text);
+                    let layout_width =
+                        f64::from(layout.extents().1.width()) / f64::from(pango::SCALE);
+                    let grid_width = f64::from(placement.columns) * metrics.width;
+                    (layout_width - grid_width).abs() <= 0.5
+                } else {
+                    false
+                };
+                if use_fast_path {
                     cr.move_to(f64::from(column) * metrics.width, y);
                     pangocairo::functions::show_layout(cr, &layout);
                 } else {
@@ -2735,6 +3008,52 @@ mod tests {
             .collect()
     }
 
+    fn content_row(row: u16) -> Option<RenderRow> {
+        Some(RenderRow {
+            row,
+            runs: vec![RenderRun {
+                text: "output".to_string(),
+                fg: None,
+                bg: None,
+                attrs: 0,
+                underline: None,
+                width_hint: Some(6),
+            }],
+        })
+    }
+
+    fn blank_row(row: u16) -> Option<RenderRow> {
+        Some(RenderRow {
+            row,
+            runs: vec![RenderRun {
+                text: " ".repeat(80),
+                fg: None,
+                bg: None,
+                attrs: 0,
+                underline: None,
+                width_hint: None,
+            }],
+        })
+    }
+
+    #[test]
+    fn exited_marker_uses_first_row_for_an_empty_viewport() {
+        let rows = (0..24).map(blank_row).collect::<Vec<_>>();
+        assert_eq!(exited_marker_row(&rows), 0);
+    }
+
+    #[test]
+    fn exited_marker_follows_the_last_content_row() {
+        let rows = vec![None, content_row(1), None, None];
+        assert_eq!(exited_marker_row(&rows), 2);
+    }
+
+    #[test]
+    fn exited_marker_clamps_to_a_full_viewports_last_row() {
+        let rows = vec![content_row(0), content_row(1), content_row(2)];
+        assert_eq!(exited_marker_row(&rows), 2);
+    }
+
     #[test]
     fn sidebar_scrims_are_hidden_when_list_is_shorter_than_viewport() {
         assert_eq!(sidebar_scrim_visibility(0.0, 80.0, 100.0), (false, false));
@@ -2806,6 +3125,50 @@ mod tests {
         assert_eq!(placement.columns, 4);
         assert_eq!(placement_offsets(&placement), vec![0, 1, 3]);
         assert!(!placement.use_fast_path);
+    }
+
+    #[test]
+    fn preedit_that_fits_keeps_the_complete_text() {
+        assert_eq!(
+            drawable_preedit(3, 7, "pinyin"),
+            PreeditSlice {
+                text: "pinyin",
+                columns: 3..9,
+            }
+        );
+    }
+
+    #[test]
+    fn preedit_that_overflows_is_truncated_to_the_row() {
+        assert_eq!(
+            drawable_preedit(7, 3, "kana"),
+            PreeditSlice {
+                text: "kan",
+                columns: 7..10,
+            }
+        );
+    }
+
+    #[test]
+    fn wide_preedit_is_truncated_on_grapheme_boundaries() {
+        assert_eq!(
+            drawable_preedit(4, 5, "中文語"),
+            PreeditSlice {
+                text: "中文",
+                columns: 4..8,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_preedit_has_an_empty_column_span() {
+        assert_eq!(
+            drawable_preedit(5, 10, ""),
+            PreeditSlice {
+                text: "",
+                columns: 5..5,
+            }
+        );
     }
 
     fn pane(number: u8) -> PaneId {
@@ -3069,15 +3432,53 @@ mod tests {
             letter_spacing: Some(2.0),
             ..TerminalAppearance::default()
         };
-        let scaled = apply_cell_overrides(base, &appearance);
+        let scaled = apply_cell_overrides(base, &appearance, 1);
 
         assert_eq!(scaled.width, 12.0);
         assert_eq!(scaled.height, 30.0);
         // The extra 10px is split above and below, so the glyph stays centred.
         assert_eq!(scaled.baseline, 21.0);
 
-        let untouched = apply_cell_overrides(base, &TerminalAppearance::default());
+        let untouched = apply_cell_overrides(base, &TerminalAppearance::default(), 1);
         assert_eq!(untouched, base);
+    }
+
+    #[test]
+    fn pixel_grid_snapping_respects_scale_and_tiles_adjacent_cells() {
+        assert_eq!(snap_to_pixel_grid(8.3, 1), 8.0);
+        assert_eq!(snap_to_pixel_grid(8.3, 2), 8.5);
+
+        let cell_width = 8.830_078_125;
+        for scale_factor in [1, 2] {
+            let first_left = snap_to_pixel_grid(0.0, scale_factor);
+            let first_right = snap_to_pixel_grid(cell_width, scale_factor);
+            let second_left = snap_to_pixel_grid(cell_width, scale_factor);
+            let second_right = snap_to_pixel_grid(cell_width * 2.0, scale_factor);
+
+            assert_eq!(first_right, second_left);
+            assert_eq!(
+                (first_right - first_left) + (second_right - second_left),
+                second_right - first_left
+            );
+        }
+    }
+
+    #[test]
+    fn cell_height_snaps_after_line_height_and_recentres_the_baseline() {
+        let base = CellMetrics {
+            width: 8.830_078_125,
+            height: 17.26,
+            baseline: 13.5,
+        };
+
+        let scale_one = apply_cell_overrides(base, &TerminalAppearance::default(), 1);
+        assert_eq!(scale_one.height, 17.0);
+        assert_eq!(scale_one.baseline, 13.37);
+
+        let scale_two = apply_cell_overrides(base, &TerminalAppearance::default(), 2);
+        assert_eq!(scale_two.height, 17.5);
+        assert_eq!(scale_two.baseline, 13.62);
+        assert_eq!(scale_two.width, base.width);
     }
 
     #[test]
@@ -3092,7 +3493,7 @@ mod tests {
             ..TerminalAppearance::default()
         };
         assert_eq!(
-            apply_cell_overrides(base, &appearance).height,
+            apply_cell_overrides(base, &appearance, 1).height,
             20.0 * MAX_LINE_HEIGHT
         );
     }

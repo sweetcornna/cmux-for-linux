@@ -248,6 +248,41 @@ runtime within 6pt-32pt, then reuse the existing attachment resize path for
 every visible pane. None of these features adds a client-side VT parser, and
 runtime zoom is never written to configuration.
 
+Three defects reported from daily use are fixed. The cell grid was built from
+Pango's `approximate_digit_width`, which rounds: `monospace 11` resolves to
+DejaVu Sans Mono, whose real advance is 8.830078125px while that metric reports
+9.000px. Runs are drawn as one Pango layout at their grid column, so glyphs
+advanced 0.17px short of the grid per cell and a black seam of `cells x 0.17px`
+opened wherever the next run began - about 3px through a 16-cell block run,
+which is what cut two lines through Claude Code's block-art mascot. The grid
+now measures the advance Pango will actually use, snaps the row pitch and every
+cell rectangle to whole device pixels so adjacent fills share an edge instead of
+compositing an antialiased dark line, and falls back to per-grapheme placement
+when a run's shaped width still disagrees with the grid, which covers fallback
+fonts for symbols and emoji.
+
+An exited terminal is no longer a black void. A terminal host outlives its
+daemon, so a reboot leaves the restored session holding terminals whose
+lifecycle is `exited` with reason `host-process-ended-before-adoption`; the
+frontend attached, took a snapshot of empty rows, detached, and then answered
+every keystroke with `mutation.indeterminate` because `terminal.input.write`
+against a surface that no longer exists ends as an indeterminate external
+effect. Terminal lifecycle now rides the existing session event stream, the
+pane prints `[process exited: <reason>]` below its final output, the caret
+stops blinking in a dead terminal, keyboard and paste input report the exit in
+plain language instead of the protocol error, mouse input is dropped silently,
+and no toast contains an internal resource id.
+
+Input methods work. The terminal widget carries a `GtkIMMulticontext` with
+focus notification, so ibus, fcitx and the Wayland text-input path see the key
+stream; commits reach the PTY as raw bytes rather than a bracketed paste,
+preedit is drawn underlined at the caret and clipped to the row with wide
+graphemes taking two columns, and the caret rectangle is reported so candidate
+windows follow the cursor. Because GTK filters keys through the input method
+before emitting `key-pressed`, the `Ctrl+B` prefix chord runs in a separate
+capture-phase controller: its second key is a bare letter, which any input
+method would otherwise claim as text.
+
 There is no remaining stage 2 tail.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
