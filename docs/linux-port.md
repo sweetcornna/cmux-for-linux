@@ -259,7 +259,12 @@ now measures the advance Pango will actually use, snaps the row pitch and every
 cell rectangle to whole device pixels so adjacent fills share an edge instead of
 compositing an antialiased dark line, and falls back to per-grapheme placement
 when a run's shaped width still disagrees with the grid, which covers fallback
-fonts for symbols and emoji.
+fonts for symbols and emoji. What that left was sub-pixel - a `█` glyph's ink
+covers 8.973px of an 8.830px cell, so a run boundary still darkened one device
+pixel column by about 11% - so the Block Elements range U+2580-U+259F is now
+drawn as device-aligned rectangles rather than glyphs, with the shades as flat
+alpha. Measured after that change, a run boundary inside block art steps
+straight from one block colour to the next with no intermediate pixel.
 
 An exited terminal is no longer a black void. A terminal host outlives its
 daemon, so a reboot leaves the restored session holding terminals whose

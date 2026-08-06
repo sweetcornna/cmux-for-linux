@@ -2462,6 +2462,108 @@ struct RunTextPlacement<'a> {
     use_fast_path: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockElementRectangle {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl BlockElementRectangle {
+    const EMPTY: Self = Self::new(0.0, 0.0, 0.0, 0.0);
+
+    const fn new(x0: f64, y0: f64, x1: f64, y1: f64) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BlockElementGeometry {
+    rectangles: [BlockElementRectangle; 3],
+    rectangle_count: usize,
+    alpha: f64,
+}
+
+impl BlockElementGeometry {
+    const fn one(rectangle: BlockElementRectangle, alpha: f64) -> Self {
+        Self {
+            rectangles: [
+                rectangle,
+                BlockElementRectangle::EMPTY,
+                BlockElementRectangle::EMPTY,
+            ],
+            rectangle_count: 1,
+            alpha,
+        }
+    }
+
+    const fn two(first: BlockElementRectangle, second: BlockElementRectangle) -> Self {
+        Self {
+            rectangles: [first, second, BlockElementRectangle::EMPTY],
+            rectangle_count: 2,
+            alpha: 1.0,
+        }
+    }
+
+    const fn three(
+        first: BlockElementRectangle,
+        second: BlockElementRectangle,
+        third: BlockElementRectangle,
+    ) -> Self {
+        Self {
+            rectangles: [first, second, third],
+            rectangle_count: 3,
+            alpha: 1.0,
+        }
+    }
+
+    fn rectangles(&self) -> &[BlockElementRectangle] {
+        &self.rectangles[..self.rectangle_count]
+    }
+}
+
+// Font ink can cross a snapped cell edge, so block elements must use the same
+// exact geometry as cell backgrounds in order to tile without a dark seam.
+fn block_element_geometry(character: char) -> Option<BlockElementGeometry> {
+    let rectangle = BlockElementRectangle::new;
+    let upper_left = rectangle(0.0, 0.0, 0.5, 0.5);
+    let upper_right = rectangle(0.5, 0.0, 1.0, 0.5);
+    let lower_left = rectangle(0.0, 0.5, 0.5, 1.0);
+    let lower_right = rectangle(0.5, 0.5, 1.0, 1.0);
+
+    Some(match character {
+        '\u{2580}' => BlockElementGeometry::one(rectangle(0.0, 0.0, 1.0, 0.5), 1.0),
+        '\u{2581}'..='\u{2587}' => {
+            let eighths = f64::from(u32::from(character) - 0x2580);
+            BlockElementGeometry::one(rectangle(0.0, 1.0 - eighths / 8.0, 1.0, 1.0), 1.0)
+        }
+        '\u{2588}' => BlockElementGeometry::one(rectangle(0.0, 0.0, 1.0, 1.0), 1.0),
+        '\u{2589}'..='\u{258f}' => {
+            let eighths = f64::from(0x2590 - u32::from(character));
+            BlockElementGeometry::one(rectangle(0.0, 0.0, eighths / 8.0, 1.0), 1.0)
+        }
+        '\u{2590}' => BlockElementGeometry::one(rectangle(0.5, 0.0, 1.0, 1.0), 1.0),
+        '\u{2591}'..='\u{2593}' => {
+            let alpha = f64::from(u32::from(character) - 0x2590) / 4.0;
+            BlockElementGeometry::one(rectangle(0.0, 0.0, 1.0, 1.0), alpha)
+        }
+        '\u{2594}' => BlockElementGeometry::one(rectangle(0.0, 0.0, 1.0, 0.125), 1.0),
+        '\u{2595}' => BlockElementGeometry::one(rectangle(0.875, 0.0, 1.0, 1.0), 1.0),
+        '\u{2596}' => BlockElementGeometry::one(lower_left, 1.0),
+        '\u{2597}' => BlockElementGeometry::one(lower_right, 1.0),
+        '\u{2598}' => BlockElementGeometry::one(upper_left, 1.0),
+        '\u{2599}' => BlockElementGeometry::three(upper_left, lower_left, lower_right),
+        '\u{259a}' => BlockElementGeometry::two(upper_left, lower_right),
+        '\u{259b}' => BlockElementGeometry::three(upper_left, upper_right, lower_left),
+        '\u{259c}' => BlockElementGeometry::three(upper_left, upper_right, lower_right),
+        '\u{259d}' => BlockElementGeometry::one(upper_right, 1.0),
+        '\u{259e}' => BlockElementGeometry::two(upper_right, lower_left),
+        '\u{259f}' => BlockElementGeometry::three(upper_right, lower_left, lower_right),
+        _ => return None,
+    })
+}
+
 fn unicode_column_count(text: &str) -> u32 {
     u32::try_from(text.width()).unwrap_or(u32::MAX)
 }
@@ -2521,6 +2623,30 @@ fn device_aligned_rectangle(
     let (left, top) = snap_to_device(cr, left, top);
     let (right, bottom) = snap_to_device(cr, right, bottom);
     cr.rectangle(left, top, right - left, bottom - top);
+}
+
+fn draw_block_element(
+    cr: &gtk4::cairo::Context,
+    geometry: BlockElementGeometry,
+    color: (f64, f64, f64),
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+) {
+    let _ = cr.save();
+    cr.set_source_rgba(color.0, color.1, color.2, geometry.alpha);
+    for rectangle in geometry.rectangles() {
+        device_aligned_rectangle(
+            cr,
+            left + rectangle.x0 * width,
+            top + rectangle.y0 * height,
+            left + rectangle.x1 * width,
+            top + rectangle.y1 * height,
+        );
+    }
+    let _ = cr.fill();
+    let _ = cr.restore();
 }
 
 fn draw_grid_backgrounds(
@@ -2615,7 +2741,11 @@ fn draw_grid_text(
                     run_colors(run, &screen.default_fg, &screen.default_bg, appearance).0
                 });
                 cr.set_source_rgb(color.0, color.1, color.2);
-                let use_fast_path = if placement.use_fast_path {
+                let contains_block_element = run
+                    .text
+                    .chars()
+                    .any(|character| block_element_geometry(character).is_some());
+                let use_fast_path = if placement.use_fast_path && !contains_block_element {
                     layout.set_text(&run.text);
                     let layout_width =
                         f64::from(layout.extents().1.width()) / f64::from(pango::SCALE);
@@ -2629,12 +2759,24 @@ fn draw_grid_text(
                     pangocairo::functions::show_layout(cr, &layout);
                 } else {
                     for grapheme in placement.graphemes {
-                        layout.set_text(grapheme.text);
-                        cr.move_to(
-                            f64::from(column.saturating_add(grapheme.column)) * metrics.width,
-                            y,
-                        );
-                        pangocairo::functions::show_layout(cr, &layout);
+                        let x = f64::from(column.saturating_add(grapheme.column)) * metrics.width;
+                        if let Some(geometry) =
+                            grapheme.text.chars().find_map(block_element_geometry)
+                        {
+                            draw_block_element(
+                                cr,
+                                geometry,
+                                color,
+                                x,
+                                y,
+                                metrics.width,
+                                metrics.height,
+                            );
+                        } else {
+                            layout.set_text(grapheme.text);
+                            cr.move_to(x, y);
+                            pangocairo::functions::show_layout(cr, &layout);
+                        }
                     }
                 }
                 placement.columns
@@ -3125,6 +3267,80 @@ mod tests {
         assert_eq!(placement.columns, 4);
         assert_eq!(placement_offsets(&placement), vec![0, 1, 3]);
         assert!(!placement.use_fast_path);
+    }
+
+    #[test]
+    fn full_block_covers_the_whole_cell() {
+        let geometry = block_element_geometry('\u{2588}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[BlockElementRectangle::new(0.0, 0.0, 1.0, 1.0)]
+        );
+        assert_eq!(geometry.alpha, 1.0);
+    }
+
+    #[test]
+    fn upper_half_block_covers_exactly_the_top_half() {
+        let geometry = block_element_geometry('\u{2580}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[BlockElementRectangle::new(0.0, 0.0, 1.0, 0.5)]
+        );
+        assert_eq!(geometry.alpha, 1.0);
+    }
+
+    #[test]
+    fn lower_one_eighth_block_is_anchored_at_the_bottom() {
+        let geometry = block_element_geometry('\u{2581}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[BlockElementRectangle::new(0.0, 0.875, 1.0, 1.0)]
+        );
+        assert_eq!(geometry.alpha, 1.0);
+    }
+
+    #[test]
+    fn left_one_eighth_block_is_anchored_at_the_left() {
+        let geometry = block_element_geometry('\u{258f}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[BlockElementRectangle::new(0.0, 0.0, 0.125, 1.0)]
+        );
+        assert_eq!(geometry.alpha, 1.0);
+    }
+
+    #[test]
+    fn diagonal_quadrants_are_two_disjoint_rectangles() {
+        let geometry = block_element_geometry('\u{259a}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[
+                BlockElementRectangle::new(0.0, 0.0, 0.5, 0.5),
+                BlockElementRectangle::new(0.5, 0.5, 1.0, 1.0),
+            ]
+        );
+        assert_eq!(geometry.alpha, 1.0);
+    }
+
+    #[test]
+    fn medium_shade_covers_the_cell_at_half_alpha() {
+        let geometry = block_element_geometry('\u{2592}').unwrap();
+
+        assert_eq!(
+            geometry.rectangles(),
+            &[BlockElementRectangle::new(0.0, 0.0, 1.0, 1.0)]
+        );
+        assert_eq!(geometry.alpha, 0.5);
+    }
+
+    #[test]
+    fn ordinary_character_has_no_block_geometry() {
+        assert_eq!(block_element_geometry('A'), None);
     }
 
     #[test]
