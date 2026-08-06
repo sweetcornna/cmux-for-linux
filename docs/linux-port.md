@@ -255,16 +255,29 @@ DejaVu Sans Mono, whose real advance is 8.830078125px while that metric reports
 advanced 0.17px short of the grid per cell and a black seam of `cells x 0.17px`
 opened wherever the next run began - about 3px through a 16-cell block run,
 which is what cut two lines through Claude Code's block-art mascot. The grid
-now measures the advance Pango will actually use, snaps the row pitch and every
-cell rectangle to whole device pixels so adjacent fills share an edge instead of
-compositing an antialiased dark line, and falls back to per-grapheme placement
-when a run's shaped width still disagrees with the grid, which covers fallback
-fonts for symbols and emoji. What that left was sub-pixel - a `█` glyph's ink
-covers 8.973px of an 8.830px cell, so a run boundary still darkened one device
-pixel column by about 11% - so the Block Elements range U+2580-U+259F is now
-drawn as device-aligned rectangles rather than glyphs, with the shades as flat
-alpha. Measured after that change, a run boundary inside block art steps
-straight from one block colour to the next with no intermediate pixel.
+now measures the advance Pango will actually use, snaps the row pitch, and
+falls back to per-grapheme placement when a run's shaped width still disagrees
+with the grid, which covers fallback fonts for symbols and emoji. What that
+left was sub-pixel - a `█` glyph's ink covers 8.973px of an 8.830px cell - so
+the Block Elements range U+2580-U+259F is drawn as rectangles rather than
+glyphs, with the shades as flat alpha.
+
+Neighbouring cells tile because they are filled together, not because their
+edges are snapped. Snapping was the first attempt and it silently did nothing
+where it mattered: GSK hands a `GtkDrawingArea` draw function a recording
+context whose transform is the identity, measured as
+`device_per_user=(1,1)` on a Wayland session scaled to 133%, so rounding
+through that transform quantised to logical pixels and the real rasterisation
+put every edge back on a fraction. Two separate `fill()` calls sharing a
+fractional edge each antialias their own half and composite into a dark line -
+the seam a user still saw in block art after the metrics fix, and one that
+verification under an integer-scaled cairo surface could not reproduce. Cell
+backgrounds and block elements now collect their exact rectangles, bucket them
+by colour, and issue one fill per colour across the whole grid: cairo computes
+coverage once per fill, so shared edges inside a path cannot seam at any scale.
+Two tests rasterise into an image surface at device scale 4/3 and assert no
+intermediate pixel survives between cells or rows; they fail if the fills are
+split apart again.
 
 An exited terminal is no longer a black void. A terminal host outlives its
 daemon, so a reboot leaves the restored session holding terminals whose

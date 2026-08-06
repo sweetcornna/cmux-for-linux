@@ -2059,6 +2059,8 @@ fn draw_grid(
             let _ = cr.stroke();
             return;
         }
+        // Snapping this isolated cursor rectangle is cosmetic. Grid cells tile
+        // because their exact coordinates are filled together in shared paths.
         match style {
             RenderCursorStyle::Block => device_aligned_rectangle(
                 cr,
@@ -2523,8 +2525,58 @@ impl BlockElementGeometry {
     }
 }
 
-// Font ink can cross a snapped cell edge, so block elements must use the same
-// exact geometry as cell backgrounds in order to tile without a dark seam.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FillStyle {
+    color: (f64, f64, f64),
+    alpha: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct FillBucket {
+    style: FillStyle,
+    rectangles: Vec<BlockElementRectangle>,
+}
+
+fn bucket_fill_rectangle(
+    buckets: &mut Vec<FillBucket>,
+    style: FillStyle,
+    rectangle: BlockElementRectangle,
+) {
+    if let Some(bucket) = buckets.iter_mut().find(|bucket| bucket.style == style) {
+        bucket.rectangles.push(rectangle);
+    } else {
+        buckets.push(FillBucket {
+            style,
+            rectangles: vec![rectangle],
+        });
+    }
+}
+
+fn fill_rectangle_buckets(cr: &gtk4::cairo::Context, buckets: &[FillBucket]) {
+    for bucket in buckets {
+        cr.set_source_rgba(
+            bucket.style.color.0,
+            bucket.style.color.1,
+            bucket.style.color.2,
+            bucket.style.alpha,
+        );
+        cr.new_path();
+        for rectangle in &bucket.rectangles {
+            cr.rectangle(
+                rectangle.x0,
+                rectangle.y0,
+                rectangle.x1 - rectangle.x0,
+                rectangle.y1 - rectangle.y0,
+            );
+        }
+        // Cairo computes coverage for the whole path, so shared cell edges do
+        // not get antialiased and composited as two separate fills.
+        let _ = cr.fill();
+    }
+}
+
+// Font ink can cross cell edges, so block elements use explicit grid geometry
+// and are filled in one path per style to tile without dark seams.
 fn block_element_geometry(character: char) -> Option<BlockElementGeometry> {
     let rectangle = BlockElementRectangle::new;
     let upper_left = rectangle(0.0, 0.0, 0.5, 0.5);
@@ -2625,30 +2677,6 @@ fn device_aligned_rectangle(
     cr.rectangle(left, top, right - left, bottom - top);
 }
 
-fn draw_block_element(
-    cr: &gtk4::cairo::Context,
-    geometry: BlockElementGeometry,
-    color: (f64, f64, f64),
-    left: f64,
-    top: f64,
-    width: f64,
-    height: f64,
-) {
-    let _ = cr.save();
-    cr.set_source_rgba(color.0, color.1, color.2, geometry.alpha);
-    for rectangle in geometry.rectangles() {
-        device_aligned_rectangle(
-            cr,
-            left + rectangle.x0 * width,
-            top + rectangle.y0 * height,
-            left + rectangle.x1 * width,
-            top + rectangle.y1 * height,
-        );
-    }
-    let _ = cr.fill();
-    let _ = cr.restore();
-}
-
 fn draw_grid_backgrounds(
     cr: &gtk4::cairo::Context,
     screen: &Screen,
@@ -2656,6 +2684,7 @@ fn draw_grid_backgrounds(
     metrics: CellMetrics,
     height: f64,
 ) {
+    let mut buckets = Vec::new();
     for (index, row) in screen.rows.iter().enumerate() {
         let Some(row) = row else { continue };
         let top = index as f64 * metrics.height;
@@ -2669,20 +2698,26 @@ fn draw_grid_backgrounds(
             let cells = run_column_count(&run.text, run.width_hint);
             let end_column = column.saturating_add(cells);
             let (_, bg) = run_colors(run, &screen.default_fg, &screen.default_bg, appearance);
-            cr.set_source_rgb(bg.0, bg.1, bg.2);
-            // Separate fills must share the same device-pixel edge or their
-            // antialiasing composites into a dark line between cells.
-            device_aligned_rectangle(
-                cr,
-                f64::from(column) * metrics.width,
-                top,
-                f64::from(end_column) * metrics.width,
-                (index + 1) as f64 * metrics.height,
-            );
-            let _ = cr.fill();
+            let style = FillStyle {
+                color: bg,
+                alpha: 1.0,
+            };
+            for cell in column..end_column {
+                bucket_fill_rectangle(
+                    &mut buckets,
+                    style,
+                    BlockElementRectangle::new(
+                        f64::from(cell) * metrics.width,
+                        top,
+                        f64::from(cell + 1) * metrics.width,
+                        (index + 1) as f64 * metrics.height,
+                    ),
+                );
+            }
             column = end_column;
         }
     }
+    fill_rectangle_buckets(cr, &buckets);
 }
 
 fn draw_grid_text(
@@ -2699,6 +2734,54 @@ fn draw_grid_text(
         height,
         blink,
     } = context;
+    let mut block_buckets = Vec::new();
+    for (index, row) in screen.rows.iter().enumerate() {
+        let Some(row) = row else { continue };
+        let y = index as f64 * metrics.height;
+        if y >= height {
+            break;
+        }
+        let mut column = 0u32;
+        for run in &row.runs {
+            let should_draw = !run.has_attr(RenderRun::ATTR_INVISIBLE)
+                && blinking_content_visible(run.has_attr(RenderRun::ATTR_BLINK), blink)
+                && !run.text.trim().is_empty();
+            let cells = if should_draw {
+                let placement = place_run_text(&run.text, run.width_hint);
+                let color = foreground.map(Rgb::cairo).unwrap_or_else(|| {
+                    run_colors(run, &screen.default_fg, &screen.default_bg, appearance).0
+                });
+                for grapheme in &placement.graphemes {
+                    let Some(geometry) = grapheme.text.chars().find_map(block_element_geometry)
+                    else {
+                        continue;
+                    };
+                    let left = f64::from(column.saturating_add(grapheme.column)) * metrics.width;
+                    for rectangle in geometry.rectangles() {
+                        bucket_fill_rectangle(
+                            &mut block_buckets,
+                            FillStyle {
+                                color,
+                                alpha: geometry.alpha,
+                            },
+                            BlockElementRectangle::new(
+                                left + rectangle.x0 * metrics.width,
+                                y + rectangle.y0 * metrics.height,
+                                left + rectangle.x1 * metrics.width,
+                                y + rectangle.y1 * metrics.height,
+                            ),
+                        );
+                    }
+                }
+                placement.columns
+            } else {
+                run_column_count(&run.text, run.width_hint)
+            };
+            column = column.saturating_add(cells);
+        }
+    }
+    fill_rectangle_buckets(cr, &block_buckets);
+
     let layout = area.create_pango_layout(None);
     let mut description = font.clone();
     for (index, row) in screen.rows.iter().enumerate() {
@@ -2760,19 +2843,12 @@ fn draw_grid_text(
                 } else {
                     for grapheme in placement.graphemes {
                         let x = f64::from(column.saturating_add(grapheme.column)) * metrics.width;
-                        if let Some(geometry) =
-                            grapheme.text.chars().find_map(block_element_geometry)
+                        if grapheme
+                            .text
+                            .chars()
+                            .find_map(block_element_geometry)
+                            .is_none()
                         {
-                            draw_block_element(
-                                cr,
-                                geometry,
-                                color,
-                                x,
-                                y,
-                                metrics.width,
-                                metrics.height,
-                            );
-                        } else {
                             layout.set_text(grapheme.text);
                             cr.move_to(x, y);
                             pangocairo::functions::show_layout(cr, &layout);
@@ -3341,6 +3417,167 @@ mod tests {
     #[test]
     fn ordinary_character_has_no_block_geometry() {
         assert_eq!(block_element_geometry('A'), None);
+    }
+
+    const FRACTIONAL_DEVICE_SCALE: f64 = 4.0 / 3.0;
+    const RASTER_CELL_METRICS: CellMetrics = CellMetrics {
+        width: 8.830_078_125,
+        height: 17.0,
+        baseline: 13.0,
+    };
+    const RASTER_COLUMNS: u32 = 4;
+    const RASTER_ROWS: usize = 2;
+    const RASTER_FILL: (f64, f64, f64) = (1.0, 0.0, 0.0);
+    const RASTER_FILL_PIXEL: u32 = 0x00ff_0000;
+
+    fn fractional_scale_surface() -> (gtk4::cairo::ImageSurface, gtk4::cairo::Context) {
+        let surface = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::Rgb24, 64, 64)
+            .expect("create image surface");
+        surface.set_device_scale(FRACTIONAL_DEVICE_SCALE, FRACTIONAL_DEVICE_SCALE);
+        let cr = gtk4::cairo::Context::new(&surface).expect("create cairo context");
+        cr.set_source_rgb(0.0, 0.0, 1.0);
+        cr.paint().expect("paint contrasting background");
+        (surface, cr)
+    }
+
+    fn assert_filled_grid_is_solid(surface: &mut gtk4::cairo::ImageSurface) {
+        let stride = usize::try_from(surface.stride()).expect("positive image stride");
+        surface.flush();
+        let data = surface.data().expect("read image surface").to_vec();
+        surface.finish();
+
+        let right =
+            (f64::from(RASTER_COLUMNS) * RASTER_CELL_METRICS.width * FRACTIONAL_DEVICE_SCALE)
+                .floor() as usize;
+        let bottom = (RASTER_ROWS as f64 * RASTER_CELL_METRICS.height * FRACTIONAL_DEVICE_SCALE)
+            .floor() as usize;
+        for y in 1..bottom {
+            for x in 1..right {
+                let offset = y * stride + x * 4;
+                let pixel = u32::from_ne_bytes(
+                    data[offset..offset + 4]
+                        .try_into()
+                        .expect("complete RGB24 pixel"),
+                ) & 0x00ff_ffff;
+                assert_eq!(
+                    pixel, RASTER_FILL_PIXEL,
+                    "intermediate pixel at device coordinate ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cell_backgrounds_leave_no_seam_at_fractional_device_scale() {
+        // Protects adjacent background runs and rows from dark fractional-scale seams.
+        let background = ColorHex::parse("#ff0000").expect("valid literal");
+        let run = || RenderRun {
+            text: "  ".to_string(),
+            fg: None,
+            bg: Some(background.clone()),
+            attrs: 0,
+            underline: None,
+            width_hint: Some(2),
+        };
+        let mut screen = Screen {
+            size: Size {
+                cols: RASTER_COLUMNS as u16,
+                rows: RASTER_ROWS as u16,
+            },
+            ..Screen::default()
+        };
+        screen.rows = (0..RASTER_ROWS)
+            .map(|row| {
+                Some(RenderRow {
+                    row: row as u16,
+                    runs: vec![run(), run()],
+                })
+            })
+            .collect();
+        let (mut surface, cr) = fractional_scale_surface();
+
+        draw_grid_backgrounds(
+            &cr,
+            &screen,
+            &TerminalAppearance::default(),
+            RASTER_CELL_METRICS,
+            RASTER_ROWS as f64 * RASTER_CELL_METRICS.height,
+        );
+
+        drop(cr);
+        assert_filled_grid_is_solid(&mut surface);
+    }
+
+    #[test]
+    fn block_elements_leave_no_seam_at_fractional_device_scale() {
+        // Protects adjacent block cells and rows from dark fractional-scale seams.
+        let (mut surface, cr) = fractional_scale_surface();
+        let mut buckets = Vec::new();
+        let style = FillStyle {
+            color: RASTER_FILL,
+            alpha: 1.0,
+        };
+        for row in 0..RASTER_ROWS {
+            for column in 0..RASTER_COLUMNS {
+                bucket_fill_rectangle(
+                    &mut buckets,
+                    style,
+                    BlockElementRectangle::new(
+                        f64::from(column) * RASTER_CELL_METRICS.width,
+                        row as f64 * RASTER_CELL_METRICS.height,
+                        f64::from(column + 1) * RASTER_CELL_METRICS.width,
+                        (row + 1) as f64 * RASTER_CELL_METRICS.height,
+                    ),
+                );
+            }
+        }
+
+        fill_rectangle_buckets(&cr, &buckets);
+
+        drop(cr);
+        assert_filled_grid_is_solid(&mut surface);
+    }
+
+    #[test]
+    fn fill_rectangles_group_by_color_and_alpha_across_rows_and_columns() {
+        let red = (1.0, 0.0, 0.0);
+        let blue = (0.0, 0.0, 1.0);
+        let full_red = FillStyle {
+            color: red,
+            alpha: 1.0,
+        };
+        let mut buckets = Vec::new();
+        let left = BlockElementRectangle::new(0.0, 0.0, 1.0, 1.0);
+        let right = BlockElementRectangle::new(1.0, 0.0, 2.0, 1.0);
+        let next_row = BlockElementRectangle::new(0.0, 1.0, 1.0, 2.0);
+
+        bucket_fill_rectangle(&mut buckets, full_red, left);
+        bucket_fill_rectangle(&mut buckets, full_red, right);
+        bucket_fill_rectangle(&mut buckets, full_red, next_row);
+        bucket_fill_rectangle(
+            &mut buckets,
+            FillStyle {
+                color: blue,
+                alpha: 1.0,
+            },
+            BlockElementRectangle::new(2.0, 0.0, 3.0, 1.0),
+        );
+        bucket_fill_rectangle(
+            &mut buckets,
+            FillStyle {
+                color: red,
+                alpha: 0.5,
+            },
+            BlockElementRectangle::new(1.0, 1.0, 2.0, 2.0),
+        );
+
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].style, full_red);
+        assert_eq!(buckets[0].rectangles, vec![left, right, next_row]);
+        assert_eq!(buckets[1].style.color, blue);
+        assert_eq!(buckets[1].style.alpha, 1.0);
+        assert_eq!(buckets[2].style.color, red);
+        assert_eq!(buckets[2].style.alpha, 0.5);
     }
 
     #[test]
