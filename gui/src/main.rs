@@ -18,6 +18,7 @@ mod view;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::{CString, OsStr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -26,6 +27,7 @@ use cmux::{
     Direction, InputModifier, LayoutDirection, MouseButton, PaneId, ScreenId, TerminalId,
     TerminalMouseKind, TerminalMouseOptions, WorkspaceId,
 };
+use gtk4::glib::translate::ToGlibPtr;
 use gtk4::prelude::*;
 use gtk4::{gdk, gio};
 use gtk4::{
@@ -48,6 +50,13 @@ const UPDATE_WATCHDOG_INTERVAL: Duration = BLINK_INTERVAL;
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_MAX_WIDTH: i32 = 600;
 const EXITED_INPUT_TOAST: &str = "This terminal has exited. Ctrl+B t opens a new tab.";
+const USAGE: &str = "cmux-gtk — GTK4 frontend for cmux\n\n\
+                     USAGE\n  \
+                     cmux-gtk [--session <name>] [--socket <path>] [--probe]\n\n\
+                     Connects to a cmux session, starting a headless one when needed.\n\n\
+                     --probe runs the protocol workers without GTK or automatic session\n\
+                     startup and prints every update, which separates protocol failures\n\
+                     from drawing ones.\n";
 
 struct MouseTarget {
     terminal: TerminalId,
@@ -195,43 +204,57 @@ struct ScrollbarDrag {
     sent_rows: i32,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Args {
     session: String,
     socket: Option<PathBuf>,
 }
 
-fn parse_args() -> Args {
-    let mut session = std::env::var("CMUX_SESSION").unwrap_or_else(|_| "main".to_string());
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedArgs {
+    Launch(Args),
+    Help,
+}
+
+fn parse_args<I, S>(arguments: I, default_session: impl Into<String>) -> ParsedArgs
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut session = default_session.into();
     let mut socket = None;
-    let mut argv = std::env::args().skip(1);
+    let mut argv = arguments.into_iter();
     while let Some(argument) = argv.next() {
-        match argument.as_str() {
-            "--session" => {
+        match argument.as_ref().to_str() {
+            Some("--session") => {
                 if let Some(value) = argv.next() {
-                    session = value;
+                    session = value.as_ref().to_string_lossy().into_owned();
                 }
             }
-            "--socket" => socket = argv.next().map(PathBuf::from),
-            "--help" | "-h" => {
-                println!(
-                    "cmux-gtk — GTK4 frontend for cmux\n\n\
-                     USAGE\n  \
-                     cmux-gtk [--session <name>] [--socket <path>] [--probe]\n\n\
-                     Connects to a cmux session, starting a headless one when needed.\n\n\
-                     --probe runs the protocol workers without GTK or automatic session\n\
-                     startup and prints every update, which separates protocol failures\n\
-                     from drawing ones."
-                );
-                std::process::exit(0);
-            }
+            Some("--socket") => socket = argv.next().map(|value| PathBuf::from(value.as_ref())),
+            Some("--help" | "-h") => return ParsedArgs::Help,
             _ => {}
         }
     }
-    Args { session, socket }
+    ParsedArgs::Launch(Args { session, socket })
+}
+
+fn default_session() -> String {
+    std::env::var("CMUX_SESSION").unwrap_or_else(|_| "main".to_string())
+}
+
+fn parse_process_args() -> Args {
+    match parse_args(std::env::args().skip(1), default_session()) {
+        ParsedArgs::Launch(args) => args,
+        ParsedArgs::Help => {
+            print!("{USAGE}");
+            std::process::exit(0);
+        }
+    }
 }
 
 fn probe() -> gtk4::glib::ExitCode {
-    let args = parse_args();
+    let args = parse_process_args();
     let (tx, rx) = async_channel::unbounded::<StampedUpdate>();
     let worker = session::spawn(args.session.clone(), args.socket.clone(), false, tx);
 
@@ -315,11 +338,46 @@ fn main() -> gtk4::glib::ExitCode {
     if std::env::args().any(|argument| argument == "--probe") {
         return probe();
     }
-    let application = Application::builder().application_id(APP_ID).build();
-    application.connect_activate(build_ui);
-    // Arguments are parsed before GTK sees argv so `--session` is not mistaken
-    // for a GApplication option.
-    application.run_with_args::<&str>(&[])
+    let application = Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
+    application.connect_activate(|application| {
+        let ParsedArgs::Launch(args) = parse_args(std::iter::empty::<&str>(), default_session())
+        else {
+            unreachable!("an empty argument list cannot request help");
+        };
+        build_ui(application, args);
+    });
+    application.connect_command_line(|application, command_line| {
+        let arguments = command_line.arguments();
+        match parse_args(arguments.iter().skip(1), default_session()) {
+            ParsedArgs::Launch(args) => build_ui(application, args),
+            ParsedArgs::Help => print_command_line(command_line, USAGE),
+        }
+        0
+    });
+    // With no registered GOptions, HANDLES_COMMAND_LINE forwards our options
+    // unchanged instead of rejecting them as unknown.
+    application.run()
+}
+
+/// Prints back to whichever invocation asked, not to the primary instance's
+/// own stdout, so `--help` still reaches the shell that ran it while a window
+/// is open elsewhere. gio's safe `print_literal` binding sits behind its
+/// `v2_80` feature, which would raise this package's glib floor for one usage
+/// string, so this calls the entry point glib has always had.
+fn print_command_line(command_line: &gio::ApplicationCommandLine, message: &str) {
+    let message = CString::new(message).expect("usage text cannot contain a NUL byte");
+    // SAFETY: both pointers stay alive for the call, and the format string is
+    // a literal `%s` matching the single message argument.
+    unsafe {
+        gio::ffi::g_application_command_line_print(
+            command_line.to_glib_none().0,
+            c"%s".as_ptr(),
+            message.as_ptr(),
+        );
+    }
 }
 
 fn sync_attachments(
@@ -1356,8 +1414,7 @@ fn workspace_row(
     row
 }
 
-fn build_ui(application: &Application) {
-    let args = parse_args();
+fn build_ui(application: &Application, args: Args) {
     let theme = Rc::new(view::Theme::new(config::load()));
     let screens = Rc::new(RefCell::new(ScreenSet::default()));
     let attention = Rc::new(RefCell::new(attention::AttentionState::default()));
@@ -3341,6 +3398,64 @@ fn build_ui(application: &Application) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_args_uses_default_session_without_arguments() {
+        assert_eq!(
+            parse_args(std::iter::empty::<&str>(), "main"),
+            ParsedArgs::Launch(Args {
+                session: "main".to_string(),
+                socket: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_selects_session() {
+        assert_eq!(
+            parse_args(["--session", "foo"], "main"),
+            ParsedArgs::Launch(Args {
+                session: "foo".to_string(),
+                socket: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_selects_socket() {
+        assert_eq!(
+            parse_args(["--socket", "/path"], "main"),
+            ParsedArgs::Launch(Args {
+                session: "main".to_string(),
+                socket: Some(PathBuf::from("/path")),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_selects_non_utf8_socket() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let socket = OsStr::from_bytes(b"/tmp/\xff.sock");
+        assert_eq!(
+            parse_args([OsStr::new("--socket"), socket], "main"),
+            ParsedArgs::Launch(Args {
+                session: "main".to_string(),
+                socket: Some(PathBuf::from(socket)),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_args_ignores_unknown_argument() {
+        assert_eq!(
+            parse_args(["--unknown"], "main"),
+            ParsedArgs::Launch(Args {
+                session: "main".to_string(),
+                socket: None,
+            })
+        );
+    }
 
     #[test]
     fn sidebar_width_is_clamped_to_metrics_and_one_third() {

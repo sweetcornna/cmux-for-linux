@@ -288,6 +288,14 @@ before emitting `key-pressed`, the `Ctrl+B` prefix chord runs in a separate
 capture-phase controller: its second key is a bare letter, which any input
 method would otherwise claim as text.
 
+A second launch now reaches its own session. The frontend is a single-instance
+`GApplication`, and a second `cmux-gtk --session other` was handing its
+activation to the primary and exiting without ever passing its arguments, so
+the primary re-read its own argv and opened another window on the first
+session. It now handles the command line, so each launch builds a window for
+the session it names, in the one process; `--help` prints back to the shell
+that ran it rather than into the primary's stdout.
+
 There is no remaining stage 2 tail.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
