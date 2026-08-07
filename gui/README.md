@@ -32,7 +32,8 @@ session and reports the failure in a toast.
   topology-affecting deltas into sidebar and layout refreshes
 - renders pane splits and tabs from the server's styled render stream
 - creates, closes and resizes panes through server-owned layout mutations
-- sends keyboard and supported mouse input back to each pane's PTY
+- sends keyboard and supported mouse input back to each pane's PTY, with keys
+  encoded server-side against the pane's live terminal state
 
 ## What it deliberately does not do
 
@@ -40,8 +41,18 @@ session and reports the failure in a toast.
 the only VT implementation: it sends styled runs, a cursor, resolved colours
 and decoded Kitty image pixels with placement geometry, and a client draws
 them. So there is no VT parser here, no libghostty, no VTE - only a cell grid,
-Pango text, Pixbuf/cairo image drawing and a key mapper. Everything that would
+Pango text, Pixbuf/cairo image drawing and a key namer. Everything that would
 normally be terminal-emulation complexity stays server-side.
+
+That rule covers input as well. Which bytes a key produces is not a property of
+the key: it depends on application cursor mode, `modifyOtherKeys`, and the
+Kitty keyboard flags an agent turns on to tell `Shift+Tab` and `Shift+Enter`
+apart from `Tab` and `Enter`. So a key this window can name travels over
+`terminal.input.keys` as a chord such as `shift+tab` or `ctrl+right` and is
+encoded by the same Ghostty encoder the TUI uses, against that pane's live
+terminal. Only the characters the encoder has no physical key for - `Ctrl+@`,
+`Ctrl+^`, `Ctrl+_`, and most of what a non-US layout produces - are encoded
+here, and plain text stays with the input method.
 
 ## Git branch exception
 
@@ -66,7 +77,7 @@ blocks the GTK thread.
 | `src/search.rs` | case-insensitive scrollback matching, result navigation and pure search geometry |
 | `src/session.rs` | protocol worker supervisor, session socket enumeration and joined control/attachment runtimes; render payloads reach GTK without blocking it on a socket |
 | `src/screen.rs` | cell and image state, with snapshot/patch merge semantics |
-| `src/view.rs` | cairo/Pango/Pixbuf drawing and key-to-bytes translation |
+| `src/view.rs` | cairo/Pango/Pixbuf drawing and key-to-chord translation |
 
 It lives outside `cmux-tui/` because `packaging/linux/sync-upstream.sh`
 replaces that directory wholesale from upstream.
@@ -101,7 +112,7 @@ CMUX_GTK_TRACE=1 cargo run --release -- --session main
 | Pane tabs | each always-visible pane strip supports switching, hover or middle-click close, double-click rename and terminal-tab creation; closing the last tab follows server collapse semantics |
 | Notification markers | unread terminal notifications add severity-colored bullets to pane and screen tabs and a highest-severity dot to each affected workspace row |
 | Agent state | terminal tabs show the upstream 12-spoke spinner while an agent is working and a static 9px ring for blocked, idle and done; the spinner turns only while the window is focused. Workspace rows show the highest-priority reported state across their terminals |
-| Input | keyboard input, including Ctrl and Alt sequences; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
+| Input | keyboard input encoded server-side against each pane's terminal, so `Shift+Tab`, `Shift+Enter`, function keys, `Insert`, modified arrows such as `Ctrl+Right` and application cursor mode all reach the application the way the TUI sends them; the default `Ctrl+B` lifecycle shortcuts listed below; `Ctrl+Shift+V` pastes through server-side bracketed-paste handling; and mouse input reaches applications |
 | Workspaces | macOS-parity sidebar rows with optional agent-status, git-branch and active-terminal working-directory details, switching, hover close, double-click rename, drag reordering and titlebar creation; the resizable sidebar is clamped to one third of the window and topology follows coalesced server resource events |
 | Resize | dynamic window resize updates pane PTY sizes; dragging a split divider sends throttled server ratio mutations; runtime font zoom reuses the same resize channel for every visible pane |
 | Scrollback | the mouse wheel scrolls the viewport; a rounded 4px overlay thumb appears off-bottom, widens on hover, and supports direct dragging |
@@ -136,6 +147,10 @@ then press the action key:
 | `Ctrl+B $` | Rename the active workspace |
 | `Ctrl+B %` / `Ctrl+B "` | Split the focused pane right / down |
 | `Ctrl+B X` | Close the focused pane |
+
+Every other key belongs to the focused pane, `Shift+Tab` included: it reaches
+the application as a backtab rather than moving GTK's focus, which is the press
+coding agents such as Claude Code read as "switch mode".
 
 `Ctrl+B c` keeps screen creation reachable while a one-screen workspace hides
 the screen strip. Once the strip appears, its `+` button also creates a screen.

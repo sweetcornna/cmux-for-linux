@@ -2146,8 +2146,8 @@ fn build_ui(application: &Application, args: Args) {
                 return gtk4::glib::Propagation::Stop;
             }
 
-            match view::key_to_bytes(key, state) {
-                Some(bytes) => {
+            match view::key_press(key, state) {
+                Some(press) => {
                     let had_selection = screens
                         .borrow()
                         .focused_screen()
@@ -2164,7 +2164,10 @@ fn build_ui(application: &Application, args: Args) {
                         &terminal_statuses.borrow(),
                         focused.as_ref(),
                         &toast,
-                        Input::Bytes(bytes),
+                        match press {
+                            view::KeyPress::Chord(chord) => Input::Keys(vec![chord]),
+                            view::KeyPress::Bytes(bytes) => Input::Bytes(bytes),
+                        },
                     );
                     gtk4::glib::Propagation::Stop
                 }

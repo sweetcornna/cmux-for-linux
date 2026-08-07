@@ -3158,47 +3158,142 @@ pub fn paste_payload(text: &str) -> Option<&str> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Translates a GDK key press into the bytes a PTY expects.
+/// What a key press sends to a pane.
+///
+/// The bytes a key produces are not a property of the key. They depend on VT
+/// state this frontend deliberately does not track: application cursor mode,
+/// `modifyOtherKeys`, and the Kitty keyboard flags a coding agent turns on to
+/// tell `Shift+Tab` and `Shift+Enter` apart from `Tab` and `Enter`. So input
+/// follows the same rule as rendering and leaves the VT to the server: a key
+/// the server's encoder can name travels as a chord and is encoded there
+/// against the pane's live terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPress {
+    /// A `terminal.input.keys` chord for the server to encode.
+    Chord(String),
+    /// Bytes for keys the chord grammar cannot name.
+    Bytes(Vec<u8>),
+}
+
+/// Translates a GDK key press into pane input.
 ///
 /// Returns None for keys this frontend does not handle, so GTK keeps its own
 /// default handling for them.
-pub fn key_to_bytes(key: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
+pub fn key_press(key: gdk::Key, state: gdk::ModifierType) -> Option<KeyPress> {
+    match key_chord(key, state) {
+        Some(chord) => Some(KeyPress::Chord(chord)),
+        None => key_to_bytes(key, state).map(KeyPress::Bytes),
+    }
+}
+
+/// The key names the server's chord parser accepts.
+fn chord_name(key: gdk::Key) -> Option<&'static str> {
+    Some(match key {
+        gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter => "enter",
+        // GDK reports Shift+Tab under its own keysym, which is the press
+        // coding agents read as "switch mode".
+        gdk::Key::Tab | gdk::Key::KP_Tab | gdk::Key::ISO_Left_Tab => "tab",
+        gdk::Key::Escape => "escape",
+        gdk::Key::BackSpace => "backspace",
+        gdk::Key::Delete | gdk::Key::KP_Delete => "delete",
+        gdk::Key::Insert | gdk::Key::KP_Insert => "insert",
+        gdk::Key::Up | gdk::Key::KP_Up => "up",
+        gdk::Key::Down | gdk::Key::KP_Down => "down",
+        gdk::Key::Left | gdk::Key::KP_Left => "left",
+        gdk::Key::Right | gdk::Key::KP_Right => "right",
+        gdk::Key::Home | gdk::Key::KP_Home => "home",
+        gdk::Key::End | gdk::Key::KP_End => "end",
+        gdk::Key::Page_Up | gdk::Key::KP_Page_Up => "pageup",
+        gdk::Key::Page_Down | gdk::Key::KP_Page_Down => "pagedown",
+        gdk::Key::F1 => "f1",
+        gdk::Key::F2 => "f2",
+        gdk::Key::F3 => "f3",
+        gdk::Key::F4 => "f4",
+        gdk::Key::F5 => "f5",
+        gdk::Key::F6 => "f6",
+        gdk::Key::F7 => "f7",
+        gdk::Key::F8 => "f8",
+        gdk::Key::F9 => "f9",
+        gdk::Key::F10 => "f10",
+        gdk::Key::F11 => "f11",
+        gdk::Key::F12 => "f12",
+        _ => return None,
+    })
+}
+
+/// Spells a character the way the chord parser names it, for the characters
+/// the encoder has a physical key for. The server rejects a chord it cannot
+/// parse, so anything outside that table is encoded locally instead.
+fn chord_character(unicode: char) -> Option<String> {
+    if unicode == ' ' {
+        return Some("space".to_string());
+    }
+    matches!(
+        unicode.to_ascii_lowercase(),
+        'a'..='z'
+            | '0'..='9'
+            | '`'
+            | '\\'
+            | '['
+            | ']'
+            | ','
+            | '='
+            | '-'
+            | '.'
+            | '\''
+            | ';'
+            | '/'
+    )
+    .then(|| unicode.to_string())
+}
+
+fn key_chord(key: gdk::Key, state: gdk::ModifierType) -> Option<String> {
     let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
     let alt = state.contains(gdk::ModifierType::ALT_MASK);
+    // A layout that reports Shift+Tab as `ISO_Left_Tab` has already spent the
+    // modifier on the keysym and leaves it out of the state.
+    let shift = state.contains(gdk::ModifierType::SHIFT_MASK) || key == gdk::Key::ISO_Left_Tab;
 
-    let base: Vec<u8> = match key {
-        gdk::Key::Return | gdk::Key::KP_Enter => vec![b'\r'],
-        gdk::Key::BackSpace => vec![0x7f],
-        gdk::Key::Tab => vec![b'\t'],
-        gdk::Key::Escape => vec![0x1b],
-        gdk::Key::Up => b"\x1b[A".to_vec(),
-        gdk::Key::Down => b"\x1b[B".to_vec(),
-        gdk::Key::Right => b"\x1b[C".to_vec(),
-        gdk::Key::Left => b"\x1b[D".to_vec(),
-        gdk::Key::Home => b"\x1b[H".to_vec(),
-        gdk::Key::End => b"\x1b[F".to_vec(),
-        gdk::Key::Page_Up => b"\x1b[5~".to_vec(),
-        gdk::Key::Page_Down => b"\x1b[6~".to_vec(),
-        gdk::Key::Delete => b"\x1b[3~".to_vec(),
-        _ => {
-            let unicode = key.to_unicode()?;
-            if ctrl {
-                let upper = unicode.to_ascii_uppercase();
-                if ('@'..='_').contains(&upper) {
-                    vec![(upper as u8) & 0x1f]
-                } else if unicode == ' ' {
-                    vec![0]
-                } else {
-                    return None;
-                }
-            } else {
-                let mut buffer = [0u8; 4];
-                unicode.encode_utf8(&mut buffer).as_bytes().to_vec()
-            }
-        }
+    let name = match chord_name(key) {
+        Some(name) => name.to_string(),
+        // Plain text is the input method's to commit; a character becomes a
+        // chord only once a modifier turns it into a control sequence.
+        None if ctrl || alt => chord_character(key.to_unicode()?)?,
+        None => return None,
     };
 
+    let mut chord = String::new();
+    if ctrl {
+        chord.push_str("ctrl+");
+    }
     if alt {
+        chord.push_str("alt+");
+    }
+    if shift {
+        chord.push_str("shift+");
+    }
+    chord.push_str(&name);
+    Some(chord)
+}
+
+/// Bytes for keys the chord grammar cannot name: `Ctrl+@`, `Ctrl+^`, `Ctrl+_`,
+/// and the characters a non-US layout produces that the encoder's physical-key
+/// table has no entry for.
+fn key_to_bytes(key: gdk::Key, state: gdk::ModifierType) -> Option<Vec<u8>> {
+    let unicode = key.to_unicode()?;
+    let base: Vec<u8> = if state.contains(gdk::ModifierType::CONTROL_MASK) {
+        let upper = unicode.to_ascii_uppercase();
+        if ('@'..='_').contains(&upper) {
+            vec![(upper as u8) & 0x1f]
+        } else {
+            return None;
+        }
+    } else {
+        let mut buffer = [0u8; 4];
+        unicode.encode_utf8(&mut buffer).as_bytes().to_vec()
+    };
+
+    if state.contains(gdk::ModifierType::ALT_MASK) {
         let mut prefixed = vec![0x1b];
         prefixed.extend_from_slice(&base);
         return Some(prefixed);
@@ -4089,6 +4184,93 @@ mod tests {
             gdk::ModifierType::CONTROL_MASK
         ));
         assert!(!is_copy_shortcut(gdk::Key::v, control_shift));
+    }
+
+    fn chord(key: gdk::Key, state: gdk::ModifierType) -> Option<String> {
+        match key_press(key, state) {
+            Some(KeyPress::Chord(chord)) => Some(chord),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn shift_tab_reaches_the_pane_instead_of_moving_gtk_focus() {
+        // GDK reports Shift+Tab as ISO_Left_Tab, which has no Unicode value.
+        // Left unhandled it falls through to GTK's focus navigation and the
+        // pane never sees the press agents read as "switch mode".
+        assert_eq!(
+            chord(gdk::Key::ISO_Left_Tab, gdk::ModifierType::SHIFT_MASK),
+            Some("shift+tab".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::ISO_Left_Tab, gdk::ModifierType::empty()),
+            Some("shift+tab".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::Tab, gdk::ModifierType::SHIFT_MASK),
+            Some("shift+tab".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::Tab, gdk::ModifierType::empty()),
+            Some("tab".to_string())
+        );
+    }
+
+    #[test]
+    fn chords_carry_the_modifiers_the_encoder_needs() {
+        assert_eq!(
+            chord(gdk::Key::Right, gdk::ModifierType::CONTROL_MASK),
+            Some("ctrl+right".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::Return, gdk::ModifierType::SHIFT_MASK),
+            Some("shift+enter".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::c, gdk::ModifierType::CONTROL_MASK),
+            Some("ctrl+c".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::b, gdk::ModifierType::ALT_MASK),
+            Some("alt+b".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::space, gdk::ModifierType::CONTROL_MASK),
+            Some("ctrl+space".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::F5, gdk::ModifierType::empty()),
+            Some("f5".to_string())
+        );
+        assert_eq!(
+            chord(gdk::Key::Escape, gdk::ModifierType::empty()),
+            Some("escape".to_string())
+        );
+    }
+
+    #[test]
+    fn keys_outside_the_chord_grammar_are_encoded_locally() {
+        // Plain text belongs to the input method, not to a chord.
+        assert_eq!(
+            key_press(gdk::Key::a, gdk::ModifierType::empty()),
+            Some(KeyPress::Bytes(b"a".to_vec()))
+        );
+        // The encoder has no physical key for `@`, `^` or `_`.
+        assert_eq!(
+            key_press(gdk::Key::at, gdk::ModifierType::CONTROL_MASK),
+            Some(KeyPress::Bytes(vec![0]))
+        );
+        assert_eq!(
+            key_press(gdk::Key::underscore, gdk::ModifierType::CONTROL_MASK),
+            Some(KeyPress::Bytes(vec![0x1f]))
+        );
+        assert_eq!(
+            key_press(gdk::Key::eacute, gdk::ModifierType::ALT_MASK),
+            Some(KeyPress::Bytes("\x1bé".as_bytes().to_vec()))
+        );
+        // Modifiers alone, and keys with no terminal meaning, stay with GTK.
+        assert!(key_press(gdk::Key::Shift_L, gdk::ModifierType::empty()).is_none());
+        assert!(key_press(gdk::Key::colon, gdk::ModifierType::CONTROL_MASK).is_none());
     }
 
     #[test]

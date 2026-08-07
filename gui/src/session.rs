@@ -27,7 +27,8 @@ use cmux::{
     ScreenId, ScrollOptions, Selector, SessionEvent, SessionEventStream, Size, SplitId,
     SplitOptions, SplitRatioOptions, StreamPoll, TabContentId, TabId, TerminalAttachOptions,
     TerminalAttachmentItem, TerminalCreateOptions, TerminalExit, TerminalExitOutcome, TerminalId,
-    TerminalLifecycle, TerminalMouseOptions, TerminalSnapshot, TextInputOptions, WorkspaceId,
+    TerminalKeysOptions, TerminalLifecycle, TerminalMouseOptions, TerminalSnapshot,
+    TextInputOptions, WorkspaceId,
 };
 
 use crate::attention::AttentionState;
@@ -277,6 +278,9 @@ pub struct StampedUpdate {
 #[derive(Debug)]
 pub enum Input {
     Bytes(Vec<u8>),
+    /// Key chords for the server to encode against the pane's live terminal
+    /// state, which is where every VT decision belongs.
+    Keys(Vec<String>),
     Paste(String),
     Scroll {
         terminal: TerminalId,
@@ -1829,6 +1833,17 @@ fn control_loop(
                 };
                 if let Err(error) = session.terminal(Selector::id(terminal)).write_bytes(&bytes) {
                     let _ = updates.send_blocking(Update::Error(format!("write failed: {error}")));
+                }
+            }
+            Input::Keys(keys) => {
+                let Some(terminal) = target.clone() else {
+                    continue;
+                };
+                if let Err(error) = session
+                    .terminal(Selector::id(terminal))
+                    .keys(TerminalKeysOptions { keys })
+                {
+                    let _ = updates.send_blocking(Update::Error(format!("key failed: {error}")));
                 }
             }
             Input::Paste(text) => {

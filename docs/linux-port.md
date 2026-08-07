@@ -309,6 +309,27 @@ session. It now handles the command line, so each launch builds a window for
 the session it names, in the one process; `--help` prints back to the shell
 that ran it rather than into the primary's stdout.
 
+`Shift+Tab` reaches the pane. GDK reports it as the `ISO_Left_Tab` keysym,
+which has no Unicode value, so the frontend's own key-to-bytes table returned
+nothing for it and GTK fell back to its own focus navigation: the pane never
+saw the press, and focus left the terminal. Coding agents read exactly that
+press as "switch mode", so a Claude Code pane in a GTK window could not leave
+the mode it was in. The fix is not another table entry. Which bytes a key
+produces is not a property of the key - it depends on application cursor mode,
+`modifyOtherKeys`, and the Kitty keyboard flags an agent turns on to tell
+`Shift+Enter` from `Enter` - so `spec/render.md`'s rule that the server owns
+every VT decision now covers input too: a key the encoder can name travels over
+`terminal.input.keys` as a chord and is encoded server-side by the same Ghostty
+encoder the TUI uses, against that pane's live terminal, including the same
+scroll-to-bottom the TUI does on a keypress. That is one mutation per press,
+the same round trip `terminal.input.write` already cost, and it also gives the
+window function keys, `Insert`, modified arrows such as `Ctrl+Right`, `Ctrl+/`
+and application cursor mode, none of which the local table produced. Characters
+the encoder has no physical key for - `Ctrl+@`, `Ctrl+^`, `Ctrl+_`, and most of
+what a non-US layout produces - are still encoded in the frontend, and plain
+text still belongs to the input method. Pure tests cover the chord spelling for
+both `Shift+Tab` keysyms, the modifier prefixes, and the keys that stay local.
+
 There is no remaining stage 2 tail.
 
 Stage 1 needed two SDK fixes, both carried in [`../patches/`](../patches/) and
